@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""prtui — minimal lazygit-style GitHub PR review TUI.
+
+Panes:
+  top-left     PRs authored by / requesting review from you
+  bottom-left  Files of the checked-out PR as a tree
+  right        Diff of the highlighted / opened file
+
+Backend: `gh` CLI (auth, PR list, checkout, diff) + GraphQL (viewed state).
+"""
+import curses
+import json
+import queue
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ---------- gh helpers ----------
+
+def sh(args, check=True):
+    r = subprocess.run(args, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip().replace("\n", " | ")
+        raise RuntimeError(f"{args[0]} {args[1] if len(args) > 1 else ''}: {err[:400]}")
+    return r.stdout
+
+
+def gh_json(args):
+    return json.loads(sh(["gh", *args]))
+
+
+def gh_graphql(query, **variables):
+    args = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is None:
+            continue
+        if isinstance(v, int):
+            args += ["-F", f"{k}={v}"]
+        else:
+            args += ["-f", f"{k}={v}"]
+    return json.loads(sh(args))
+
+
+@dataclass
+class PR:
+    number: int
+    title: str
+    head: str
+    author: str
+    node_id: str = ""
+
+
+@dataclass
+class FileEntry:
+    path: str
+    viewed: bool
+
+
+def detect_repo():
+    data = gh_json(["repo", "view", "--json", "owner,name"])
+    return data["owner"]["login"], data["name"]
+
+
+def load_prs():
+    fields = "number,title,headRefName,author,id"
+    seen = {}
+    for search in ("is:open author:@me", "is:open review-requested:@me"):
+        try:
+            data = gh_json(["pr", "list", "--limit", "50", "--search", search, "--json", fields])
+        except Exception:
+            data = []
+        for p in data:
+            if p["number"] in seen:
+                continue
+            seen[p["number"]] = PR(
+                number=p["number"], title=p["title"], head=p["headRefName"],
+                author=p.get("author", {}).get("login", "?"), node_id=p["id"],
+            )
+    return sorted(seen.values(), key=lambda pr: -pr.number)
+
+
+def current_pr_number():
+    try:
+        return gh_json(["pr", "view", "--json", "number"])["number"]
+    except Exception:
+        return None
+
+
+def load_files(owner, name, number):
+    q = """
+    query($owner:String!, $name:String!, $number:Int!, $after:String) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$number) {
+          id
+          files(first:100, after:$after) {
+            nodes { path viewerViewedState }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }
+    """
+    entries = []
+    pr_id = ""
+    after = None
+    while True:
+        data = gh_graphql(q, owner=owner, name=name, number=number, after=after)
+        pr = data["data"]["repository"]["pullRequest"]
+        pr_id = pr["id"]
+        for n in pr["files"]["nodes"]:
+            entries.append(FileEntry(path=n["path"], viewed=n["viewerViewedState"] == "VIEWED"))
+        pi = pr["files"]["pageInfo"]
+        if not pi["hasNextPage"]:
+            break
+        after = pi["endCursor"]
+    return pr_id, entries
+
+
+def load_diff(number):
+    raw = sh(["gh", "pr", "diff", str(number)])
+    per_file = {}
+    current_path = None
+    buf = []
+    for line in raw.splitlines():
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                per_file[current_path] = buf
+            buf = [line]
+            try:
+                current_path = line.split(" b/", 1)[1]
+            except IndexError:
+                current_path = None
+        else:
+            buf.append(line)
+    if current_path is not None:
+        per_file[current_path] = buf
+    return per_file
+
+
+def compute_hunks(diff_lines):
+    return [i for i, ln in enumerate(diff_lines) if ln.startswith("@@")]
+
+
+def mark_viewed_api(pr_id, path, viewed):
+    m = "markFileAsViewed" if viewed else "unmarkFileAsViewed"
+    q = f"mutation($pr:ID!, $path:String!) {{ {m}(input:{{pullRequestId:$pr, path:$path}}) {{ pullRequest {{ id }} }} }}"
+    gh_graphql(q, pr=pr_id, path=path)
+
+
+def checkout_pr(number):
+    sh(["gh", "pr", "checkout", str(number)])
+
+
+# ---------- state ----------
+
+@dataclass
+class State:
+    repo_owner: str = ""
+    repo_name: str = ""
+    prs: list = field(default_factory=list)
+    pr_idx: int = 0
+    pr_view_offset: int = 0
+    active_pr: Optional[PR] = None
+    files: list = field(default_factory=list)
+    collapsed_dirs: set = field(default_factory=set)
+    tree: list = field(default_factory=list)
+    file_idx: int = 0
+    file_view_offset: int = 0
+    diff_by_file: dict = field(default_factory=dict)
+    hunks_by_file: dict = field(default_factory=dict)
+    diff_scroll: int = 0
+    focus: int = 0  # 0=prs 1=files 2=diff
+    status: str = ""
+    busy: set = field(default_factory=set)
+    rects: dict = field(default_factory=dict)
+
+
+# ---------- tree ----------
+
+def build_tree(files, collapsed):
+    root = {}
+    for i, f in enumerate(files):
+        parts = f.path.split("/")
+        node = root
+        for p in parts[:-1]:
+            nxt = node.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[p] = nxt
+            node = nxt
+        node[parts[-1]] = i
+
+    display = []
+
+    def walk(node, prefix, depth):
+        entries = sorted(node.items(), key=lambda kv: (isinstance(kv[1], int), kv[0].lower()))
+        for name, val in entries:
+            if isinstance(val, dict):
+                path = prefix + name
+                is_collapsed = path in collapsed
+                display.append((depth, name, "dir", path, is_collapsed))
+                if not is_collapsed:
+                    walk(val, path + "/", depth + 1)
+            else:
+                display.append((depth, name, "file", val, False))
+
+    walk(root, "", 0)
+    return display
+
+
+def rebuild_tree(st: State):
+    st.tree = build_tree(st.files, st.collapsed_dirs)
+    if st.file_idx >= len(st.tree):
+        st.file_idx = max(0, len(st.tree) - 1)
+
+
+def files_under_dir(st: State, dir_path: str):
+    prefix = dir_path + "/"
+    return [f for f in st.files if f.path.startswith(prefix)]
+
+
+# ---------- worker ----------
+
+def worker_loop(jobs: queue.Queue, results: queue.Queue):
+    while True:
+        job = jobs.get()
+        if job is None:
+            return
+        kind = job[0]
+        try:
+            if kind == "load_prs":
+                results.put(("prs", load_prs()))
+            elif kind == "load_active":
+                _, owner, name = job
+                n = current_pr_number()
+                if n is None:
+                    results.put(("active", None, None, [], {}))
+                else:
+                    pr_id, files = load_files(owner, name, n)
+                    diff = load_diff(n)
+                    results.put(("active", n, pr_id, files, diff))
+            elif kind == "checkout":
+                _, number = job
+                checkout_pr(number)
+                results.put(("checkout_done", number))
+            elif kind == "mark_viewed":
+                _, pr_id, path, viewed = job
+                mark_viewed_api(pr_id, path, viewed)
+                results.put(("viewed_ok", [path], viewed))
+            elif kind == "mark_viewed_bulk":
+                _, pr_id, paths, viewed = job
+                done = []
+                errs = []
+                for p in paths:
+                    try:
+                        mark_viewed_api(pr_id, p, viewed)
+                        done.append(p)
+                    except Exception as e:
+                        errs.append((p, str(e)))
+                if errs:
+                    results.put(("viewed_bulk", done, viewed, errs))
+                else:
+                    results.put(("viewed_ok", done, viewed))
+        except Exception as e:
+            results.put(("error", kind, str(e)))
+
+
+# ---------- theme / rendering ----------
+
+class Theme:
+    """Color pair IDs; initialised in run()."""
+    ADD = 1
+    DEL = 2
+    HUNK = 3
+    FOCUS = 4     # green fg (borders/titles/scrollbar of focused pane)
+    ACTIVE = 5    # cyan fg (active PR marker)
+    SEL_FOCUS = 6 # black on green (selected in focused pane)
+    SEL = 7       # reversed (selected in unfocused pane)
+    STATUS = 8    # bright status line
+    KEYS = 9      # dim key hints
+    TITLE = 10    # yellow (unfocused title accent)
+
+
+def init_theme():
+    curses.use_default_colors()
+    curses.init_pair(Theme.ADD, curses.COLOR_GREEN, -1)
+    curses.init_pair(Theme.DEL, curses.COLOR_RED, -1)
+    curses.init_pair(Theme.HUNK, curses.COLOR_CYAN, -1)
+    curses.init_pair(Theme.FOCUS, curses.COLOR_GREEN, -1)
+    curses.init_pair(Theme.ACTIVE, curses.COLOR_CYAN, -1)
+    curses.init_pair(Theme.SEL_FOCUS, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(Theme.SEL, -1, -1)
+    curses.init_pair(Theme.STATUS, curses.COLOR_YELLOW, -1)
+    curses.init_pair(Theme.KEYS, curses.COLOR_WHITE, -1)
+    curses.init_pair(Theme.TITLE, curses.COLOR_YELLOW, -1)
+
+
+def safe_addstr(win, y, x, s, attr=0, maxw=None):
+    if maxw is not None:
+        s = s[:maxw]
+    try:
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def draw_box(win, y, x, h, w, title, focused, busy=False):
+    border_attr = curses.color_pair(Theme.FOCUS) | curses.A_BOLD if focused else curses.A_DIM
+    try:
+        win.attron(border_attr)
+        win.addch(y, x, curses.ACS_ULCORNER)
+        win.addch(y, x + w - 1, curses.ACS_URCORNER)
+        win.addch(y + h - 1, x, curses.ACS_LLCORNER)
+        win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
+        for i in range(1, w - 1):
+            win.addch(y, x + i, curses.ACS_HLINE)
+            win.addch(y + h - 1, x + i, curses.ACS_HLINE)
+        for i in range(1, h - 1):
+            win.addch(y + i, x, curses.ACS_VLINE)
+            win.addch(y + i, x + w - 1, curses.ACS_VLINE)
+        win.attroff(border_attr)
+    except curses.error:
+        pass
+    label = f" {title}{' ⏳' if busy else ''} "
+    title_attr = curses.color_pair(Theme.FOCUS) | curses.A_BOLD if focused else curses.color_pair(Theme.TITLE)
+    safe_addstr(win, y, x + 2, label, title_attr, maxw=max(0, w - 4))
+
+
+def draw_scrollbar(win, y, x, h, view_offset, view_h, total, focused=False):
+    if total <= view_h or h <= 0:
+        return
+    bar_h = max(1, view_h * h // total)
+    span = max(1, total - view_h)
+    bar_y = view_offset * (h - bar_h) // span
+    bar_attr = curses.color_pair(Theme.FOCUS) | curses.A_BOLD if focused else curses.A_DIM
+    track_attr = curses.A_DIM
+    for i in range(h):
+        if bar_y <= i < bar_y + bar_h:
+            try: win.addstr(y + i, x, "█", bar_attr)
+            except curses.error: pass
+        else:
+            try: win.addstr(y + i, x, "░", track_attr)
+            except curses.error: pass
+
+
+def clamp_view(idx, view_offset, view_h, total):
+    if total == 0:
+        return 0
+    if idx < view_offset:
+        return idx
+    if idx >= view_offset + view_h:
+        return idx - view_h + 1
+    if view_offset > max(0, total - view_h):
+        return max(0, total - view_h)
+    return view_offset
+
+
+def shortcuts_for(st: State):
+    common = "Tab: next pane · r: refresh · q: quit · Shift+J/K: scroll diff · mouse-wheel: scroll hovered"
+    if st.focus == 0:
+        return f"Enter: checkout · j/k: move · {common}"
+    if st.focus == 1:
+        return f"Enter: open in diff · v: toggle viewed (folder = all) · Space: fold/expand · j/k: move · {common}"
+    return f"j/k: next/prev hunk · d/u: page · g/G: top/bottom · Esc: back to files · {common}"
+
+
+def cur_file_path(st: State):
+    if 0 <= st.file_idx < len(st.tree) and st.tree[st.file_idx][2] == "file":
+        return st.files[st.tree[st.file_idx][3]].path
+    return None
+
+
+def render(stdscr, st: State):
+    stdscr.erase()
+    H, W = stdscr.getmaxyx()
+    left_w = max(36, W // 3)
+    right_w = W - left_w
+    body_h = H - 2  # two status lines
+    top_h = max(6, body_h // 2)
+    bot_h = body_h - top_h
+
+    st.rects = {
+        "prs": (0, 0, top_h, left_w),
+        "files": (top_h, 0, bot_h, left_w),
+        "diff": (0, left_w, body_h, right_w),
+    }
+
+    # --- PR pane ---
+    draw_box(stdscr, 0, 0, top_h, left_w,
+             f"PRs [{st.repo_owner}/{st.repo_name}]", st.focus == 0, busy="prs" in st.busy)
+    vh = top_h - 2
+    iw = left_w - 3
+    st.pr_view_offset = clamp_view(st.pr_idx, st.pr_view_offset, vh, len(st.prs))
+    for i, pr in enumerate(st.prs[st.pr_view_offset : st.pr_view_offset + vh]):
+        idx = st.pr_view_offset + i
+        active = st.active_pr and st.active_pr.number == pr.number
+        marker = "● " if active else "  "
+        line = f"{marker}#{pr.number} {pr.title}"
+        selected = idx == st.pr_idx and st.focus == 0
+        if selected:
+            attr = curses.color_pair(Theme.SEL_FOCUS) | curses.A_BOLD
+        elif idx == st.pr_idx:
+            attr = curses.A_REVERSE
+        elif active:
+            attr = curses.color_pair(Theme.ACTIVE) | curses.A_BOLD
+        else:
+            attr = 0
+        safe_addstr(stdscr, 1 + i, 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, 1, left_w - 2, vh, st.pr_view_offset, vh, len(st.prs), st.focus == 0)
+
+    # --- Files pane ---
+    files_title = "Files"
+    if st.active_pr:
+        n_viewed = sum(1 for f in st.files if f.viewed)
+        files_title = f"Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
+    draw_box(stdscr, top_h, 0, bot_h, left_w, files_title, st.focus == 1, busy="active" in st.busy or "viewed" in st.busy)
+    vh = bot_h - 2
+    iw = left_w - 3
+    st.file_view_offset = clamp_view(st.file_idx, st.file_view_offset, vh, len(st.tree))
+    for i, item in enumerate(st.tree[st.file_view_offset : st.file_view_offset + vh]):
+        idx = st.file_view_offset + i
+        depth, name, kind, payload, *rest = (*item, None)[:5]
+        indent = "  " * depth
+        if kind == "dir":
+            is_collapsed = rest[0] if rest else False
+            dir_path = payload
+            dir_files = files_under_dir(st, dir_path)
+            n_viewed = sum(1 for f in dir_files if f.viewed)
+            total = len(dir_files)
+            summary = f" {n_viewed}/{total}" if total else ""
+            glyph = "▶" if is_collapsed else "▼"
+            line = f"{indent}{glyph} {name}/{summary}"
+            base = curses.A_BOLD
+        else:
+            fe = st.files[payload]
+            mark = "✔" if fe.viewed else " "
+            line = f"{indent}[{mark}] {name}"
+            base = curses.color_pair(Theme.ADD) | curses.A_DIM if fe.viewed else 0
+        selected = idx == st.file_idx and st.focus == 1
+        if selected:
+            attr = curses.color_pair(Theme.SEL_FOCUS) | curses.A_BOLD
+        elif idx == st.file_idx:
+            attr = curses.A_REVERSE
+        else:
+            attr = base
+        safe_addstr(stdscr, top_h + 1 + i, 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, top_h + 1, left_w - 2, vh, st.file_view_offset, vh, len(st.tree), st.focus == 1)
+
+    # --- Diff pane ---
+    cur_path = cur_file_path(st)
+    title = f"Diff — {cur_path}" if cur_path else "Diff"
+    draw_box(stdscr, 0, left_w, body_h, right_w, title, st.focus == 2)
+    diff_lines = st.diff_by_file.get(cur_path, []) if cur_path else []
+    if not diff_lines and cur_path:
+        diff_lines = ["(no diff — file may be binary, removed, or too large)"]
+    vh = body_h - 2
+    iw = right_w - 3
+    max_scroll = max(0, len(diff_lines) - vh)
+    if st.diff_scroll > max_scroll:
+        st.diff_scroll = max_scroll
+    for i, ln in enumerate(diff_lines[st.diff_scroll : st.diff_scroll + vh]):
+        attr = 0
+        if ln.startswith("+") and not ln.startswith("+++"):
+            attr = curses.color_pair(Theme.ADD)
+        elif ln.startswith("-") and not ln.startswith("---"):
+            attr = curses.color_pair(Theme.DEL)
+        elif ln.startswith("@@"):
+            attr = curses.color_pair(Theme.HUNK) | curses.A_BOLD
+        elif ln.startswith(("diff --git", "index ", "+++", "---")):
+            attr = curses.A_BOLD
+        safe_addstr(stdscr, 1 + i, left_w + 1, ln, attr, maxw=iw)
+    draw_scrollbar(stdscr, 1, left_w + right_w - 2, vh, st.diff_scroll, vh, len(diff_lines), st.focus == 2)
+
+    # --- Status lines ---
+    status = st.status or "Ready."
+    safe_addstr(stdscr, H - 2, 0, status.ljust(W - 1), curses.color_pair(Theme.STATUS) | curses.A_BOLD, maxw=W - 1)
+    safe_addstr(stdscr, H - 1, 0, shortcuts_for(st).ljust(W - 1), curses.color_pair(Theme.KEYS) | curses.A_DIM, maxw=W - 1)
+    stdscr.refresh()
+
+
+# ---------- controller ----------
+
+def point_in(rect, my, mx):
+    y, x, h, w = rect
+    return y <= my < y + h and x <= mx < x + w
+
+
+def pane_at(st, my, mx):
+    for name, rect in st.rects.items():
+        if point_in(rect, my, mx):
+            return name
+    return None
+
+
+def submit(jobs, st, job):
+    tag = {"load_prs": "prs", "load_active": "active",
+           "checkout": "checkout", "mark_viewed": "viewed",
+           "mark_viewed_bulk": "viewed"}[job[0]]
+    st.busy.add(tag)
+    jobs.put(job)
+
+
+def apply_result(st: State, res, jobs):
+    kind = res[0]
+    if kind == "prs":
+        st.prs = res[1]
+        st.busy.discard("prs")
+        if st.pr_idx >= len(st.prs):
+            st.pr_idx = max(0, len(st.prs) - 1)
+    elif kind == "active":
+        st.busy.discard("active")
+        number, pr_id, files, diff = res[1], res[2], res[3], res[4]
+        if number is None:
+            st.active_pr = None
+            st.files = []
+            st.diff_by_file = {}
+            st.hunks_by_file = {}
+        else:
+            match = next((p for p in st.prs if p.number == number), None)
+            if match is None:
+                match = PR(number=number, title=f"#{number}", head="", author="", node_id=pr_id)
+            else:
+                match.node_id = pr_id
+            st.active_pr = match
+            st.files = files
+            st.diff_by_file = diff
+            st.hunks_by_file = {p: compute_hunks(lines) for p, lines in diff.items()}
+        st.file_idx = 0
+        st.file_view_offset = 0
+        st.diff_scroll = 0
+        rebuild_tree(st)
+    elif kind == "checkout_done":
+        st.busy.discard("checkout")
+        st.status = f"Checked out #{res[1]} — reloading files…"
+        submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+    elif kind == "viewed_ok":
+        paths, viewed = res[1], res[2]
+        pset = set(paths)
+        for f in st.files:
+            if f.path in pset:
+                f.viewed = viewed
+        st.busy.discard("viewed")
+        if len(paths) == 1:
+            st.status = f"{'Marked' if viewed else 'Unmarked'} {paths[0]}"
+        else:
+            st.status = f"{'Marked' if viewed else 'Unmarked'} {len(paths)} files"
+    elif kind == "viewed_bulk":
+        done, viewed, errs = res[1], res[2], res[3]
+        dset = set(done)
+        for f in st.files:
+            if f.path in dset:
+                f.viewed = viewed
+        st.busy.discard("viewed")
+        st.status = f"{'Marked' if viewed else 'Unmarked'} {len(done)}, {len(errs)} failed"
+    elif kind == "error":
+        _, job_kind, msg = res
+        tag = {"load_prs": "prs", "load_active": "active",
+               "checkout": "checkout", "mark_viewed": "viewed",
+               "mark_viewed_bulk": "viewed"}.get(job_kind, "")
+        st.busy.discard(tag)
+        st.status = f"[{job_kind}] {msg}"
+
+
+def scroll_diff(st: State, delta: int):
+    st.diff_scroll = max(0, st.diff_scroll + delta)
+
+
+def jump_hunk(st: State, direction: int):
+    path = cur_file_path(st)
+    if not path:
+        return
+    hunks = st.hunks_by_file.get(path, [])
+    if not hunks:
+        return
+    cur = st.diff_scroll
+    if direction > 0:
+        nxt = next((h for h in hunks if h > cur), None)
+        if nxt is not None:
+            st.diff_scroll = nxt
+    else:
+        prev = None
+        for h in hunks:
+            if h < cur:
+                prev = h
+            else:
+                break
+        if prev is not None:
+            st.diff_scroll = prev
+        else:
+            st.diff_scroll = hunks[0]
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    init_theme()
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    try:
+        print("\033[?1000h\033[?1006h", end="", flush=True)
+    except Exception:
+        pass
+    stdscr.timeout(80)
+
+    jobs: queue.Queue = queue.Queue()
+    results: queue.Queue = queue.Queue()
+    t = threading.Thread(target=worker_loop, args=(jobs, results), daemon=True)
+    t.start()
+
+    st = State()
+    try:
+        st.repo_owner, st.repo_name = detect_repo()
+    except Exception as e:
+        st.status = f"detect_repo: {e}"
+
+    if st.repo_owner:
+        submit(jobs, st, ("load_prs",))
+        submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+
+    while True:
+        while True:
+            try:
+                res = results.get_nowait()
+            except queue.Empty:
+                break
+            apply_result(st, res, jobs)
+
+        render(stdscr, st)
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+
+        # Global keys
+        if ch == ord("q"):
+            break
+        if ch == ord("J"):
+            scroll_diff(st, 1); continue
+        if ch == ord("K"):
+            scroll_diff(st, -1); continue
+        if ch == 9:
+            st.focus = (st.focus + 1) % 3; continue
+        if ch == curses.KEY_BTAB:
+            st.focus = (st.focus - 1) % 3; continue
+        if ch == ord("r"):
+            if "prs" not in st.busy:
+                submit(jobs, st, ("load_prs",))
+            if "active" not in st.busy and st.repo_owner:
+                submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+            st.status = "Refreshing…"
+            continue
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            pane = pane_at(st, my, mx)
+            if pane is None:
+                continue
+            up = bool(bstate & curses.BUTTON4_PRESSED)
+            down = hasattr(curses, "BUTTON5_PRESSED") and bool(bstate & curses.BUTTON5_PRESSED)
+            if not up and not down and bstate & curses.BUTTON1_CLICKED:
+                st.focus = {"prs": 0, "files": 1, "diff": 2}[pane]; continue
+            step = 3
+            if pane == "prs":
+                if up: st.pr_view_offset = max(0, st.pr_view_offset - step)
+                elif down: st.pr_view_offset = min(max(0, len(st.prs) - 1), st.pr_view_offset + step)
+            elif pane == "files":
+                if up: st.file_view_offset = max(0, st.file_view_offset - step)
+                elif down: st.file_view_offset = min(max(0, len(st.tree) - 1), st.file_view_offset + step)
+            elif pane == "diff":
+                if up: scroll_diff(st, -step)
+                elif down: scroll_diff(st, step)
+            continue
+
+        # Pane-scoped keys
+        if st.focus == 0:
+            if ch in (curses.KEY_DOWN, ord("j")):
+                st.pr_idx = min(max(0, len(st.prs) - 1), st.pr_idx + 1)
+            elif ch in (curses.KEY_UP, ord("k")):
+                st.pr_idx = max(0, st.pr_idx - 1)
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if st.prs and "checkout" not in st.busy:
+                    pr = st.prs[st.pr_idx]
+                    st.status = f"Checking out #{pr.number}…"
+                    submit(jobs, st, ("checkout", pr.number))
+        elif st.focus == 1:
+            if ch in (curses.KEY_DOWN, ord("j")):
+                st.file_idx = min(max(0, len(st.tree) - 1), st.file_idx + 1)
+                st.diff_scroll = 0
+            elif ch in (curses.KEY_UP, ord("k")):
+                st.file_idx = max(0, st.file_idx - 1)
+                st.diff_scroll = 0
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if 0 <= st.file_idx < len(st.tree):
+                    item = st.tree[st.file_idx]
+                    if item[2] == "file":
+                        st.focus = 2
+                        st.diff_scroll = 0
+                    else:
+                        p = item[3]
+                        (st.collapsed_dirs.discard if p in st.collapsed_dirs else st.collapsed_dirs.add)(p)
+                        rebuild_tree(st)
+            elif ch == ord(" "):
+                if 0 <= st.file_idx < len(st.tree) and st.tree[st.file_idx][2] == "dir":
+                    p = st.tree[st.file_idx][3]
+                    (st.collapsed_dirs.discard if p in st.collapsed_dirs else st.collapsed_dirs.add)(p)
+                    rebuild_tree(st)
+            elif ch == ord("v"):
+                if 0 <= st.file_idx < len(st.tree) and st.active_pr and "viewed" not in st.busy:
+                    item = st.tree[st.file_idx]
+                    if item[2] == "file":
+                        fe = st.files[item[3]]
+                        new_v = not fe.viewed
+                        st.status = f"{'Marking' if new_v else 'Unmarking'} {fe.path}…"
+                        submit(jobs, st, ("mark_viewed", st.active_pr.node_id, fe.path, new_v))
+                    else:
+                        dir_files = files_under_dir(st, item[3])
+                        if dir_files:
+                            all_viewed = all(f.viewed for f in dir_files)
+                            new_v = not all_viewed
+                            paths = [f.path for f in dir_files if f.viewed != new_v]
+                            if paths:
+                                st.status = f"{'Marking' if new_v else 'Unmarking'} {len(paths)} files in {item[3]}/…"
+                                submit(jobs, st, ("mark_viewed_bulk", st.active_pr.node_id, paths, new_v))
+        elif st.focus == 2:
+            H, _ = stdscr.getmaxyx()
+            page = max(1, (H - 4) // 1)
+            diff_lines = []
+            path = cur_file_path(st)
+            if path:
+                diff_lines = st.diff_by_file.get(path, [])
+            max_scroll = max(0, len(diff_lines) - 1)
+            if ch in (curses.KEY_DOWN, ord("j")):
+                jump_hunk(st, +1)
+            elif ch in (curses.KEY_UP, ord("k")):
+                jump_hunk(st, -1)
+            elif ch in (curses.KEY_NPAGE, ord("d")):
+                st.diff_scroll = min(max_scroll, st.diff_scroll + page)
+            elif ch in (curses.KEY_PPAGE, ord("u")):
+                st.diff_scroll = max(0, st.diff_scroll - page)
+            elif ch == ord("g"):
+                st.diff_scroll = 0
+            elif ch == ord("G"):
+                st.diff_scroll = max_scroll
+            elif ch == 27:  # Esc
+                st.focus = 1
+
+    jobs.put(None)
+
+
+def main():
+    try:
+        sh(["gh", "auth", "status"])
+    except Exception:
+        print("gh is not authenticated. Run `gh auth login` first.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        curses.wrapper(run)
+    finally:
+        try:
+            print("\033[?1000l\033[?1006l", end="", flush=True)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
