@@ -424,15 +424,14 @@ def render(stdscr, st: State):
         idx = st.file_view_offset + i
         depth, name, kind, payload, *rest = (*item, None)[:5]
         indent = "  " * depth
+        summary = ""
         if kind == "dir":
             is_collapsed = rest[0] if rest else False
-            dir_path = payload
-            dir_files = files_under_dir(st, dir_path)
-            n_viewed = sum(1 for f in dir_files if f.viewed)
-            total = len(dir_files)
-            summary = f" {n_viewed}/{total}" if total else ""
+            dir_files = files_under_dir(st, payload)
+            if dir_files:
+                summary = f"{sum(1 for f in dir_files if f.viewed)}/{len(dir_files)}"
             glyph = "▶" if is_collapsed else "▼"
-            line = f"{indent}{glyph} {name}/{summary}"
+            line = f"{indent}{glyph} {name}/"
             base = curses.A_BOLD
         else:
             fe = st.files[payload]
@@ -446,7 +445,15 @@ def render(stdscr, st: State):
             attr = curses.A_REVERSE
         else:
             attr = base
-        safe_addstr(stdscr, top_h + 1 + i, 1, line.ljust(iw), attr, maxw=iw)
+        row = top_h + 1 + i
+        safe_addstr(stdscr, row, 1, line.ljust(iw), attr, maxw=iw)
+        if summary:
+            # Overwrite the right edge with the non-bold summary, keeping the
+            # selection background when the row is selected.
+            summary_attr = (attr & ~curses.A_BOLD) | curses.A_DIM
+            sx = 1 + iw - len(summary)
+            if sx > len(line) + 1:
+                safe_addstr(stdscr, row, sx, summary, summary_attr, maxw=iw - (sx - 1))
     draw_scrollbar(stdscr, top_h + 1, left_w - 2, vh, st.file_view_offset, vh, len(st.tree), st.focus == 1)
 
     # --- Diff pane ---
