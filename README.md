@@ -51,61 +51,134 @@ On start it will:
 
 Global:
 - `Tab` / `Shift-Tab` — cycle panes (PRs → Pending → Files → Diff)
+- `0` / `1` / `2` / `3` — focus a pane directly (`0` Diff, `1` PRs, `2` Pending, `3` Files)
 - `q` — quit
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
-- `Shift+J` / `Shift+K` — scroll the diff one line (works from any pane)
-- `Shift+C` — comment on the current hunk (opens a modal editor)
-- `Shift+F` — finish review (submit all pending comments)
-- mouse wheel — scroll the pane under the cursor (independent of selection)
+- `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
+  focused, otherwise the diff (works from any pane)
+- `c` — comment on the current hunk (opens a modal editor)
+- `f` — finish review (submit the pending review)
+- mouse wheel — scroll the pane under the cursor (stops at the content edge)
 - click — focus a pane
 
 PRs pane:
 - `j` / `k` / arrows — move
 - `Enter` — `gh pr checkout` the selected PR
 - `d` / `u` or PgDn / PgUp — scroll the details view
+- `Shift+J` / `Shift+K` — scroll the PR summary line-by-line
+
+The PR summary renders markdown (headings, lists, task-boxes, quotes, code
+blocks, links), expands `<details>`/`<summary>` sections, and hides HTML
+comments (`<!-- … -->`).
 
 Pending pane:
 - `j` / `k` — move
-- `d` — discard the highlighted pending comment
+- `Enter` — open the submit-review modal
+- `d` — discard the highlighted pending comment (deleted from the draft review on GitHub)
+
+While the Pending pane is focused the right pane shows the selected comment's
+target hunk (with the anchored line marked) and the comment body below it.
 
 Files pane:
 - `j` / `k` — move
 - `Space` — collapse / expand folder
+- `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `v` — toggle viewed on file, or on all files under a folder
+- `e` — open the selected file in the editor (top of file)
 - `Enter` — open file in the diff pane (focuses diff)
 
 Diff pane:
 - `j` / `k` / arrows — jump to next / previous hunk
-- `d` / `u` or PgDn / PgUp — page down / up
-- `g` / `G` — top / bottom
-- `Shift+C` — comment on the current hunk
+- `PgDn` / `PgUp` — page down / up
+- `c` — comment on the current hunk
+- `e` — open the file in the editor at the current hunk's line
 - `Esc` — back to the files pane
 
-### Comment modal (`Shift+C` in diff pane)
+The currently-focused hunk is highlighted with a cyan background band (same hue
+as the `@@` headers, lighter) plus a green side-bar, so it stands out. The
+highlight only shows while the diff pane is focused.
+
+### Comment modal (`c` in diff pane)
 
 Opens a multi-line text editor anchored to the first commentable line in the
 current hunk (`RIGHT` side by default, `LEFT` if the hunk is a pure deletion).
 
-- typing — insert text
-- `Enter` — insert a newline
+- typing — insert text (long lines soft-wrap for display; no newline is added)
+- `Shift+Enter` — insert a newline
+- `Enter` — add to the pending review
 - `Backspace` — delete character
 - Arrow keys / `Home` / `End` — move cursor
-- `Ctrl+S` — add to the pending review
-- `Ctrl+X` — send *now* as a single-comment review (event = `COMMENT`)
 - `Esc` — cancel
 
-### Finish-review modal (`Shift+F`)
+Adding a comment creates (or reuses) a **pending review on GitHub** and attaches
+the comment to it, so pending comments persist across restarts and show up on
+github.com's review UI. They stay private until you finish the review.
 
-Two-step:
+### Submit-review modal (`f`, or `Enter` in the Pending pane)
 
-1. Multi-line body editor. `Ctrl+S` continues, `Esc` cancels.
-2. Choice screen: `a` approve · `c` comment · `r` request changes · `Esc` cancel.
+A single modal with two halves:
 
-On submit, a review is created via GraphQL with all pending comments as
-inline threads, then submitted with the chosen event.
+1. **Description** editor (top). `Shift+Enter` inserts a newline; `Enter` moves
+   focus down to the event choices; `Esc` cancels.
+2. **Event** choice (bottom): `j`/`k` to pick *Comment*, *Request changes*, or
+   *Approve*; `Enter` submits; `k` at the top jumps back to the description;
+   `Esc` cancels.
+
+On submit, the existing pending review (with all its comments) is submitted with
+the chosen event.
+
+> `Shift+Enter` relies on the terminal's `modifyOtherKeys` (or kitty keyboard)
+> support — foot, kitty, wezterm, ghostty, alacritty and xterm all qualify.
+
+### Editor integration (`e`)
+
+`e` opens the file in a running Neovim server (`/tmp/nvim.sock`) at the relevant
+line and focuses the window via `hyprctl`. This is wired for an Omarchy/Hyprland
++ Neovim setup; adjust `open_in_editor` in `ghreview/editor.py` for a different
+editor or window manager.
 
 ## Notes
 
 - "Viewed" state is stored server-side on GitHub; toggling here syncs to the PR review UI on github.com.
+- Pending review comments are stored server-side too — close the app and they're still there when you return.
 - Diffs are fetched once per checkout — press `r` to reload after new pushes.
 - File pagination handles PRs with up to a few hundred files.
+
+## Project layout
+
+`gh-review-ui` is a thin launcher; the implementation lives in the `ghreview/`
+package, split so that almost all logic is curses-free and unit-testable:
+
+| Module | Responsibility |
+| --- | --- |
+| `gh` | `gh` CLI / GraphQL subprocess wrappers |
+| `api` | GitHub domain calls (PRs, files, diffs, viewed-state, reviews) |
+| `models` | dataclasses + the central `State` |
+| `diff` | unified-diff parsing and hunk indexing |
+| `markdown` | markdown/HTML → styled terminal lines |
+| `tree` | file-tree building and folding |
+| `navigation` | cursor / hunk / selection logic over `State` |
+| `keys` | keyboard decoding (modifier+Enter, flow control) |
+| `theme` | color pairs + generic highlight/coloring helpers |
+| `textbuffer` | modal text editor + soft-wrapping |
+| `render` | curses drawing primitives and the panes |
+| `modals` | comment / finish-review modal loops |
+| `editor` | external-editor integration |
+| `worker` | background thread running blocking `gh` jobs |
+| `controller` | state transitions + job orchestration |
+| `app` | curses bootstrap, main loop, entry point |
+
+## Development
+
+Requirements are still zero-dependency at runtime (stdlib `curses` + threads).
+The tests use `pytest`:
+
+```sh
+python -m pytest
+```
+
+The suite covers the pure logic — diff parsing, markdown, the file tree, hunk
+navigation, key decoding, the text buffer/soft-wrap, theming, layout, the
+GitHub API request building (with a fake GraphQL client), and the controller's
+state transitions. The curses drawing code is exercised indirectly through
+those seams.
