@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""prtui — minimal lazygit-style GitHub PR review TUI.
+"""gh-review-ui — minimal lazygit-style GitHub PR review TUI.
 
-Panes:
-  top-left     PRs authored by / requesting review from you
-  bottom-left  Files of the checked-out PR as a tree
-  right        Diff of the highlighted / opened file
+Panes (left column, top-down):
+  PRs                 open PRs you authored / are asked to review
+  Pending             review comments queued locally, not yet submitted
+  Files               file tree of the checked-out PR (viewed-state)
 
-Backend: `gh` CLI (auth, PR list, checkout, diff) + GraphQL (viewed state).
+Right pane switches based on focus:
+  PRs focused         PR title + body + timeline (comments & reviews)
+  Files / Diff        diff of the highlighted / opened file, hunk-navigable
+
+Backend: `gh` CLI + GraphQL. No third-party Python deps.
 """
 import curses
+import curses.ascii
 import json
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -37,12 +44,16 @@ def gh_graphql(query, **variables):
     for k, v in variables.items():
         if v is None:
             continue
-        if isinstance(v, int):
+        if isinstance(v, bool):
+            args += ["-F", f"{k}={'true' if v else 'false'}"]
+        elif isinstance(v, int):
             args += ["-F", f"{k}={v}"]
         else:
             args += ["-f", f"{k}={v}"]
     return json.loads(sh(args))
 
+
+# ---------- domain ----------
 
 @dataclass
 class PR:
@@ -59,9 +70,17 @@ class FileEntry:
     viewed: bool
 
 
+@dataclass
+class PendingComment:
+    path: str
+    body: str
+    line: int          # line number on the chosen side
+    side: str          # "RIGHT" or "LEFT"
+
+
 def detect_repo():
-    data = gh_json(["repo", "view", "--json", "owner,name"])
-    return data["owner"]["login"], data["name"]
+    d = gh_json(["repo", "view", "--json", "owner,name"])
+    return d["owner"]["login"], d["name"]
 
 
 def load_prs():
@@ -119,29 +138,91 @@ def load_files(owner, name, number):
     return pr_id, entries
 
 
-def load_diff(number):
-    raw = sh(["gh", "pr", "diff", str(number)])
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_diff(raw):
+    """Return (per_file_lines, per_file_line_info).
+
+    per_file_line_info[path] is a list, one entry per diff line, where each
+    entry is (old_line_no or None, new_line_no or None).
+    """
     per_file = {}
+    per_info = {}
     current_path = None
     buf = []
+    info = []
+    old_no = new_no = None
+    in_hunk = False
+
+    def flush():
+        if current_path is not None:
+            per_file[current_path] = buf[:]
+            per_info[current_path] = info[:]
+
     for line in raw.splitlines():
         if line.startswith("diff --git "):
-            if current_path is not None:
-                per_file[current_path] = buf
+            flush()
             buf = [line]
+            info = [(None, None)]
             try:
                 current_path = line.split(" b/", 1)[1]
             except IndexError:
                 current_path = None
+            in_hunk = False
+            old_no = new_no = None
+            continue
+        if current_path is None:
+            continue
+        buf.append(line)
+        if line.startswith("@@"):
+            m = HUNK_RE.match(line)
+            if m:
+                old_no = int(m.group(1))
+                new_no = int(m.group(3))
+                in_hunk = True
+            info.append((None, None))
+            continue
+        if not in_hunk:
+            info.append((None, None))
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            info.append((None, new_no))
+            new_no += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            info.append((old_no, None))
+            old_no += 1
+        elif line.startswith("\\"):  # "\ No newline at end of file"
+            info.append((None, None))
         else:
-            buf.append(line)
-    if current_path is not None:
-        per_file[current_path] = buf
-    return per_file
+            info.append((old_no, new_no))
+            old_no += 1
+            new_no += 1
+    flush()
+    return per_file, per_info
 
 
 def compute_hunks(diff_lines):
-    return [i for i, ln in enumerate(diff_lines) if ln.startswith("@@")]
+    """Return list of (start_idx, end_idx_exclusive) for each hunk header."""
+    starts = [i for i, ln in enumerate(diff_lines) if ln.startswith("@@")]
+    ranges = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(diff_lines)
+        ranges.append((s, e))
+    return ranges
+
+
+def load_diff(number):
+    raw = sh(["gh", "pr", "diff", str(number)])
+    return parse_diff(raw)
+
+
+def load_pr_details(number):
+    data = gh_json([
+        "pr", "view", str(number),
+        "--json", "title,body,author,state,url,createdAt,reviewDecision,comments,reviews",
+    ])
+    return data
 
 
 def mark_viewed_api(pr_id, path, viewed):
@@ -154,25 +235,75 @@ def checkout_pr(number):
     sh(["gh", "pr", "checkout", str(number)])
 
 
+def submit_review_api(pr_id, comments, event, body):
+    """Start a review, add all threads, then submit.
+
+    event: "APPROVE" | "COMMENT" | "REQUEST_CHANGES"
+    comments: list[PendingComment]
+    """
+    q_start = """
+    mutation($pr:ID!) {
+      addPullRequestReview(input:{pullRequestId:$pr}) {
+        pullRequestReview { id }
+      }
+    }
+    """
+    review_id = gh_graphql(q_start, pr=pr_id)["data"]["addPullRequestReview"]["pullRequestReview"]["id"]
+    q_thread = """
+    mutation($r:ID!, $path:String!, $line:Int!, $body:String!, $side:DiffSide!) {
+      addPullRequestReviewThread(input:{
+        pullRequestReviewId:$r, path:$path, line:$line, body:$body, side:$side
+      }) { thread { id } }
+    }
+    """
+    for c in comments:
+        gh_graphql(q_thread, r=review_id, path=c.path, line=c.line, body=c.body, side=c.side)
+    q_submit = """
+    mutation($r:ID!, $event:PullRequestReviewEvent!, $body:String) {
+      submitPullRequestReview(input:{pullRequestReviewId:$r, event:$event, body:$body}) {
+        pullRequestReview { id }
+      }
+    }
+    """
+    gh_graphql(q_submit, r=review_id, event=event, body=body or None)
+
+
 # ---------- state ----------
+
+FOCUS_PRS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF = 0, 1, 2, 3
+
 
 @dataclass
 class State:
     repo_owner: str = ""
     repo_name: str = ""
+
     prs: list = field(default_factory=list)
     pr_idx: int = 0
     pr_view_offset: int = 0
     active_pr: Optional[PR] = None
+
     files: list = field(default_factory=list)
     collapsed_dirs: set = field(default_factory=set)
     tree: list = field(default_factory=list)
     file_idx: int = 0
     file_view_offset: int = 0
+
     diff_by_file: dict = field(default_factory=dict)
+    info_by_file: dict = field(default_factory=dict)
     hunks_by_file: dict = field(default_factory=dict)
     diff_scroll: int = 0
-    focus: int = 0  # 0=prs 1=files 2=diff
+
+    # PR details for the right pane when PRs is focused
+    pr_details: dict = field(default_factory=dict)  # number -> data or None (loading)
+    details_scroll: int = 0
+
+    # Pending comments (local queue)
+    pending: list = field(default_factory=list)
+    pending_idx: int = 0
+    pending_view_offset: int = 0
+
+    focus: int = FOCUS_PRS
     status: str = ""
     busy: set = field(default_factory=set)
     rects: dict = field(default_factory=dict)
@@ -237,11 +368,11 @@ def worker_loop(jobs: queue.Queue, results: queue.Queue):
                 _, owner, name = job
                 n = current_pr_number()
                 if n is None:
-                    results.put(("active", None, None, [], {}))
+                    results.put(("active", None, None, [], {}, {}))
                 else:
                     pr_id, files = load_files(owner, name, n)
-                    diff = load_diff(n)
-                    results.put(("active", n, pr_id, files, diff))
+                    diff, info = load_diff(n)
+                    results.put(("active", n, pr_id, files, diff, info))
             elif kind == "checkout":
                 _, number = job
                 checkout_pr(number)
@@ -252,36 +383,39 @@ def worker_loop(jobs: queue.Queue, results: queue.Queue):
                 results.put(("viewed_ok", [path], viewed))
             elif kind == "mark_viewed_bulk":
                 _, pr_id, paths, viewed = job
-                done = []
-                errs = []
+                done, errs = [], []
                 for p in paths:
                     try:
                         mark_viewed_api(pr_id, p, viewed)
                         done.append(p)
                     except Exception as e:
                         errs.append((p, str(e)))
-                if errs:
-                    results.put(("viewed_bulk", done, viewed, errs))
-                else:
-                    results.put(("viewed_ok", done, viewed))
+                results.put(("viewed_bulk", done, viewed, errs))
+            elif kind == "load_pr_details":
+                _, number = job
+                data = load_pr_details(number)
+                results.put(("pr_details", number, data))
+            elif kind == "submit_review":
+                _, pr_id, comments, event, body = job
+                submit_review_api(pr_id, comments, event, body)
+                results.put(("review_submitted", event, len(comments)))
         except Exception as e:
             results.put(("error", kind, str(e)))
 
 
-# ---------- theme / rendering ----------
+# ---------- theme ----------
 
 class Theme:
-    """Color pair IDs; initialised in run()."""
     ADD = 1
     DEL = 2
     HUNK = 3
-    FOCUS = 4     # green fg (borders/titles/scrollbar of focused pane)
-    ACTIVE = 5    # cyan fg (active PR marker)
-    SEL_FOCUS = 6 # black on green (selected in focused pane)
-    SEL = 7       # reversed (selected in unfocused pane)
-    STATUS = 8    # bright status line
-    KEYS = 9      # dim key hints
-    TITLE = 10    # yellow (unfocused title accent)
+    FOCUS = 4
+    ACTIVE = 5
+    SEL_FOCUS = 6
+    STATUS = 8
+    KEYS = 9
+    TITLE = 10
+    CURHUNK = 11
 
 
 def init_theme():
@@ -292,11 +426,13 @@ def init_theme():
     curses.init_pair(Theme.FOCUS, curses.COLOR_GREEN, -1)
     curses.init_pair(Theme.ACTIVE, curses.COLOR_CYAN, -1)
     curses.init_pair(Theme.SEL_FOCUS, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(Theme.SEL, -1, -1)
     curses.init_pair(Theme.STATUS, curses.COLOR_YELLOW, -1)
     curses.init_pair(Theme.KEYS, curses.COLOR_WHITE, -1)
     curses.init_pair(Theme.TITLE, curses.COLOR_YELLOW, -1)
+    curses.init_pair(Theme.CURHUNK, curses.COLOR_GREEN, -1)
 
+
+# ---------- rendering primitives ----------
 
 def safe_addstr(win, y, x, s, attr=0, maxw=None):
     if maxw is not None:
@@ -338,12 +474,11 @@ def draw_scrollbar(win, y, x, h, view_offset, view_h, total, focused=False):
     bar_attr = curses.color_pair(Theme.FOCUS) | curses.A_BOLD if focused else curses.A_DIM
     track_attr = curses.A_DIM
     for i in range(h):
-        if bar_y <= i < bar_y + bar_h:
-            try: win.addstr(y + i, x, "█", bar_attr)
-            except curses.error: pass
-        else:
-            try: win.addstr(y + i, x, "░", track_attr)
-            except curses.error: pass
+        ch = "█" if bar_y <= i < bar_y + bar_h else "░"
+        try:
+            win.addstr(y + i, x, ch, bar_attr if bar_y <= i < bar_y + bar_h else track_attr)
+        except curses.error:
+            pass
 
 
 def clamp_view(idx, view_offset, view_h, total):
@@ -358,13 +493,37 @@ def clamp_view(idx, view_offset, view_h, total):
     return view_offset
 
 
-def shortcuts_for(st: State):
-    common = "Tab: next pane · r: refresh · q: quit · Shift+J/K: scroll diff · mouse-wheel: scroll hovered"
-    if st.focus == 0:
-        return f"Enter: checkout · j/k: move · {common}"
-    if st.focus == 1:
-        return f"Enter: open in diff · v: toggle viewed (folder = all) · Space: fold/expand · j/k: move · {common}"
-    return f"j/k: next/prev hunk · d/u: page · g/G: top/bottom · Esc: back to files · {common}"
+# ---------- current hunk helpers ----------
+
+def current_hunk_range(st: State, path: str):
+    hunks = st.hunks_by_file.get(path, [])
+    if not hunks:
+        return None
+    cur = None
+    for s, e in hunks:
+        if s <= st.diff_scroll:
+            cur = (s, e)
+        else:
+            break
+    return cur or hunks[0]
+
+
+def hunk_anchor_line(st: State, path: str):
+    """Return (line_no, side) for the first non-header line of the current hunk."""
+    hr = current_hunk_range(st, path)
+    info = st.info_by_file.get(path, [])
+    if not hr:
+        return None
+    s, e = hr
+    for i in range(s + 1, e):
+        if i >= len(info):
+            break
+        old, new = info[i]
+        if new is not None:
+            return (new, "RIGHT")
+        if old is not None:
+            return (old, "LEFT")
+    return None
 
 
 def cur_file_path(st: State):
@@ -373,33 +532,33 @@ def cur_file_path(st: State):
     return None
 
 
-def render(stdscr, st: State):
-    stdscr.erase()
-    H, W = stdscr.getmaxyx()
-    left_w = max(36, W // 3)
-    right_w = W - left_w
-    body_h = H - 2  # two status lines
-    top_h = max(6, body_h // 2)
-    bot_h = body_h - top_h
+# ---------- shortcut hints ----------
 
-    st.rects = {
-        "prs": (0, 0, top_h, left_w),
-        "files": (top_h, 0, bot_h, left_w),
-        "diff": (0, left_w, body_h, right_w),
-    }
+def shortcuts_for(st: State):
+    common = "Tab: next · Shift+F: finish review · Shift+J/K: scroll diff · r: refresh · q: quit"
+    if st.focus == FOCUS_PRS:
+        return f"Enter: checkout · j/k: move · {common}"
+    if st.focus == FOCUS_PENDING:
+        return f"j/k: move · d: delete · {common}"
+    if st.focus == FOCUS_FILES:
+        return f"Enter: open diff · v: viewed (folder = all) · Space: fold · j/k: move · {common}"
+    return f"j/k: next/prev hunk · d/u: page · g/G: top/bottom · Shift+C: comment hunk · Esc: back · {common}"
 
-    # --- PR pane ---
-    draw_box(stdscr, 0, 0, top_h, left_w,
-             f"PRs [{st.repo_owner}/{st.repo_name}]", st.focus == 0, busy="prs" in st.busy)
-    vh = top_h - 2
-    iw = left_w - 3
+
+# ---------- panes: PRs / Pending / Files ----------
+
+def render_prs(stdscr, st: State, y, x, h, w):
+    draw_box(stdscr, y, x, h, w, f"PRs [{st.repo_owner}/{st.repo_name}]",
+             st.focus == FOCUS_PRS, busy="prs" in st.busy)
+    vh = h - 2
+    iw = w - 3
     st.pr_view_offset = clamp_view(st.pr_idx, st.pr_view_offset, vh, len(st.prs))
     for i, pr in enumerate(st.prs[st.pr_view_offset : st.pr_view_offset + vh]):
         idx = st.pr_view_offset + i
         active = st.active_pr and st.active_pr.number == pr.number
         marker = "● " if active else "  "
         line = f"{marker}#{pr.number} {pr.title}"
-        selected = idx == st.pr_idx and st.focus == 0
+        selected = idx == st.pr_idx and st.focus == FOCUS_PRS
         if selected:
             attr = curses.color_pair(Theme.SEL_FOCUS) | curses.A_BOLD
         elif idx == st.pr_idx:
@@ -408,17 +567,44 @@ def render(stdscr, st: State):
             attr = curses.color_pair(Theme.ACTIVE) | curses.A_BOLD
         else:
             attr = 0
-        safe_addstr(stdscr, 1 + i, 1, line.ljust(iw), attr, maxw=iw)
-    draw_scrollbar(stdscr, 1, left_w - 2, vh, st.pr_view_offset, vh, len(st.prs), st.focus == 0)
+        safe_addstr(stdscr, y + 1 + i, x + 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.pr_view_offset, vh, len(st.prs), st.focus == FOCUS_PRS)
 
-    # --- Files pane ---
+
+def render_pending(stdscr, st: State, y, x, h, w):
+    draw_box(stdscr, y, x, h, w, f"Pending ({len(st.pending)})",
+             st.focus == FOCUS_PENDING, busy="review" in st.busy)
+    vh = h - 2
+    iw = w - 3
+    if not st.pending:
+        safe_addstr(stdscr, y + 1, x + 2, "No pending comments", curses.A_DIM, maxw=iw)
+        return
+    st.pending_view_offset = clamp_view(st.pending_idx, st.pending_view_offset, vh, len(st.pending))
+    for i, c in enumerate(st.pending[st.pending_view_offset : st.pending_view_offset + vh]):
+        idx = st.pending_view_offset + i
+        first_line = c.body.splitlines()[0] if c.body else ""
+        line = f"{c.path}:{c.line}  {first_line}"
+        selected = idx == st.pending_idx and st.focus == FOCUS_PENDING
+        if selected:
+            attr = curses.color_pair(Theme.SEL_FOCUS) | curses.A_BOLD
+        elif idx == st.pending_idx:
+            attr = curses.A_REVERSE
+        else:
+            attr = 0
+        safe_addstr(stdscr, y + 1 + i, x + 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.pending_view_offset, vh, len(st.pending),
+                   st.focus == FOCUS_PENDING)
+
+
+def render_files(stdscr, st: State, y, x, h, w):
     files_title = "Files"
     if st.active_pr:
         n_viewed = sum(1 for f in st.files if f.viewed)
         files_title = f"Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
-    draw_box(stdscr, top_h, 0, bot_h, left_w, files_title, st.focus == 1, busy="active" in st.busy or "viewed" in st.busy)
-    vh = bot_h - 2
-    iw = left_w - 3
+    draw_box(stdscr, y, x, h, w, files_title,
+             st.focus == FOCUS_FILES, busy="active" in st.busy or "viewed" in st.busy)
+    vh = h - 2
+    iw = w - 3
     st.file_view_offset = clamp_view(st.file_idx, st.file_view_offset, vh, len(st.tree))
     for i, item in enumerate(st.tree[st.file_view_offset : st.file_view_offset + vh]):
         idx = st.file_view_offset + i
@@ -438,37 +624,42 @@ def render(stdscr, st: State):
             mark = "✔" if fe.viewed else " "
             line = f"{indent}[{mark}] {name}"
             base = curses.color_pair(Theme.ADD) | curses.A_DIM if fe.viewed else 0
-        selected = idx == st.file_idx and st.focus == 1
+        selected = idx == st.file_idx and st.focus == FOCUS_FILES
         if selected:
             attr = curses.color_pair(Theme.SEL_FOCUS) | curses.A_BOLD
         elif idx == st.file_idx:
             attr = curses.A_REVERSE
         else:
             attr = base
-        row = top_h + 1 + i
-        safe_addstr(stdscr, row, 1, line.ljust(iw), attr, maxw=iw)
+        row = y + 1 + i
+        safe_addstr(stdscr, row, x + 1, line.ljust(iw), attr, maxw=iw)
         if summary:
-            # Overwrite the right edge with the non-bold summary, keeping the
-            # selection background when the row is selected.
             summary_attr = (attr & ~curses.A_BOLD) | curses.A_DIM
-            sx = 1 + iw - len(summary)
-            if sx > len(line) + 1:
-                safe_addstr(stdscr, row, sx, summary, summary_attr, maxw=iw - (sx - 1))
-    draw_scrollbar(stdscr, top_h + 1, left_w - 2, vh, st.file_view_offset, vh, len(st.tree), st.focus == 1)
+            sx = x + 1 + iw - len(summary)
+            if sx > x + 1 + len(line):
+                safe_addstr(stdscr, row, sx, summary, summary_attr, maxw=iw - (sx - x - 1))
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.file_view_offset, vh, len(st.tree),
+                   st.focus == FOCUS_FILES)
 
-    # --- Diff pane ---
-    cur_path = cur_file_path(st)
-    title = f"Diff — {cur_path}" if cur_path else "Diff"
-    draw_box(stdscr, 0, left_w, body_h, right_w, title, st.focus == 2)
-    diff_lines = st.diff_by_file.get(cur_path, []) if cur_path else []
-    if not diff_lines and cur_path:
+
+# ---------- right pane: diff and PR details ----------
+
+def render_diff(stdscr, st: State, y, x, h, w):
+    path = cur_file_path(st)
+    title = f"Diff — {path}" if path else "Diff"
+    draw_box(stdscr, y, x, h, w, title, st.focus == FOCUS_DIFF)
+    diff_lines = st.diff_by_file.get(path, []) if path else []
+    if not diff_lines and path:
         diff_lines = ["(no diff — file may be binary, removed, or too large)"]
-    vh = body_h - 2
-    iw = right_w - 3
+    vh = h - 2
+    iw = w - 3
     max_scroll = max(0, len(diff_lines) - vh)
     if st.diff_scroll > max_scroll:
         st.diff_scroll = max_scroll
+    cur_hr = current_hunk_range(st, path) if path else None
+
     for i, ln in enumerate(diff_lines[st.diff_scroll : st.diff_scroll + vh]):
+        line_idx = st.diff_scroll + i
         attr = 0
         if ln.startswith("+") and not ln.startswith("+++"):
             attr = curses.color_pair(Theme.ADD)
@@ -478,14 +669,275 @@ def render(stdscr, st: State):
             attr = curses.color_pair(Theme.HUNK) | curses.A_BOLD
         elif ln.startswith(("diff --git", "index ", "+++", "---")):
             attr = curses.A_BOLD
-        safe_addstr(stdscr, 1 + i, left_w + 1, ln, attr, maxw=iw)
-    draw_scrollbar(stdscr, 1, left_w + right_w - 2, vh, st.diff_scroll, vh, len(diff_lines), st.focus == 2)
+        # Current-hunk left-bar marker
+        in_current = cur_hr and cur_hr[0] <= line_idx < cur_hr[1]
+        row_y = y + 1 + i
+        if in_current:
+            safe_addstr(stdscr, row_y, x + 1, "▎",
+                        curses.color_pair(Theme.CURHUNK) | curses.A_BOLD)
+            safe_addstr(stdscr, row_y, x + 2, ln, attr, maxw=iw - 1)
+        else:
+            safe_addstr(stdscr, row_y, x + 2, ln, attr, maxw=iw - 1)
 
-    # --- Status lines ---
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.diff_scroll, vh, len(diff_lines),
+                   st.focus == FOCUS_DIFF)
+
+
+def format_pr_details(data):
+    """Return a list of (line, attr_key) tuples for rendering."""
+    out = []
+    add = lambda s, k="plain": out.append((s, k))
+    title = data.get("title") or ""
+    state = data.get("state") or ""
+    author = (data.get("author") or {}).get("login") or "?"
+    decision = data.get("reviewDecision") or ""
+    created = data.get("createdAt") or ""
+    url = data.get("url") or ""
+    add(title, "title")
+    line = f"by {author} · {state}"
+    if decision:
+        line += f" · review: {decision}"
+    if created:
+        line += f" · {created[:10]}"
+    add(line, "meta")
+    if url:
+        add(url, "meta")
+    add("", "plain")
+    body = data.get("body") or "(no description)"
+    for ln in body.splitlines():
+        add(ln, "plain")
+    add("", "plain")
+    add("━━━ Timeline ━━━", "sep")
+    events = []
+    for c in data.get("comments") or []:
+        events.append(("comment", c.get("createdAt") or "", c))
+    for r in data.get("reviews") or []:
+        events.append(("review", r.get("createdAt") or "", r))
+    events.sort(key=lambda e: e[1] or "")
+    for kind, ts, item in events:
+        who = (item.get("author") or {}).get("login") or "?"
+        when = (ts or "")[:19].replace("T", " ")
+        if kind == "review":
+            head = f"[review] {who} · {item.get('state') or ''} · {when}"
+        else:
+            head = f"[comment] {who} · {when}"
+        add(head, "sep")
+        body = (item.get("body") or "").strip()
+        if body:
+            for ln in body.splitlines():
+                add(ln, "plain")
+        else:
+            add("(no body)", "dim")
+        add("", "plain")
+    return out
+
+
+def render_pr_details(stdscr, st: State, y, x, h, w):
+    pr = st.prs[st.pr_idx] if st.prs and 0 <= st.pr_idx < len(st.prs) else None
+    if not pr:
+        draw_box(stdscr, y, x, h, w, "PR details", False)
+        return
+    data = st.pr_details.get(pr.number)
+    title = f"PR #{pr.number} · {pr.title}"
+    busy = data is None
+    draw_box(stdscr, y, x, h, w, title, False, busy=busy)
+    vh = h - 2
+    iw = w - 3
+    if data is None:
+        safe_addstr(stdscr, y + 1, x + 2, "Loading…", curses.A_DIM, maxw=iw)
+        return
+    lines = format_pr_details(data)
+    max_scroll = max(0, len(lines) - vh)
+    if st.details_scroll > max_scroll:
+        st.details_scroll = max_scroll
+    for i, (ln, kind) in enumerate(lines[st.details_scroll : st.details_scroll + vh]):
+        attr = 0
+        if kind == "title":
+            attr = curses.color_pair(Theme.FOCUS) | curses.A_BOLD
+        elif kind == "meta":
+            attr = curses.color_pair(Theme.ACTIVE)
+        elif kind == "sep":
+            attr = curses.color_pair(Theme.HUNK) | curses.A_BOLD
+        elif kind == "dim":
+            attr = curses.A_DIM
+        safe_addstr(stdscr, y + 1 + i, x + 2, ln, attr, maxw=iw - 1)
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.details_scroll, vh, len(lines), False)
+
+
+# ---------- top-level render ----------
+
+def render(stdscr, st: State):
+    stdscr.erase()
+    H, W = stdscr.getmaxyx()
+    left_w = max(38, W // 3)
+    right_w = W - left_w
+    body_h = H - 2
+    pr_h = max(6, body_h * 2 // 7)
+    pending_h = max(4, body_h // 6)
+    files_h = body_h - pr_h - pending_h
+
+    st.rects = {
+        "prs": (0, 0, pr_h, left_w),
+        "pending": (pr_h, 0, pending_h, left_w),
+        "files": (pr_h + pending_h, 0, files_h, left_w),
+        "right": (0, left_w, body_h, right_w),
+    }
+
+    render_prs(stdscr, st, 0, 0, pr_h, left_w)
+    render_pending(stdscr, st, pr_h, 0, pending_h, left_w)
+    render_files(stdscr, st, pr_h + pending_h, 0, files_h, left_w)
+    if st.focus == FOCUS_PRS:
+        render_pr_details(stdscr, st, 0, left_w, body_h, right_w)
+    else:
+        render_diff(stdscr, st, 0, left_w, body_h, right_w)
+
     status = st.status or "Ready."
-    safe_addstr(stdscr, H - 2, 0, status.ljust(W - 1), curses.color_pair(Theme.STATUS) | curses.A_BOLD, maxw=W - 1)
-    safe_addstr(stdscr, H - 1, 0, shortcuts_for(st).ljust(W - 1), curses.color_pair(Theme.KEYS) | curses.A_DIM, maxw=W - 1)
+    safe_addstr(stdscr, H - 2, 0, status.ljust(W - 1),
+                curses.color_pair(Theme.STATUS) | curses.A_BOLD, maxw=W - 1)
+    safe_addstr(stdscr, H - 1, 0, shortcuts_for(st).ljust(W - 1),
+                curses.color_pair(Theme.KEYS) | curses.A_DIM, maxw=W - 1)
     stdscr.refresh()
+
+
+# ---------- text-area modal ----------
+
+class TextArea:
+    def __init__(self, initial=""):
+        self.lines = initial.split("\n") if initial else [""]
+        if not self.lines:
+            self.lines = [""]
+        self.row = len(self.lines) - 1
+        self.col = len(self.lines[-1])
+
+    def text(self):
+        return "\n".join(self.lines)
+
+    def handle(self, ch):
+        if ch == 27:
+            return "cancel"
+        if ch == 19:  # Ctrl+S
+            return "save"
+        if ch == 24:  # Ctrl+X
+            return "send"
+        if ch in (curses.KEY_ENTER, 10, 13):
+            cur = self.lines[self.row]
+            self.lines[self.row] = cur[:self.col]
+            self.lines.insert(self.row + 1, cur[self.col:])
+            self.row += 1
+            self.col = 0
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if self.col > 0:
+                self.lines[self.row] = self.lines[self.row][:self.col - 1] + self.lines[self.row][self.col:]
+                self.col -= 1
+            elif self.row > 0:
+                prev = self.lines[self.row - 1]
+                self.col = len(prev)
+                self.lines[self.row - 1] = prev + self.lines[self.row]
+                del self.lines[self.row]
+                self.row -= 1
+        elif ch == curses.KEY_LEFT:
+            if self.col > 0:
+                self.col -= 1
+            elif self.row > 0:
+                self.row -= 1
+                self.col = len(self.lines[self.row])
+        elif ch == curses.KEY_RIGHT:
+            if self.col < len(self.lines[self.row]):
+                self.col += 1
+            elif self.row < len(self.lines) - 1:
+                self.row += 1
+                self.col = 0
+        elif ch == curses.KEY_UP:
+            if self.row > 0:
+                self.row -= 1
+                self.col = min(self.col, len(self.lines[self.row]))
+        elif ch == curses.KEY_DOWN:
+            if self.row < len(self.lines) - 1:
+                self.row += 1
+                self.col = min(self.col, len(self.lines[self.row]))
+        elif ch == curses.KEY_HOME:
+            self.col = 0
+        elif ch == curses.KEY_END:
+            self.col = len(self.lines[self.row])
+        elif 32 <= ch < 127:
+            self.lines[self.row] = self.lines[self.row][:self.col] + chr(ch) + self.lines[self.row][self.col:]
+            self.col += 1
+        return None
+
+
+def _dim_background(stdscr):
+    # Just leave as-is; we simply draw the modal on top.
+    pass
+
+
+def show_editor_modal(stdscr, title, help_line, initial=""):
+    """Return (action, text). Action in {'save', 'send', 'cancel'}."""
+    ta = TextArea(initial)
+    curses.curs_set(1)
+    try:
+        while True:
+            H, W = stdscr.getmaxyx()
+            mh = max(8, min(20, H - 4))
+            mw = max(40, min(90, W - 4))
+            my = (H - mh) // 2
+            mx = (W - mw) // 2
+            # blank interior
+            for r in range(1, mh - 1):
+                safe_addstr(stdscr, my + r, mx + 1, " " * (mw - 2))
+            draw_box(stdscr, my, mx, mh, mw, title, True)
+            safe_addstr(stdscr, my + mh - 2, mx + 2, help_line,
+                        curses.color_pair(Theme.KEYS) | curses.A_DIM, maxw=mw - 4)
+            editor_h = mh - 3
+            editor_w = mw - 4
+            # Simple word-wrap-free rendering; horizontally clip long lines.
+            first = max(0, ta.row - editor_h + 1)
+            for i in range(editor_h):
+                idx = first + i
+                if idx >= len(ta.lines):
+                    break
+                safe_addstr(stdscr, my + 1 + i, mx + 2, ta.lines[idx], 0, maxw=editor_w)
+            try:
+                stdscr.move(my + 1 + (ta.row - first),
+                            mx + 2 + min(ta.col, editor_w - 1))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            action = ta.handle(ch)
+            if action:
+                return action, ta.text()
+    finally:
+        curses.curs_set(0)
+
+
+def show_choice_modal(stdscr, title, prompt, choices):
+    """choices = [(key_char, label)]. Return the chosen key_char or None."""
+    while True:
+        H, W = stdscr.getmaxyx()
+        mh = max(6, min(10, H - 4))
+        mw = max(40, min(70, W - 4))
+        my = (H - mh) // 2
+        mx = (W - mw) // 2
+        for r in range(1, mh - 1):
+            safe_addstr(stdscr, my + r, mx + 1, " " * (mw - 2))
+        draw_box(stdscr, my, mx, mh, mw, title, True)
+        safe_addstr(stdscr, my + 1, mx + 2, prompt, curses.A_BOLD, maxw=mw - 4)
+        for i, (k, label) in enumerate(choices):
+            safe_addstr(stdscr, my + 3 + i, mx + 2, f"  {k}  {label}",
+                        curses.color_pair(Theme.FOCUS) | curses.A_BOLD, maxw=mw - 4)
+        safe_addstr(stdscr, my + mh - 2, mx + 2, "Esc: cancel",
+                    curses.color_pair(Theme.KEYS) | curses.A_DIM, maxw=mw - 4)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch == 27:
+            return None
+        for k, _ in choices:
+            if ch == ord(k) or ch == ord(k.lower()) or ch == ord(k.upper()):
+                return k.lower()
 
 
 # ---------- controller ----------
@@ -502,10 +954,16 @@ def pane_at(st, my, mx):
     return None
 
 
-def submit(jobs, st, job):
-    tag = {"load_prs": "prs", "load_active": "active",
-           "checkout": "checkout", "mark_viewed": "viewed",
-           "mark_viewed_bulk": "viewed"}[job[0]]
+def submit_job(jobs, st, job):
+    tag = {
+        "load_prs": "prs",
+        "load_active": "active",
+        "checkout": "checkout",
+        "mark_viewed": "viewed",
+        "mark_viewed_bulk": "viewed",
+        "load_pr_details": "details",
+        "submit_review": "review",
+    }[job[0]]
     st.busy.add(tag)
     jobs.put(job)
 
@@ -519,11 +977,12 @@ def apply_result(st: State, res, jobs):
             st.pr_idx = max(0, len(st.prs) - 1)
     elif kind == "active":
         st.busy.discard("active")
-        number, pr_id, files, diff = res[1], res[2], res[3], res[4]
+        number, pr_id, files, diff, info = res[1], res[2], res[3], res[4], res[5]
         if number is None:
             st.active_pr = None
             st.files = []
             st.diff_by_file = {}
+            st.info_by_file = {}
             st.hunks_by_file = {}
         else:
             match = next((p for p in st.prs if p.number == number), None)
@@ -534,6 +993,7 @@ def apply_result(st: State, res, jobs):
             st.active_pr = match
             st.files = files
             st.diff_by_file = diff
+            st.info_by_file = info
             st.hunks_by_file = {p: compute_hunks(lines) for p, lines in diff.items()}
         st.file_idx = 0
         st.file_view_offset = 0
@@ -542,7 +1002,7 @@ def apply_result(st: State, res, jobs):
     elif kind == "checkout_done":
         st.busy.discard("checkout")
         st.status = f"Checked out #{res[1]} — reloading files…"
-        submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+        submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name))
     elif kind == "viewed_ok":
         paths, viewed = res[1], res[2]
         pset = set(paths)
@@ -550,10 +1010,7 @@ def apply_result(st: State, res, jobs):
             if f.path in pset:
                 f.viewed = viewed
         st.busy.discard("viewed")
-        if len(paths) == 1:
-            st.status = f"{'Marked' if viewed else 'Unmarked'} {paths[0]}"
-        else:
-            st.status = f"{'Marked' if viewed else 'Unmarked'} {len(paths)} files"
+        st.status = f"{'Marked' if viewed else 'Unmarked'} {len(paths)} file{'s' if len(paths)!=1 else ''}"
     elif kind == "viewed_bulk":
         done, viewed, errs = res[1], res[2], res[3]
         dset = set(done)
@@ -562,11 +1019,21 @@ def apply_result(st: State, res, jobs):
                 f.viewed = viewed
         st.busy.discard("viewed")
         st.status = f"{'Marked' if viewed else 'Unmarked'} {len(done)}, {len(errs)} failed"
+    elif kind == "pr_details":
+        number, data = res[1], res[2]
+        st.pr_details[number] = data
+        st.busy.discard("details")
+    elif kind == "review_submitted":
+        event, count = res[1], res[2]
+        st.pending = []
+        st.pending_idx = 0
+        st.busy.discard("review")
+        st.status = f"Review submitted ({event}) · {count} comment{'s' if count!=1 else ''}"
     elif kind == "error":
         _, job_kind, msg = res
-        tag = {"load_prs": "prs", "load_active": "active",
-               "checkout": "checkout", "mark_viewed": "viewed",
-               "mark_viewed_bulk": "viewed"}.get(job_kind, "")
+        tag = {"load_prs": "prs", "load_active": "active", "checkout": "checkout",
+               "mark_viewed": "viewed", "mark_viewed_bulk": "viewed",
+               "load_pr_details": "details", "submit_review": "review"}.get(job_kind, "")
         st.busy.discard(tag)
         st.status = f"[{job_kind}] {msg}"
 
@@ -577,33 +1044,93 @@ def scroll_diff(st: State, delta: int):
 
 def jump_hunk(st: State, direction: int):
     path = cur_file_path(st)
-    if not path:
-        return
-    hunks = st.hunks_by_file.get(path, [])
+    hunks = st.hunks_by_file.get(path, []) if path else []
     if not hunks:
         return
+    starts = [s for s, _ in hunks]
     cur = st.diff_scroll
     if direction > 0:
-        nxt = next((h for h in hunks if h > cur), None)
-        if nxt is not None:
-            st.diff_scroll = nxt
+        nxt = next((s for s in starts if s > cur), None)
+        st.diff_scroll = nxt if nxt is not None else starts[-1]
     else:
         prev = None
-        for h in hunks:
-            if h < cur:
-                prev = h
+        for s in starts:
+            if s < cur:
+                prev = s
             else:
                 break
-        if prev is not None:
-            st.diff_scroll = prev
-        else:
-            st.diff_scroll = hunks[0]
+        st.diff_scroll = prev if prev is not None else starts[0]
+
+
+def open_comment_modal(stdscr, st: State, jobs):
+    if st.focus != FOCUS_DIFF or not st.active_pr:
+        st.status = "Focus the diff pane to comment on a hunk."
+        return
+    path = cur_file_path(st)
+    if not path:
+        return
+    anchor = hunk_anchor_line(st, path)
+    if anchor is None:
+        st.status = "No commentable line in the current hunk."
+        return
+    line, side = anchor
+    action, body = show_editor_modal(
+        stdscr,
+        f"Comment on {path}:{line} ({side})",
+        "Ctrl+S: add to pending · Ctrl+X: send now as single review · Esc: cancel",
+    )
+    if action == "cancel" or not body.strip():
+        return
+    if action == "save":
+        st.pending.append(PendingComment(path=path, body=body.strip(), line=line, side=side))
+        st.status = f"Queued comment on {path}:{line}"
+    elif action == "send":
+        one = [PendingComment(path=path, body=body.strip(), line=line, side=side)]
+        submit_job(jobs, st, ("submit_review", st.active_pr.node_id, one, "COMMENT", ""))
+        st.status = "Sending single comment as a review…"
+
+
+def open_finish_modal(stdscr, st: State, jobs):
+    if not st.active_pr:
+        st.status = "No active PR."
+        return
+    action, body = show_editor_modal(
+        stdscr,
+        f"Finish review · {len(st.pending)} pending comment{'s' if len(st.pending)!=1 else ''}",
+        "Ctrl+S: continue to submit · Esc: cancel",
+    )
+    if action != "save":
+        return
+    choice = show_choice_modal(
+        stdscr,
+        "Submit review as",
+        f"How to submit these {len(st.pending)} comment(s)?",
+        [("a", "Approve"), ("c", "Comment"), ("r", "Request changes")],
+    )
+    if not choice:
+        return
+    event = {"a": "APPROVE", "c": "COMMENT", "r": "REQUEST_CHANGES"}[choice]
+    submit_job(jobs, st, ("submit_review", st.active_pr.node_id, list(st.pending), event, body))
+    st.status = f"Submitting review ({event})…"
+
+
+def maybe_load_details(st: State, jobs):
+    if not st.prs or "details" in st.busy:
+        return
+    pr = st.prs[st.pr_idx]
+    if pr.number not in st.pr_details:
+        st.pr_details[pr.number] = None
+        submit_job(jobs, st, ("load_pr_details", pr.number))
 
 
 def run(stdscr):
     curses.curs_set(0)
     init_theme()
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        os.environ.setdefault("ESCDELAY", "25")
     try:
         print("\033[?1000h\033[?1006h", end="", flush=True)
     except Exception:
@@ -622,9 +1149,11 @@ def run(stdscr):
         st.status = f"detect_repo: {e}"
 
     if st.repo_owner:
-        submit(jobs, st, ("load_prs",))
-        submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+        submit_job(jobs, st, ("load_prs",))
+        submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name))
 
+    prev_pr_idx = -1
+    prev_focus = -1
     while True:
         while True:
             try:
@@ -632,6 +1161,12 @@ def run(stdscr):
             except queue.Empty:
                 break
             apply_result(st, res, jobs)
+
+        if st.focus == FOCUS_PRS and (st.pr_idx != prev_pr_idx or prev_focus != FOCUS_PRS):
+            maybe_load_details(st, jobs)
+            st.details_scroll = 0
+        prev_pr_idx = st.pr_idx
+        prev_focus = st.focus
 
         render(stdscr, st)
         ch = stdscr.getch()
@@ -642,19 +1177,32 @@ def run(stdscr):
         if ch == ord("q"):
             break
         if ch == ord("J"):
-            scroll_diff(st, 1); continue
+            scroll_diff(st, 1)
+            continue
         if ch == ord("K"):
-            scroll_diff(st, -1); continue
+            scroll_diff(st, -1)
+            continue
         if ch == 9:
-            st.focus = (st.focus + 1) % 3; continue
+            st.focus = (st.focus + 1) % 4
+            continue
         if ch == curses.KEY_BTAB:
-            st.focus = (st.focus - 1) % 3; continue
+            st.focus = (st.focus - 1) % 4
+            continue
         if ch == ord("r"):
             if "prs" not in st.busy:
-                submit(jobs, st, ("load_prs",))
+                submit_job(jobs, st, ("load_prs",))
             if "active" not in st.busy and st.repo_owner:
-                submit(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+                submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name))
+            if st.focus == FOCUS_PRS and st.prs:
+                st.pr_details.pop(st.prs[st.pr_idx].number, None)
+                maybe_load_details(st, jobs)
             st.status = "Refreshing…"
+            continue
+        if ch == ord("F"):
+            open_finish_modal(stdscr, st, jobs)
+            continue
+        if ch == ord("C"):
+            open_comment_modal(stdscr, st, jobs)
             continue
         if ch == curses.KEY_MOUSE:
             try:
@@ -667,31 +1215,54 @@ def run(stdscr):
             up = bool(bstate & curses.BUTTON4_PRESSED)
             down = hasattr(curses, "BUTTON5_PRESSED") and bool(bstate & curses.BUTTON5_PRESSED)
             if not up and not down and bstate & curses.BUTTON1_CLICKED:
-                st.focus = {"prs": 0, "files": 1, "diff": 2}[pane]; continue
+                st.focus = {"prs": FOCUS_PRS, "pending": FOCUS_PENDING,
+                            "files": FOCUS_FILES, "right": FOCUS_DIFF}[pane]
+                continue
             step = 3
             if pane == "prs":
                 if up: st.pr_view_offset = max(0, st.pr_view_offset - step)
                 elif down: st.pr_view_offset = min(max(0, len(st.prs) - 1), st.pr_view_offset + step)
+            elif pane == "pending":
+                if up: st.pending_view_offset = max(0, st.pending_view_offset - step)
+                elif down: st.pending_view_offset = min(max(0, len(st.pending) - 1), st.pending_view_offset + step)
             elif pane == "files":
                 if up: st.file_view_offset = max(0, st.file_view_offset - step)
                 elif down: st.file_view_offset = min(max(0, len(st.tree) - 1), st.file_view_offset + step)
-            elif pane == "diff":
-                if up: scroll_diff(st, -step)
-                elif down: scroll_diff(st, step)
+            elif pane == "right":
+                if st.focus == FOCUS_PRS:
+                    if up: st.details_scroll = max(0, st.details_scroll - step)
+                    elif down: st.details_scroll += step
+                else:
+                    if up: scroll_diff(st, -step)
+                    elif down: scroll_diff(st, step)
             continue
 
         # Pane-scoped keys
-        if st.focus == 0:
+        if st.focus == FOCUS_PRS:
             if ch in (curses.KEY_DOWN, ord("j")):
                 st.pr_idx = min(max(0, len(st.prs) - 1), st.pr_idx + 1)
             elif ch in (curses.KEY_UP, ord("k")):
                 st.pr_idx = max(0, st.pr_idx - 1)
+            elif ch in (curses.KEY_NPAGE, ord("d")):
+                st.details_scroll += 10
+            elif ch in (curses.KEY_PPAGE, ord("u")):
+                st.details_scroll = max(0, st.details_scroll - 10)
             elif ch in (curses.KEY_ENTER, 10, 13):
                 if st.prs and "checkout" not in st.busy:
                     pr = st.prs[st.pr_idx]
                     st.status = f"Checking out #{pr.number}…"
-                    submit(jobs, st, ("checkout", pr.number))
-        elif st.focus == 1:
+                    submit_job(jobs, st, ("checkout", pr.number))
+        elif st.focus == FOCUS_PENDING:
+            if ch in (curses.KEY_DOWN, ord("j")):
+                st.pending_idx = min(max(0, len(st.pending) - 1), st.pending_idx + 1)
+            elif ch in (curses.KEY_UP, ord("k")):
+                st.pending_idx = max(0, st.pending_idx - 1)
+            elif ch == ord("d"):
+                if 0 <= st.pending_idx < len(st.pending):
+                    removed = st.pending.pop(st.pending_idx)
+                    st.pending_idx = min(st.pending_idx, max(0, len(st.pending) - 1))
+                    st.status = f"Discarded pending comment on {removed.path}:{removed.line}"
+        elif st.focus == FOCUS_FILES:
             if ch in (curses.KEY_DOWN, ord("j")):
                 st.file_idx = min(max(0, len(st.tree) - 1), st.file_idx + 1)
                 st.diff_scroll = 0
@@ -702,16 +1273,18 @@ def run(stdscr):
                 if 0 <= st.file_idx < len(st.tree):
                     item = st.tree[st.file_idx]
                     if item[2] == "file":
-                        st.focus = 2
+                        st.focus = FOCUS_DIFF
                         st.diff_scroll = 0
                     else:
                         p = item[3]
-                        (st.collapsed_dirs.discard if p in st.collapsed_dirs else st.collapsed_dirs.add)(p)
+                        (st.collapsed_dirs.discard if p in st.collapsed_dirs
+                         else st.collapsed_dirs.add)(p)
                         rebuild_tree(st)
             elif ch == ord(" "):
                 if 0 <= st.file_idx < len(st.tree) and st.tree[st.file_idx][2] == "dir":
                     p = st.tree[st.file_idx][3]
-                    (st.collapsed_dirs.discard if p in st.collapsed_dirs else st.collapsed_dirs.add)(p)
+                    (st.collapsed_dirs.discard if p in st.collapsed_dirs
+                     else st.collapsed_dirs.add)(p)
                     rebuild_tree(st)
             elif ch == ord("v"):
                 if 0 <= st.file_idx < len(st.tree) and st.active_pr and "viewed" not in st.busy:
@@ -720,19 +1293,19 @@ def run(stdscr):
                         fe = st.files[item[3]]
                         new_v = not fe.viewed
                         st.status = f"{'Marking' if new_v else 'Unmarking'} {fe.path}…"
-                        submit(jobs, st, ("mark_viewed", st.active_pr.node_id, fe.path, new_v))
+                        submit_job(jobs, st, ("mark_viewed", st.active_pr.node_id, fe.path, new_v))
                     else:
                         dir_files = files_under_dir(st, item[3])
                         if dir_files:
-                            all_viewed = all(f.viewed for f in dir_files)
-                            new_v = not all_viewed
+                            all_v = all(f.viewed for f in dir_files)
+                            new_v = not all_v
                             paths = [f.path for f in dir_files if f.viewed != new_v]
                             if paths:
                                 st.status = f"{'Marking' if new_v else 'Unmarking'} {len(paths)} files in {item[3]}/…"
-                                submit(jobs, st, ("mark_viewed_bulk", st.active_pr.node_id, paths, new_v))
-        elif st.focus == 2:
+                                submit_job(jobs, st, ("mark_viewed_bulk", st.active_pr.node_id, paths, new_v))
+        elif st.focus == FOCUS_DIFF:
             H, _ = stdscr.getmaxyx()
-            page = max(1, (H - 4) // 1)
+            page = max(1, H - 4)
             diff_lines = []
             path = cur_file_path(st)
             if path:
@@ -750,8 +1323,8 @@ def run(stdscr):
                 st.diff_scroll = 0
             elif ch == ord("G"):
                 st.diff_scroll = max_scroll
-            elif ch == 27:  # Esc
-                st.focus = 1
+            elif ch == 27:
+                st.focus = FOCUS_FILES
 
     jobs.put(None)
 
