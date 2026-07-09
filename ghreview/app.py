@@ -73,7 +73,7 @@ def _handle_mouse(st, jobs):
 
 
 def _mark_viewed(st, jobs):
-    if not (0 <= st.file_idx < len(st.tree)) or not st.active_pr or "viewed" in st.busy:
+    if not (0 <= st.file_idx < len(st.tree)) or not st.active_pr:
         return
     item = st.tree[st.file_idx]
     if item[2] == "file":
