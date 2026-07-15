@@ -9,6 +9,9 @@ from .gh import gh_json, gh_graphql, sh
 from .diff import parse_diff
 from .models import PR, Commit, FileEntry, PendingComment
 
+# Lines of context shown around each hunk (git's own default is 3).
+DIFF_CONTEXT = 8
+
 
 # ---- repo / identity ----
 
@@ -120,7 +123,7 @@ def load_diff_range(first_oid, last_oid):
     A single commit (``first_oid == last_oid``) yields just that commit's diff.
     Requires the PR to be checked out locally so the commits resolve.
     """
-    raw = sh(["git", "diff", f"{first_oid}^..{last_oid}"])
+    raw = sh(["git", "diff", f"-U{DIFF_CONTEXT}", f"{first_oid}^..{last_oid}"])
     return parse_diff(raw)
 
 

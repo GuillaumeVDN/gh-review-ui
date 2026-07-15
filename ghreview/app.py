@@ -7,7 +7,7 @@ import threading
 
 from . import api, theme
 from .gh import sh
-from .keys import get_key, disable_flow_control
+from .keys import get_key, disable_flow_control, KEY_ALT_J, KEY_ALT_K
 from .models import (State, N_PANES, FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING,
                      FOCUS_FILES, FOCUS_DIFF)
 from .navigation import scroll_diff, jump_hunk, cur_file_path
@@ -121,6 +121,17 @@ def _toggle_all_commits(st):
         st.commit_selected = set()
     else:
         st.commit_selected = {c.oid for c in st.commits}
+
+
+def _jump_file(st, direction):
+    """Move the tree cursor to the next/previous *file* row, skipping folders."""
+    i = st.file_idx + direction
+    while 0 <= i < len(st.tree):
+        if st.tree[i][2] == "file":
+            st.file_idx = i
+            st.diff_scroll = st.diff_hunk_idx = 0
+            return
+        i += direction
 
 
 def _open_file_or_dir(st):
@@ -240,6 +251,10 @@ def _handle_key(stdscr, st, jobs, ch):
         elif ch in (curses.KEY_UP, ord("k")):
             st.file_idx = max(0, st.file_idx - 1)
             st.diff_scroll = st.diff_hunk_idx = 0
+        elif ch == KEY_ALT_J:
+            _jump_file(st, +1)
+        elif ch == KEY_ALT_K:
+            _jump_file(st, -1)
         elif ch in (curses.KEY_ENTER, 10, 13):
             _open_file_or_dir(st)
         elif ch == ord(" "):

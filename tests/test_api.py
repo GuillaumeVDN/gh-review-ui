@@ -129,5 +129,5 @@ def test_load_diff_range_uses_git_range(monkeypatch):
 
     monkeypatch.setattr(api, "sh", fake_sh)
     diff, info = api.load_diff_range("aaa", "bbb")
-    assert calls == [["git", "diff", "aaa^..bbb"]]
+    assert calls == [["git", "diff", f"-U{api.DIFF_CONTEXT}", "aaa^..bbb"]]
     assert "f.py" in diff

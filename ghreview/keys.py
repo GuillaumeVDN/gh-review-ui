@@ -9,6 +9,11 @@ import termios
 KEY_SHIFT_ENTER = 1_000_001
 KEY_CTRL_ENTER = 1_000_002
 
+# Alt+<key> combos (terminals send ESC then the bare key byte).
+KEY_ALT = {ord("j"): 1_000_010, ord("k"): 1_000_011}
+KEY_ALT_J = KEY_ALT[ord("j")]
+KEY_ALT_K = KEY_ALT[ord("k")]
+
 
 def classify_seq(params, final):
     """Map a parsed CSI escape sequence to a synthetic key, or None.
@@ -55,6 +60,8 @@ def get_key(win):
         if c2 == -1:
             return 27  # bare Escape
         if c2 != ord("["):
+            if c2 in KEY_ALT:  # Alt+<key>: ESC arrived glued to the key byte
+                return KEY_ALT[c2]
             try:
                 curses.ungetch(c2)
             except (curses.error, OverflowError):

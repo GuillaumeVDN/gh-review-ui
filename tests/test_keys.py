@@ -27,3 +27,26 @@ def test_kitty_u_form():
 def test_non_enter_sequences_ignored():
     assert classify_seq("1;2", "A") is None   # arrow-ish
     assert classify_seq("27;2;9", "~") is None  # shift+tab, not enter
+
+
+class FakeWin:
+    """Feeds a scripted sequence of getch() return values."""
+    def __init__(self, seq):
+        self.seq = list(seq)
+
+    def getch(self):
+        return self.seq.pop(0) if self.seq else -1
+
+    def timeout(self, _):
+        pass
+
+
+def test_alt_j_decoded():
+    from ghreview.keys import get_key, KEY_ALT_J, KEY_ALT_K
+    assert get_key(FakeWin([27, ord("j")])) == KEY_ALT_J
+    assert get_key(FakeWin([27, ord("k")])) == KEY_ALT_K
+
+
+def test_bare_escape_then_timeout():
+    from ghreview.keys import get_key
+    assert get_key(FakeWin([27, -1])) == 27

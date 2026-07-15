@@ -95,7 +95,8 @@ While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.
 
 Files pane:
-- `j` / `k` — move
+- `j` / `k` — move (over files *and* folders)
+- `Alt+j` / `Alt+k` — jump to the next / previous file, skipping folder rows
 - `Space` — collapse / expand folder
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `v` — toggle viewed on file, or on all files under a folder

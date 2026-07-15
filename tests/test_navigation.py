@@ -95,3 +95,27 @@ def test_scroll_diff_floor_zero():
     st.diff_scroll = 1
     scroll_diff(st, -5)
     assert st.diff_scroll == 0
+
+
+def test_jump_file_skips_folders():
+    from ghreview.app import _jump_file
+    st = State()
+    # tree: dir, file, dir, file, file
+    st.tree = [
+        (0, "src", "dir", "src", False),
+        (1, "a.py", "file", 0, None),
+        (0, "lib", "dir", "lib", False),
+        (1, "b.py", "file", 1, None),
+        (1, "c.py", "file", 2, None),
+    ]
+    st.file_idx = 1  # on a.py
+    _jump_file(st, +1)
+    assert st.file_idx == 3  # jumped over the "lib" dir to b.py
+    _jump_file(st, +1)
+    assert st.file_idx == 4  # c.py
+    _jump_file(st, +1)
+    assert st.file_idx == 4  # no file below -> stays
+    _jump_file(st, -1)
+    assert st.file_idx == 3  # back to b.py
+    _jump_file(st, -1)
+    assert st.file_idx == 1  # skips "lib" and "src", lands on a.py

@@ -23,15 +23,21 @@ def worker_loop(jobs, results):
                     results.put(("active", None, None, [], {}, {}, [], []))
                 else:
                     pr_id, files = api.load_files(owner, name, n)
-                    diff, info = api.load_diff(n)
-                    try:
-                        pending = api.load_pending_comments(owner, name, n, login) if login else []
-                    except Exception:
-                        pending = []
                     try:
                         commits = api.load_commits(n)
                     except Exception:
                         commits = []
+                    # Prefer the local git range so we control context lines;
+                    # fall back to `gh pr diff` (3-line context) when the commit
+                    # list is unavailable.
+                    if commits:
+                        diff, info = api.load_diff_range(commits[-1].oid, commits[0].oid)
+                    else:
+                        diff, info = api.load_diff(n)
+                    try:
+                        pending = api.load_pending_comments(owner, name, n, login) if login else []
+                    except Exception:
+                        pending = []
                     results.put(("active", n, pr_id, files, diff, info, pending, commits))
             elif kind == "load_commit_diff":
                 _, first_oid, last_oid = job

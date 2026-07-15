@@ -90,7 +90,7 @@ def shortcuts_for(st):
         return f"Enter: submit review · j/k: move · d: delete · Shift+J/K: scroll diff · {common}"
     if st.focus == FOCUS_FILES:
         return (f"Enter: open diff · e: editor · v: viewed · z: fold viewed · "
-                f"Space: fold · j/k: move · {common}")
+                f"Space: fold · j/k: move · Alt+j/k: next/prev file · {common}")
     return f"j/k: next/prev hunk · c: comment · e: editor · PgUp/PgDn: scroll · Esc: back · {common}"
 
 
