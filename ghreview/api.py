@@ -39,7 +39,8 @@ def get_repo_root():
 def load_prs():
     fields = "number,title,headRefName,author,id"
     seen = {}
-    for search in ("is:open author:@me", "is:open review-requested:@me"):
+    for search in ("is:open author:@me", "is:open review-requested:@me",
+                   "is:open reviewed-by:@me"):
         try:
             data = gh_json(["pr", "list", "--limit", "50", "--search", search, "--json", fields])
         except Exception:

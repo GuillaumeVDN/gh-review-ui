@@ -3,7 +3,8 @@
 Minimal, lazygit-style terminal UI for reviewing GitHub PRs.
 
 Five panes (left column stacked, right side full-height):
-- **PRs** — open PRs you authored *or* have been requested to review.
+- **PRs** — open PRs you authored, have been requested to review, *or* have
+  already reviewed (still open).
 - **Commits** — commits of the active PR. All are selected by default (whole
   PR); unselect and pick a range (or a single commit) to review only those.
 - **Pending** — review comments queued locally, waiting to be submitted.
@@ -48,7 +49,7 @@ gh-review-ui
 
 On start it will:
 1. detect the repo from the current working directory (via `gh repo view`);
-2. fetch open PRs where you're the author or a requested reviewer;
+2. fetch open PRs where you're the author, a requested reviewer, or have already reviewed;
 3. if the current branch corresponds to a PR, load its file list and diff.
 
 ## Keys

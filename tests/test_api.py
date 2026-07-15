@@ -131,3 +131,31 @@ def test_load_diff_range_uses_git_range(monkeypatch):
     diff, info = api.load_diff_range("aaa", "bbb")
     assert calls == [["git", "diff", f"-U{api.DIFF_CONTEXT}", "aaa^..bbb"]]
     assert "f.py" in diff
+
+
+def test_load_prs_queries_authored_requested_and_reviewed(monkeypatch):
+    searches = []
+
+    def fake_gh_json(args):
+        # args like: ["pr", "list", "--limit", "50", "--search", <q>, "--json", ...]
+        q = args[args.index("--search") + 1]
+        searches.append(q)
+        if "author:@me" in q:
+            return [{"number": 3, "title": "mine", "headRefName": "b3",
+                     "author": {"login": "me"}, "id": "i3"}]
+        if "review-requested:@me" in q:
+            return [{"number": 2, "title": "req", "headRefName": "b2",
+                     "author": {"login": "x"}, "id": "i2"}]
+        if "reviewed-by:@me" in q:
+            # includes a dup (2) plus a new one (1)
+            return [{"number": 2, "title": "req", "headRefName": "b2",
+                     "author": {"login": "x"}, "id": "i2"},
+                    {"number": 1, "title": "reviewed", "headRefName": "b1",
+                     "author": {"login": "y"}, "id": "i1"}]
+        return []
+
+    monkeypatch.setattr(api, "gh_json", fake_gh_json)
+    prs = api.load_prs()
+    assert any("reviewed-by:@me" in s for s in searches)
+    # deduped by number, sorted descending
+    assert [p.number for p in prs] == [3, 2, 1]
