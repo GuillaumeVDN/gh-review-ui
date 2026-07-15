@@ -2,11 +2,15 @@
 
 Minimal, lazygit-style terminal UI for reviewing GitHub PRs.
 
-Four panes (left column stacked, right side full-height):
+Five panes (left column stacked, right side full-height):
 - **PRs** — open PRs you authored *or* have been requested to review.
+- **Commits** — commits of the active PR. All are selected by default (whole
+  PR); unselect and pick a range (or a single commit) to review only those.
 - **Pending** — review comments queued locally, waiting to be submitted.
 - **Files** — file tree of the currently checked-out PR, with viewed-state.
+  When a commit range is selected, only the files it touches are listed.
 - **Right** — PR description + timeline when the PRs pane is focused,
+  selected commit's message when the Commits pane is focused,
   diff of the highlighted / opened file otherwise. The current hunk is
   marked with a green side-bar.
 
@@ -50,8 +54,8 @@ On start it will:
 ## Keys
 
 Global:
-- `Tab` / `Shift-Tab` — cycle panes (PRs → Pending → Files → Diff)
-- `0` / `1` / `2` / `3` — focus a pane directly (`0` Diff, `1` PRs, `2` Pending, `3` Files)
+- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Pending → Files → Diff)
+- `0` / `1` / `2` / `3` / `4` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Pending, `4` Files)
 - `q` — quit
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
@@ -70,6 +74,17 @@ PRs pane:
 The PR summary renders markdown (headings, lists, task-boxes, quotes, code
 blocks, links), expands `<details>`/`<summary>` sections, and hides HTML
 comments (`<!-- … -->`).
+
+Commits pane:
+- `j` / `k` — move
+- `Space` — toggle the commit under the cursor
+- `a` — select all / none
+- `Enter` — apply the selection: reload the diff and file tree for the range
+  spanning the earliest…latest selected commit (a gap between two selected
+  commits is filled, so the checkboxes always match the reviewed range).
+  Selecting every commit reviews the whole PR.
+
+The right pane shows the selected commit's short SHA, author, date, and message.
 
 Pending pane:
 - `j` / `k` — move

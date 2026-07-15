@@ -2,8 +2,10 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Focus targets, matched to their number-key shortcut where handy.
-FOCUS_PRS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF = 0, 1, 2, 3
+# Focus targets. The integer order also drives Tab cycling; the number-key
+# shortcuts are PRs [1], Commits [2], Pending [3], Files [4], Diff [0].
+FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF = 0, 1, 2, 3, 4
+N_PANES = 5
 
 
 @dataclass
@@ -13,6 +15,19 @@ class PR:
     head: str
     author: str
     node_id: str = ""
+
+
+@dataclass
+class Commit:
+    oid: str
+    headline: str
+    body: str = ""
+    author: str = ""
+    date: str = ""
+
+    @property
+    def short(self):
+        return self.oid[:7]
 
 
 @dataclass
@@ -42,7 +57,18 @@ class State:
     pr_view_offset: int = 0
     active_pr: Optional[PR] = None
 
+    # Commits of the active PR + which are selected for review. Selection is a
+    # contiguous range: the reviewed diff spans the earliest..latest selected
+    # commit. All commits are selected by default (i.e. the whole PR).
+    commits: list = field(default_factory=list)
+    commit_selected: set = field(default_factory=set)  # selected oids
+    commit_idx: int = 0
+    commit_view_offset: int = 0
+
     files: list = field(default_factory=list)
+    # Viewed state for every file in the PR, keyed by path. Kept separate from
+    # ``files`` so it survives when the file list is filtered to a commit range.
+    viewed_by_path: dict = field(default_factory=dict)
     collapsed_dirs: set = field(default_factory=set)
     tree: list = field(default_factory=list)
     file_idx: int = 0

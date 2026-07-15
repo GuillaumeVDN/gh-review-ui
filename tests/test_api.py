@@ -102,3 +102,32 @@ def test_submit_creates_review_when_none(monkeypatch):
     api.submit_review_api("o", "n", 1, "me", "PR", "APPROVE", "lgtm")
     submits = [v for q, v in fake.calls if "submitPullRequestReview" in q]
     assert submits and submits[0]["event"] == "APPROVE" and submits[0]["r"] == "NEW"
+
+
+def test_load_commits_parses_and_orders(monkeypatch):
+    payload = {"commits": [
+        {"oid": "aaa111", "messageHeadline": "first", "messageBody": "body one",
+         "authoredDate": "2024-01-01T00:00:00Z", "authors": [{"login": "alice"}]},
+        {"oid": "bbb222", "messageHeadline": "second", "messageBody": "",
+         "authoredDate": "2024-01-02T00:00:00Z", "authors": [{"name": "Bob"}]},
+    ]}
+    monkeypatch.setattr(api, "gh_json", lambda args: payload)
+    commits = api.load_commits(7)
+    # newest first: gh returns oldest first, load_commits reverses
+    assert [c.oid for c in commits] == ["bbb222", "aaa111"]
+    assert commits[0].short == "bbb222"
+    assert commits[0].author == "Bob" and commits[1].author == "alice"
+    assert commits[0].headline == "second"
+
+
+def test_load_diff_range_uses_git_range(monkeypatch):
+    calls = []
+
+    def fake_sh(args):
+        calls.append(args)
+        return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n+x\n"
+
+    monkeypatch.setattr(api, "sh", fake_sh)
+    diff, info = api.load_diff_range("aaa", "bbb")
+    assert calls == [["git", "diff", "aaa^..bbb"]]
+    assert "f.py" in diff

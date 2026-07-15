@@ -3,7 +3,7 @@ import curses
 import textwrap
 
 from . import theme
-from .models import FOCUS_PRS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF
+from .models import FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF
 from .markdown import format_pr_details, wrap_styled
 from .navigation import cur_file_path, current_hunk_range, hunk_for_comment
 from .tree import files_under_dir
@@ -81,9 +81,11 @@ def selection_attr():
 # ---------- shortcut hints ----------
 
 def shortcuts_for(st):
-    common = "0-3: focus pane · Tab: next · f: finish review · r: refresh · q: quit"
+    common = "0-4: focus pane · Tab: next · f: finish review · r: refresh · q: quit"
     if st.focus == FOCUS_PRS:
         return f"Enter: checkout · j/k: move · Shift+J/K: scroll summary · {common}"
+    if st.focus == FOCUS_COMMITS:
+        return (f"Space: toggle · a: all/none · Enter: apply range · j/k: move · {common}")
     if st.focus == FOCUS_PENDING:
         return f"Enter: submit review · j/k: move · d: delete · Shift+J/K: scroll diff · {common}"
     if st.focus == FOCUS_FILES:
@@ -114,8 +116,34 @@ def render_prs(stdscr, st, y, x, h, w):
                    st.focus == FOCUS_PRS)
 
 
+def render_commits(stdscr, st, y, x, h, w):
+    n_sel = len(st.commit_selected)
+    total = len(st.commits)
+    title = f"[2] Commits ({n_sel}/{total})" if total else "[2] Commits"
+    draw_box(stdscr, y, x, h, w, title, st.focus == FOCUS_COMMITS,
+             busy="active" in st.busy or "commitdiff" in st.busy)
+    vh, iw = h - 2, w - 3
+    if not st.commits:
+        safe_addstr(stdscr, y + 1, x + 2, "No commits", curses.A_DIM, maxw=iw)
+        return
+    st.commit_view_offset = clamp_view(st.commit_idx, st.commit_view_offset, vh, len(st.commits))
+    for i, c in enumerate(st.commits[st.commit_view_offset:st.commit_view_offset + vh]):
+        idx = st.commit_view_offset + i
+        checked = c.oid in st.commit_selected
+        line = f"[{'x' if checked else ' '}] {c.short} {c.headline}"
+        if idx == st.commit_idx and st.focus == FOCUS_COMMITS:
+            attr = selection_attr()
+        elif not checked:
+            attr = curses.A_DIM
+        else:
+            attr = 0
+        safe_addstr(stdscr, y + 1 + i, x + 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.commit_view_offset, vh, len(st.commits),
+                   st.focus == FOCUS_COMMITS)
+
+
 def render_pending(stdscr, st, y, x, h, w):
-    draw_box(stdscr, y, x, h, w, f"[2] Pending ({len(st.pending)})",
+    draw_box(stdscr, y, x, h, w, f"[3] Pending ({len(st.pending)})",
              st.focus == FOCUS_PENDING, busy=bool({"review", "pending"} & st.busy))
     vh, iw = h - 2, w - 3
     if not st.pending:
@@ -133,10 +161,10 @@ def render_pending(stdscr, st, y, x, h, w):
 
 
 def render_files(stdscr, st, y, x, h, w):
-    files_title = "[3] Files"
+    files_title = "[4] Files"
     if st.active_pr:
         n_viewed = sum(1 for f in st.files if f.viewed)
-        files_title = f"[3] Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
+        files_title = f"[4] Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
     draw_box(stdscr, y, x, h, w, files_title,
              st.focus == FOCUS_FILES, busy="active" in st.busy or "viewed" in st.busy)
     vh, iw = h - 2, w - 3
@@ -241,6 +269,32 @@ def render_pending_detail(stdscr, st, y, x, h, w):
             break
 
 
+def render_commit_detail(stdscr, st, y, x, h, w):
+    draw_box(stdscr, y, x, h, w, "Commit", st.focus == FOCUS_COMMITS)
+    vh, iw = h - 2, w - 3
+    if not st.commits:
+        safe_addstr(stdscr, y + 1, x + 2, "No commits", curses.A_DIM, maxw=iw)
+        return
+    c = st.commits[min(max(0, st.commit_idx), len(st.commits) - 1)]
+    row, bottom = y + 1, y + 1 + vh
+    header = [
+        (f"{c.short}  {c.headline}", theme.style("title", bold=True)),
+        (f"{c.author}   {c.date}", curses.A_DIM),
+        ("", 0),
+    ]
+    for text, attr in header:
+        if row >= bottom:
+            return
+        safe_addstr(stdscr, row, x + 2, text, attr, maxw=iw - 1)
+        row += 1
+    for bl in (c.body.splitlines() if c.body else []):
+        for seg in (textwrap.wrap(bl, iw - 1) or [""]):
+            if row >= bottom:
+                return
+            safe_addstr(stdscr, row, x + 2, seg, 0, maxw=iw - 1)
+            row += 1
+
+
 def render_pr_details(stdscr, st, y, x, h, w):
     pr = st.prs[st.pr_idx] if st.prs and 0 <= st.pr_idx < len(st.prs) else None
     if not pr:
@@ -264,17 +318,19 @@ def render_pr_details(stdscr, st, y, x, h, w):
 # ---------- layout ----------
 
 def compute_layout(H, W):
-    """Return the rect dict for the four panes given the screen size."""
+    """Return the rect dict for the five panes given the screen size."""
     left_w = max(38, W // 3)
     right_w = W - left_w
     body_h = H - 2
-    pr_h = max(6, body_h * 2 // 7)
-    pending_h = max(4, body_h // 6)
-    files_h = body_h - pr_h - pending_h
+    pr_h = max(6, body_h * 2 // 9)
+    commits_h = max(4, body_h // 6)
+    pending_h = max(3, body_h // 8)
+    files_h = body_h - pr_h - commits_h - pending_h
     return {
         "prs": (0, 0, pr_h, left_w),
-        "pending": (pr_h, 0, pending_h, left_w),
-        "files": (pr_h + pending_h, 0, files_h, left_w),
+        "commits": (pr_h, 0, commits_h, left_w),
+        "pending": (pr_h + commits_h, 0, pending_h, left_w),
+        "files": (pr_h + commits_h + pending_h, 0, files_h, left_w),
         "right": (0, left_w, body_h, right_w),
     }
 
@@ -285,6 +341,8 @@ def render(stdscr, st):
     st.rects = compute_layout(H, W)
     py, px, ph, pw = st.rects["prs"]
     render_prs(stdscr, st, py, px, ph, pw)
+    py, px, ph, pw = st.rects["commits"]
+    render_commits(stdscr, st, py, px, ph, pw)
     py, px, ph, pw = st.rects["pending"]
     render_pending(stdscr, st, py, px, ph, pw)
     py, px, ph, pw = st.rects["files"]
@@ -292,6 +350,8 @@ def render(stdscr, st):
     ry, rx, rh, rw = st.rects["right"]
     if st.focus == FOCUS_PRS:
         render_pr_details(stdscr, st, ry, rx, rh, rw)
+    elif st.focus == FOCUS_COMMITS:
+        render_commit_detail(stdscr, st, ry, rx, rh, rw)
     elif st.focus == FOCUS_PENDING:
         render_pending_detail(stdscr, st, ry, rx, rh, rw)
     else:

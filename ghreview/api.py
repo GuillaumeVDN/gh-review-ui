@@ -7,7 +7,7 @@ import os
 
 from .gh import gh_json, gh_graphql, sh
 from .diff import parse_diff
-from .models import PR, FileEntry, PendingComment
+from .models import PR, Commit, FileEntry, PendingComment
 
 
 # ---- repo / identity ----
@@ -90,6 +90,37 @@ def load_files(owner, name, number):
 
 def load_diff(number):
     raw = sh(["gh", "pr", "diff", str(number)])
+    return parse_diff(raw)
+
+
+def load_commits(number):
+    """Commits of the PR, newest first (like ``git log``)."""
+    d = gh_json([
+        "pr", "view", str(number),
+        "--json", "commits",
+    ])
+    out = []
+    for c in d.get("commits", []):
+        authors = c.get("authors") or []
+        author = (authors[0].get("login") or authors[0].get("name")) if authors else ""
+        out.append(Commit(
+            oid=c.get("oid", ""),
+            headline=c.get("messageHeadline", ""),
+            body=c.get("messageBody", "") or "",
+            author=author or "",
+            date=c.get("authoredDate", "") or "",
+        ))
+    out.reverse()  # gh returns oldest first; show newest at the top
+    return out
+
+
+def load_diff_range(first_oid, last_oid):
+    """Cumulative diff from the parent of ``first_oid`` through ``last_oid``.
+
+    A single commit (``first_oid == last_oid``) yields just that commit's diff.
+    Requires the PR to be checked out locally so the commits resolve.
+    """
+    raw = sh(["git", "diff", f"{first_oid}^..{last_oid}"])
     return parse_diff(raw)
 
 

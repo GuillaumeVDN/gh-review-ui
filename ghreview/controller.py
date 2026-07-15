@@ -1,6 +1,6 @@
 """State transitions and job orchestration (glue between UI and worker)."""
 from .diff import compute_hunks
-from .models import PR, PendingComment, FOCUS_DIFF
+from .models import PR, FileEntry, PendingComment, FOCUS_DIFF
 from .navigation import cur_file_path, hunk_anchor_line
 from .tree import rebuild_tree
 from .modals import show_editor_modal, show_review_modal
@@ -16,6 +16,7 @@ JOB_TAGS = {
     "submit_review": "review",
     "add_pending": "pending",
     "discard_pending": "pending",
+    "load_commit_diff": "commitdiff",
 }
 
 
@@ -40,6 +41,41 @@ def submit_job(jobs, st, job):
     jobs.put(job)
 
 
+def _set_diff(st, diff, info):
+    """Install a new diff and reset diff/hunk indexing over it."""
+    st.diff_by_file = diff
+    st.info_by_file = info
+    st.hunks_by_file = {p: compute_hunks(lines) for p, lines in diff.items()}
+    st.diff_scroll = 0
+    st.diff_hunk_idx = 0
+
+
+def apply_commit_selection(st, jobs):
+    """Recompute the diff/files for the selected commit range.
+
+    ``st.commits`` is newest-first, so the oldest commit in a range sits at the
+    higher list index. Selection is treated as a contiguous range: everything
+    between the earliest and latest selected commit is reviewed, so the checkbox
+    set is normalised to fill any gap.
+    """
+    if not st.active_pr or not st.commits:
+        return
+    picked = [i for i, c in enumerate(st.commits) if c.oid in st.commit_selected]
+    if not picked:
+        st.status = "Select at least one commit to review."
+        return
+    lo, hi = picked[0], picked[-1]  # lo = newest end, hi = oldest end
+    # Normalise to a contiguous range so the checkboxes match the reviewed diff.
+    st.commit_selected = {st.commits[i].oid for i in range(lo, hi + 1)}
+    if "commitdiff" in st.busy:
+        return
+    oldest, newest = st.commits[hi], st.commits[lo]
+    submit_job(jobs, st, ("load_commit_diff", oldest.oid, newest.oid))
+    n = hi - lo + 1
+    st.status = (f"Reviewing {n} commit{'s' if n != 1 else ''} "
+                 f"({oldest.short}..{newest.short})…")
+
+
 def maybe_load_details(st, jobs):
     if not st.prs or "details" in st.busy:
         return
@@ -59,16 +95,23 @@ def apply_result(st, res, jobs):
             st.pr_idx = max(0, len(st.prs) - 1)
     elif kind == "active":
         st.busy.discard("active")
-        number, pr_id, files, diff, info, pending = res[1:7]
+        number, pr_id, files, diff, info, pending, commits = res[1:8]
         st.pending = pending
         if st.pending_idx >= len(st.pending):
             st.pending_idx = max(0, len(st.pending) - 1)
         if number is None:
             st.active_pr = None
             st.files = []
+            st.viewed_by_path = {}
+            st.commits = []
+            st.commit_selected = set()
+            st.commit_idx = 0
+            st.commit_view_offset = 0
             st.diff_by_file = {}
             st.info_by_file = {}
             st.hunks_by_file = {}
+            st.diff_scroll = 0
+            st.diff_hunk_idx = 0
         else:
             match = next((p for p in st.prs if p.number == number), None)
             if match is None:
@@ -77,14 +120,28 @@ def apply_result(st, res, jobs):
                 match.node_id = pr_id
             st.active_pr = match
             st.files = files
-            st.diff_by_file = diff
-            st.info_by_file = info
-            st.hunks_by_file = {p: compute_hunks(lines) for p, lines in diff.items()}
+            st.viewed_by_path = {f.path: f.viewed for f in files}
+            st.commits = commits
+            st.commit_selected = {c.oid for c in commits}  # all selected by default
+            st.commit_idx = 0
+            st.commit_view_offset = 0
+            _set_diff(st, diff, info)
         st.file_idx = 0
         st.file_view_offset = 0
-        st.diff_scroll = 0
-        st.diff_hunk_idx = 0
         rebuild_tree(st)
+    elif kind == "commit_diff":
+        _, diff, info = res
+        st.busy.discard("commitdiff")
+        _set_diff(st, diff, info)
+        # Filter the file tree to the files touched by the selected range,
+        # keeping viewed state from the PR-wide view.
+        paths = sorted(diff.keys())
+        st.files = [FileEntry(p, st.viewed_by_path.get(p, False)) for p in paths]
+        st.file_idx = 0
+        st.file_view_offset = 0
+        rebuild_tree(st)
+        n = len(st.files)
+        st.status = f"Reviewing {n} file{'s' if n != 1 else ''} in selected commits"
     elif kind == "checkout_done":
         st.busy.discard("checkout")
         st.status = f"Checked out #{res[1]} — reloading files…"
@@ -95,6 +152,8 @@ def apply_result(st, res, jobs):
         for f in st.files:
             if f.path in pset:
                 f.viewed = viewed
+        for p in pset:
+            st.viewed_by_path[p] = viewed
         st.busy.discard("viewed")
         st.status = f"{'Marked' if viewed else 'Unmarked'} {len(paths)} file{'s' if len(paths) != 1 else ''}"
     elif kind == "viewed_bulk":
@@ -103,6 +162,8 @@ def apply_result(st, res, jobs):
         for f in st.files:
             if f.path in dset:
                 f.viewed = viewed
+        for p in dset:
+            st.viewed_by_path[p] = viewed
         st.busy.discard("viewed")
         st.status = f"{'Marked' if viewed else 'Unmarked'} {len(done)}, {len(errs)} failed"
     elif kind == "pr_details":

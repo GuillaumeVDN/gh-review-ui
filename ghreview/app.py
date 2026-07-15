@@ -8,7 +8,8 @@ import threading
 from . import api, theme
 from .gh import sh
 from .keys import get_key, disable_flow_control
-from .models import State, FOCUS_PRS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF
+from .models import (State, N_PANES, FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING,
+                     FOCUS_FILES, FOCUS_DIFF)
 from .navigation import scroll_diff, jump_hunk, cur_file_path
 from .tree import rebuild_tree, files_under_dir, fold_viewed_dirs, first_unviewed_index
 from .editor import open_current_in_editor
@@ -17,13 +18,15 @@ from .render import render
 from .worker import worker_loop
 from .controller import (
     submit_job, apply_result, maybe_load_details, pane_at,
-    open_comment_modal, open_finish_modal,
+    apply_commit_selection, open_comment_modal, open_finish_modal,
 )
 
 FOCUS_BY_DIGIT = {ord("0"): FOCUS_DIFF, ord("1"): FOCUS_PRS,
-                  ord("2"): FOCUS_PENDING, ord("3"): FOCUS_FILES}
-FOCUS_BY_PANE = {"prs": FOCUS_PRS, "pending": FOCUS_PENDING,
-                 "files": FOCUS_FILES, "right": FOCUS_DIFF}
+                  ord("2"): FOCUS_COMMITS, ord("3"): FOCUS_PENDING,
+                  ord("4"): FOCUS_FILES}
+FOCUS_BY_PANE = {"prs": FOCUS_PRS, "commits": FOCUS_COMMITS,
+                 "pending": FOCUS_PENDING, "files": FOCUS_FILES,
+                 "right": FOCUS_DIFF}
 
 
 def _toggle_collapse(st, path):
@@ -51,6 +54,10 @@ def _handle_mouse(st, jobs):
         maxoff = max(0, len(st.prs) - vh)
         st.pr_view_offset = (max(0, st.pr_view_offset - step) if up
                              else min(maxoff, st.pr_view_offset + step) if down else st.pr_view_offset)
+    elif pane == "commits":
+        maxoff = max(0, len(st.commits) - vh)
+        st.commit_view_offset = (max(0, st.commit_view_offset - step) if up
+                                 else min(maxoff, st.commit_view_offset + step) if down else st.commit_view_offset)
     elif pane == "pending":
         maxoff = max(0, len(st.pending) - vh)
         st.pending_view_offset = (max(0, st.pending_view_offset - step) if up
@@ -102,6 +109,20 @@ def _fold_viewed(st):
                  + (" · jumped to first unviewed file" if ti is not None else " · no unviewed files"))
 
 
+def _toggle_commit(st):
+    if 0 <= st.commit_idx < len(st.commits):
+        oid = st.commits[st.commit_idx].oid
+        (st.commit_selected.discard if oid in st.commit_selected
+         else st.commit_selected.add)(oid)
+
+
+def _toggle_all_commits(st):
+    if len(st.commit_selected) == len(st.commits):
+        st.commit_selected = set()
+    else:
+        st.commit_selected = {c.oid for c in st.commits}
+
+
 def _open_file_or_dir(st):
     if not (0 <= st.file_idx < len(st.tree)):
         return
@@ -135,10 +156,10 @@ def _handle_key(stdscr, st, jobs, ch):
             scroll_diff(st, -1)
         return True
     if ch == 9:  # Tab
-        st.focus = (st.focus + 1) % 4
+        st.focus = (st.focus + 1) % N_PANES
         return True
     if ch == curses.KEY_BTAB:
-        st.focus = (st.focus - 1) % 4
+        st.focus = (st.focus - 1) % N_PANES
         return True
     if ch == ord("r"):
         if "prs" not in st.busy:
@@ -183,6 +204,17 @@ def _handle_key(stdscr, st, jobs, ch):
                 pr = st.prs[st.pr_idx]
                 st.status = f"Checking out #{pr.number}…"
                 submit_job(jobs, st, ("checkout", pr.number))
+    elif st.focus == FOCUS_COMMITS:
+        if ch in (curses.KEY_DOWN, ord("j")):
+            st.commit_idx = min(max(0, len(st.commits) - 1), st.commit_idx + 1)
+        elif ch in (curses.KEY_UP, ord("k")):
+            st.commit_idx = max(0, st.commit_idx - 1)
+        elif ch == ord(" "):
+            _toggle_commit(st)
+        elif ch == ord("a"):
+            _toggle_all_commits(st)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            apply_commit_selection(st, jobs)
     elif st.focus == FOCUS_PENDING:
         if ch in (curses.KEY_DOWN, ord("j")):
             st.pending_idx = min(max(0, len(st.pending) - 1), st.pending_idx + 1)
