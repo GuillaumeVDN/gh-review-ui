@@ -3,8 +3,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # Focus targets. The integer order also drives Tab cycling; the number-key
-# shortcuts are PRs [1], Commits [2], Pending [3], Files [4], Diff [0].
-FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING, FOCUS_FILES, FOCUS_DIFF = 0, 1, 2, 3, 4
+# shortcuts are PRs [1], Commits [2], Files [3], Pending [4], Diff [0].
+FOCUS_PRS, FOCUS_COMMITS, FOCUS_FILES, FOCUS_PENDING, FOCUS_DIFF = 0, 1, 2, 3, 4
 N_PANES = 5
 
 
@@ -56,6 +56,7 @@ class State:
     pr_idx: int = 0
     pr_view_offset: int = 0
     active_pr: Optional[PR] = None
+    active_worktree: str = ""  # checkout dir of the active PR's review worktree
 
     # Commits of the active PR + which are selected for review. Selection is a
     # contiguous range: the reviewed diff spans the earliest..latest selected

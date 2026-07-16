@@ -22,8 +22,8 @@ from .controller import (
 )
 
 FOCUS_BY_DIGIT = {ord("0"): FOCUS_DIFF, ord("1"): FOCUS_PRS,
-                  ord("2"): FOCUS_COMMITS, ord("3"): FOCUS_PENDING,
-                  ord("4"): FOCUS_FILES}
+                  ord("2"): FOCUS_COMMITS, ord("3"): FOCUS_FILES,
+                  ord("4"): FOCUS_PENDING}
 FOCUS_BY_PANE = {"prs": FOCUS_PRS, "commits": FOCUS_COMMITS,
                  "pending": FOCUS_PENDING, "files": FOCUS_FILES,
                  "right": FOCUS_DIFF}
@@ -175,8 +175,10 @@ def _handle_key(stdscr, st, jobs, ch):
     if ch == ord("r"):
         if "prs" not in st.busy:
             submit_job(jobs, st, ("load_prs",))
-        if "active" not in st.busy and st.repo_owner:
-            submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name, st.viewer))
+        # Re-fetch the active PR's worktree (picks up new pushes) and reload it.
+        if st.active_pr and not ({"worktree", "active"} & st.busy):
+            submit_job(jobs, st, ("open_pr", st.repo_root, st.repo_owner,
+                                  st.repo_name, st.active_pr.number))
         if st.focus == FOCUS_PRS and st.prs:
             st.pr_details.pop(st.prs[st.pr_idx].number, None)
             maybe_load_details(st, jobs)
@@ -211,10 +213,11 @@ def _handle_key(stdscr, st, jobs, ch):
         elif ch in (curses.KEY_PPAGE, ord("u")):
             st.details_scroll = max(0, st.details_scroll - 10)
         elif ch in (curses.KEY_ENTER, 10, 13):
-            if st.prs and "checkout" not in st.busy:
+            if st.prs and not ({"worktree", "active"} & st.busy):
                 pr = st.prs[st.pr_idx]
-                st.status = f"Checking out #{pr.number}…"
-                submit_job(jobs, st, ("checkout", pr.number))
+                st.status = f"Opening #{pr.number} in a worktree…"
+                submit_job(jobs, st, ("open_pr", st.repo_root, st.repo_owner,
+                                      st.repo_name, pr.number))
     elif st.focus == FOCUS_COMMITS:
         if ch in (curses.KEY_DOWN, ord("j")):
             st.commit_idx = min(max(0, len(st.commits) - 1), st.commit_idx + 1)
@@ -258,9 +261,6 @@ def _handle_key(stdscr, st, jobs, ch):
         elif ch in (curses.KEY_ENTER, 10, 13):
             _open_file_or_dir(st)
         elif ch == ord(" "):
-            if 0 <= st.file_idx < len(st.tree) and st.tree[st.file_idx][2] == "dir":
-                _toggle_collapse(st, st.tree[st.file_idx][3])
-        elif ch == ord("v"):
             _mark_viewed(st, jobs)
         elif ch == ord("z"):
             _fold_viewed(st)
@@ -315,8 +315,9 @@ def run(stdscr):
     st.repo_root = api.get_repo_root()
     st.viewer = api.get_viewer_login()
     if st.repo_owner:
+        # Only load the PR list; a PR is opened (into a worktree) on demand so
+        # the main checkout is never touched.
         submit_job(jobs, st, ("load_prs",))
-        submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name, st.viewer))
 
     prev_pr_idx = prev_focus = -1
     running = True

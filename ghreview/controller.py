@@ -9,7 +9,7 @@ from .modals import show_editor_modal, show_review_modal
 JOB_TAGS = {
     "load_prs": "prs",
     "load_active": "active",
-    "checkout": "checkout",
+    "open_pr": "worktree",
     "mark_viewed": "viewed",
     "mark_viewed_bulk": "viewed",
     "load_pr_details": "details",
@@ -101,6 +101,7 @@ def apply_result(st, res, jobs):
             st.pending_idx = max(0, len(st.pending) - 1)
         if number is None:
             st.active_pr = None
+            st.active_worktree = ""
             st.files = []
             st.viewed_by_path = {}
             st.commits = []
@@ -142,10 +143,13 @@ def apply_result(st, res, jobs):
         rebuild_tree(st)
         n = len(st.files)
         st.status = f"Reviewing {n} file{'s' if n != 1 else ''} in selected commits"
-    elif kind == "checkout_done":
-        st.busy.discard("checkout")
-        st.status = f"Checked out #{res[1]} — reloading files…"
-        submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name, st.viewer))
+    elif kind == "pr_opened":
+        _, number, path = res
+        st.active_worktree = path
+        st.busy.discard("worktree")
+        st.status = f"Worktree ready for #{number} — loading…"
+        # Load the diff/files now that the PR's objects are fetched locally.
+        submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name, st.viewer, number))
     elif kind == "viewed_ok":
         paths, viewed = res[1], res[2]
         pset = set(paths)

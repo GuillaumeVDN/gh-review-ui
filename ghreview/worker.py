@@ -17,36 +17,36 @@ def worker_loop(jobs, results):
             if kind == "load_prs":
                 results.put(("prs", api.load_prs()))
             elif kind == "load_active":
-                _, owner, name, login = job
-                n = api.current_pr_number()
-                if n is None:
+                _, owner, name, login, number = job
+                if number is None:
                     results.put(("active", None, None, [], {}, {}, [], []))
                 else:
-                    pr_id, files = api.load_files(owner, name, n)
+                    pr_id, files = api.load_files(owner, name, number)
                     try:
-                        commits = api.load_commits(n)
+                        commits = api.load_commits(number)
                     except Exception:
                         commits = []
                     # Prefer the local git range so we control context lines;
                     # fall back to `gh pr diff` (3-line context) when the commit
-                    # list is unavailable.
+                    # list is unavailable. The worktree fetch already brought the
+                    # PR objects into the repo, so the range resolves locally.
                     if commits:
                         diff, info = api.load_diff_range(commits[-1].oid, commits[0].oid)
                     else:
-                        diff, info = api.load_diff(n)
+                        diff, info = api.load_diff(number)
                     try:
-                        pending = api.load_pending_comments(owner, name, n, login) if login else []
+                        pending = api.load_pending_comments(owner, name, number, login) if login else []
                     except Exception:
                         pending = []
-                    results.put(("active", n, pr_id, files, diff, info, pending, commits))
+                    results.put(("active", number, pr_id, files, diff, info, pending, commits))
             elif kind == "load_commit_diff":
                 _, first_oid, last_oid = job
                 diff, info = api.load_diff_range(first_oid, last_oid)
                 results.put(("commit_diff", diff, info))
-            elif kind == "checkout":
-                _, number = job
-                api.checkout_pr(number)
-                results.put(("checkout_done", number))
+            elif kind == "open_pr":
+                _, repo_root, owner, name, number = job
+                path = api.open_pr_worktree(repo_root, owner, name, number)
+                results.put(("pr_opened", number, path))
             elif kind == "mark_viewed":
                 _, pr_id, path, viewed = job
                 api.mark_viewed_api(pr_id, path, viewed)

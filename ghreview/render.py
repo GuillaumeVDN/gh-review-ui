@@ -83,18 +83,18 @@ def selection_attr():
 def shortcuts_for(st):
     common = "0-4: focus pane · Tab: next · f: finish review · r: refresh · q: quit"
     if st.focus == FOCUS_PRS:
-        return f"Enter: checkout · j/k: move · Shift+J/K: scroll summary · {common}"
+        return f"Enter: open (worktree) · j/k: move · Shift+J/K: scroll summary · {common}"
     if st.focus == FOCUS_COMMITS:
         return (f"Space: toggle · a: all/none · Enter: apply range · j/k: move · {common}")
     if st.focus == FOCUS_PENDING:
         return f"Enter: submit review · j/k: move · d: delete · Shift+J/K: scroll diff · {common}"
     if st.focus == FOCUS_FILES:
-        return (f"Enter: open diff · e: editor · v: viewed · z: fold viewed · "
-                f"Space: fold · j/k: move · Alt+j/k: next/prev file · {common}")
+        return (f"Enter: open/collapse · Space: viewed · e: editor · z: fold viewed · "
+                f"j/k: move · Alt+j/k: next/prev file · {common}")
     return f"j/k: next/prev hunk · c: comment · e: editor · PgUp/PgDn: scroll · Esc: back · {common}"
 
 
-# ---------- left column: PRs / Pending / Files ----------
+# ---------- left column: PRs / Commits / Files / Pending ----------
 
 def render_prs(stdscr, st, y, x, h, w):
     draw_box(stdscr, y, x, h, w, f"[1] PRs [{st.repo_owner}/{st.repo_name}]",
@@ -143,7 +143,7 @@ def render_commits(stdscr, st, y, x, h, w):
 
 
 def render_pending(stdscr, st, y, x, h, w):
-    draw_box(stdscr, y, x, h, w, f"[3] Pending ({len(st.pending)})",
+    draw_box(stdscr, y, x, h, w, f"[4] Pending ({len(st.pending)})",
              st.focus == FOCUS_PENDING, busy=bool({"review", "pending"} & st.busy))
     vh, iw = h - 2, w - 3
     if not st.pending:
@@ -161,10 +161,10 @@ def render_pending(stdscr, st, y, x, h, w):
 
 
 def render_files(stdscr, st, y, x, h, w):
-    files_title = "[4] Files"
+    files_title = "[3] Files"
     if st.active_pr:
         n_viewed = sum(1 for f in st.files if f.viewed)
-        files_title = f"[4] Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
+        files_title = f"[3] Files #{st.active_pr.number}  {n_viewed}/{len(st.files)} viewed"
     draw_box(stdscr, y, x, h, w, files_title,
              st.focus == FOCUS_FILES, busy="active" in st.busy or "viewed" in st.busy)
     vh, iw = h - 2, w - 3
@@ -329,8 +329,8 @@ def compute_layout(H, W):
     return {
         "prs": (0, 0, pr_h, left_w),
         "commits": (pr_h, 0, commits_h, left_w),
-        "pending": (pr_h + commits_h, 0, pending_h, left_w),
-        "files": (pr_h + commits_h + pending_h, 0, files_h, left_w),
+        "files": (pr_h + commits_h, 0, files_h, left_w),
+        "pending": (pr_h + commits_h + files_h, 0, pending_h, left_w),
         "right": (0, left_w, body_h, right_w),
     }
 

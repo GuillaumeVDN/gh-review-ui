@@ -118,13 +118,24 @@ def test_apply_error_clears_busy_and_reports():
     assert "kaboom" in st.status
 
 
-def test_checkout_done_triggers_reload():
+def test_pr_opened_sets_worktree_and_triggers_load():
     st = State()
     st.repo_owner, st.repo_name, st.viewer = "o", "n", "me"
-    st.busy.add("checkout")
+    st.busy.add("worktree")
     jobs = queue.Queue()
-    controller.apply_result(st, ("checkout_done", 5), jobs)
-    assert jobs.get_nowait() == ("load_active", "o", "n", "me")
+    controller.apply_result(st, ("pr_opened", 5, "/cache/pr-5"), jobs)
+    assert st.active_worktree == "/cache/pr-5"
+    assert "worktree" not in st.busy
+    # load_active is submitted for that specific PR number
+    assert jobs.get_nowait() == ("load_active", "o", "n", "me", 5)
+
+
+def test_apply_active_none_clears_worktree():
+    st = State()
+    st.active_worktree = "/cache/pr-9"
+    st.busy.add("active")
+    controller.apply_result(st, ("active", None, None, [], {}, {}, [], []), queue.Queue())
+    assert st.active_pr is None and st.active_worktree == ""
 
 
 def test_pane_at_hit_testing():

@@ -29,19 +29,19 @@ def test_compute_layout_covers_screen_without_overlap():
     assert px == fx == 0
     assert rx == pw
     assert pw + rw == 120
-    # left panes are stacked contiguously: prs -> commits -> pending -> files
+    # left panes are stacked contiguously: prs -> commits -> files -> pending
     cy, _, ch, _ = rects["commits"]
     pey, _, peh, _ = rects["pending"]
     assert cy == py + ph
-    assert pey == cy + ch
-    assert fy == pey + peh
+    assert fy == cy + ch
+    assert pey == fy + fh
     # they fill exactly the body height
-    assert fy + fh == py + (40 - 2)
+    assert pey + peh == py + (40 - 2)
 
 
 def test_shortcuts_change_with_focus():
     st = State()
-    for focus, needle in [(FOCUS_PRS, "checkout"), (FOCUS_COMMITS, "toggle"),
+    for focus, needle in [(FOCUS_PRS, "worktree"), (FOCUS_COMMITS, "toggle"),
                           (FOCUS_PENDING, "submit review"),
                           (FOCUS_FILES, "fold viewed"), (FOCUS_DIFF, "comment")]:
         st.focus = focus

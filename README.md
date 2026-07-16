@@ -7,16 +7,17 @@ Five panes (left column stacked, right side full-height):
   already reviewed (still open).
 - **Commits** — commits of the active PR. All are selected by default (whole
   PR); unselect and pick a range (or a single commit) to review only those.
-- **Pending** — review comments queued locally, waiting to be submitted.
 - **Files** — file tree of the currently checked-out PR, with viewed-state.
   When a commit range is selected, only the files it touches are listed.
+- **Pending** — review comments queued locally, waiting to be submitted.
 - **Right** — PR description + timeline when the PRs pane is focused,
   selected commit's message when the Commits pane is focused,
   diff of the highlighted / opened file otherwise. The current hunk is
   marked with a green side-bar.
 
-Backed by the `gh` CLI (for auth, PR list, checkout, diff) plus GitHub's GraphQL
-API for the `viewedState` mutations. Zero Python dependencies — pure stdlib
+Backed by the `gh` CLI (for auth, PR list, diff) and `git` worktrees (for
+checkout), plus GitHub's GraphQL API for the `viewedState` mutations and pending
+reviews. Zero Python dependencies — pure stdlib
 `curses` + threads.
 
 ## Requirements
@@ -49,14 +50,19 @@ gh-review-ui
 
 On start it will:
 1. detect the repo from the current working directory (via `gh repo view`);
-2. fetch open PRs where you're the author, a requested reviewer, or have already reviewed;
-3. if the current branch corresponds to a PR, load its file list and diff.
+2. fetch open PRs where you're the author, a requested reviewer, or have already reviewed.
+
+Opening a PR (`Enter` in the PRs pane) checks it out into its **own git
+worktree** under `~/.cache/gh-review-ui/worktrees/<owner>__<repo>/pr-<n>` instead
+of switching your main checkout's branch — so you (or agents) can keep working on
+another branch while you review. The `e` editor shortcut opens the worktree copy
+of the file, and worktrees are reused/refreshed on subsequent opens and on `r`.
 
 ## Keys
 
 Global:
 - `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Pending → Files → Diff)
-- `0` / `1` / `2` / `3` / `4` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Pending, `4` Files)
+- `0` / `1` / `2` / `3` / `4` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending)
 - `q` — quit
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
@@ -68,7 +74,7 @@ Global:
 
 PRs pane:
 - `j` / `k` / arrows — move
-- `Enter` — `gh pr checkout` the selected PR
+- `Enter` — open the selected PR in a dedicated worktree (leaves your checkout untouched)
 - `d` / `u` or PgDn / PgUp — scroll the details view
 - `Shift+J` / `Shift+K` — scroll the PR summary line-by-line
 
@@ -87,6 +93,14 @@ Commits pane:
 
 The right pane shows the selected commit's short SHA, author, date, and message.
 
+Files pane:
+- `j` / `k` — move (over files *and* folders)
+- `Alt+j` / `Alt+k` — jump to the next / previous file, skipping folder rows
+- `Space` — toggle viewed on file, or on all files under a folder
+- `z` — fold every fully-viewed folder, then jump to the first unviewed file
+- `e` — open the selected file in the editor (top of file)
+- `Enter` — open file in the diff pane (folder: collapse / expand)
+
 Pending pane:
 - `j` / `k` — move
 - `Enter` — open the submit-review modal
@@ -94,15 +108,6 @@ Pending pane:
 
 While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.
-
-Files pane:
-- `j` / `k` — move (over files *and* folders)
-- `Alt+j` / `Alt+k` — jump to the next / previous file, skipping folder rows
-- `Space` — collapse / expand folder
-- `z` — fold every fully-viewed folder, then jump to the first unviewed file
-- `v` — toggle viewed on file, or on all files under a folder
-- `e` — open the selected file in the editor (top of file)
-- `Enter` — open file in the diff pane (focuses diff)
 
 Diff pane:
 - `j` / `k` / arrows — jump to next / previous hunk
@@ -158,7 +163,8 @@ editor or window manager.
 
 - "Viewed" state is stored server-side on GitHub; toggling here syncs to the PR review UI on github.com.
 - Pending review comments are stored server-side too — close the app and they're still there when you return.
-- Diffs are fetched once per checkout — press `r` to reload after new pushes.
+- Opening a PR fetches its head and (re)builds its worktree — press `r` to re-fetch and reload after new pushes.
+- Review worktrees live under `~/.cache/gh-review-ui/worktrees/` and are reused across sessions; delete that directory (or `git worktree remove` them) to clean up.
 - File pagination handles PRs with up to a few hundred files.
 
 ## Project layout

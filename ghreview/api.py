@@ -55,13 +55,6 @@ def load_prs():
     return sorted(seen.values(), key=lambda pr: -pr.number)
 
 
-def current_pr_number():
-    try:
-        return gh_json(["pr", "view", "--json", "number"])["number"]
-    except Exception:
-        return None
-
-
 def load_files(owner, name, number):
     q = """
     query($owner:String!, $name:String!, $number:Int!, $after:String) {
@@ -135,8 +128,62 @@ def load_pr_details(number):
     ])
 
 
-def checkout_pr(number):
-    sh(["gh", "pr", "checkout", str(number)])
+# ---- worktrees ----
+#
+# Instead of `gh pr checkout` (which switches the main checkout's branch), each
+# PR is materialised in its own git worktree under the cache dir. The main repo
+# stays on whatever branch you're working on; the worktree holds the PR head so
+# you (or agents) can edit the reviewed code independently.
+
+def base_remote(repo_root, owner, name):
+    """The git remote that points at ``owner/name`` (falls back to origin)."""
+    try:
+        out = sh(["git", "-C", repo_root, "remote", "-v"])
+    except Exception:
+        return "origin"
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and f"{owner}/{name}" in parts[1] and "fetch" in line:
+            return parts[0]
+    return "origin"
+
+
+def worktree_path(owner, name, number):
+    """Stable on-disk location for a PR's review worktree."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "gh-review-ui", "worktrees",
+                        f"{owner}__{name}", f"pr-{number}")
+
+
+def _is_worktree(path):
+    if not os.path.isdir(path):
+        return False
+    try:
+        sh(["git", "-C", path, "rev-parse", "--is-inside-work-tree"])
+        return True
+    except Exception:
+        return False
+
+
+def open_pr_worktree(repo_root, owner, name, number):
+    """Fetch the PR head and check it out in a dedicated worktree.
+
+    Returns the worktree path. Reuses/refreshes an existing worktree so
+    repeatedly opening (or refreshing) a PR is cheap and picks up new pushes.
+    """
+    remote = base_remote(repo_root, owner, name)
+    ref = f"refs/gh-review-ui/pr-{number}"
+    branch = f"gh-review-ui/pr-{number}"
+    sh(["git", "-C", repo_root, "fetch", remote, f"+refs/pull/{number}/head:{ref}"])
+    sha = sh(["git", "-C", repo_root, "rev-parse", ref]).strip()
+    path = worktree_path(owner, name, number)
+    if _is_worktree(path):
+        sh(["git", "-C", path, "checkout", "-B", branch, sha])
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        sh(["git", "-C", repo_root, "worktree", "prune"])
+        sh(["git", "-C", repo_root, "worktree", "add", "--force", "-B", branch, path, sha])
+    return path
 
 
 # ---- viewed state ----

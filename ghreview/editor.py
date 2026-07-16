@@ -32,7 +32,10 @@ def open_current_in_editor(st, top=False):
         st.status = "No file selected."
         return
     line = 1 if top else current_hunk_editor_line(st, path)
-    abs_path = os.path.join(st.repo_root or os.getcwd(), path)
+    # Prefer the PR's review worktree so edits land on the reviewed branch, not
+    # whatever the main checkout is currently on.
+    root = st.active_worktree or st.repo_root or os.getcwd()
+    abs_path = os.path.join(root, path)
     try:
         open_in_editor(abs_path, line)
         st.status = f"Opening {path}:{line} in editor…"
