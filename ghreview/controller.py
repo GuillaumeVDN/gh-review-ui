@@ -1,7 +1,8 @@
 """State transitions and job orchestration (glue between UI and worker)."""
+from . import api
 from .diff import compute_hunks
 from .models import PR, FileEntry, PendingComment, FOCUS_DIFF
-from .navigation import cur_file_path, hunk_anchor_line
+from .navigation import cur_file_path, line_target
 from .tree import rebuild_tree
 from .modals import show_editor_modal, show_review_modal
 
@@ -48,6 +49,8 @@ def _set_diff(st, diff, info):
     st.hunks_by_file = {p: compute_hunks(lines) for p, lines in diff.items()}
     st.diff_scroll = 0
     st.diff_hunk_idx = 0
+    st.comment_mode = False
+    st.comment_start = None
 
 
 def apply_commit_selection(st, jobs):
@@ -148,6 +151,8 @@ def apply_result(st, res, jobs):
         st.active_worktree = path
         st.busy.discard("worktree")
         st.status = f"Worktree ready for #{number} — loading…"
+        # Remember it so the next launch reopens the same worktree.
+        api.save_last_pr(st.repo_owner, st.repo_name, number)
         # Load the diff/files now that the PR's objects are fetched locally.
         submit_job(jobs, st, ("load_active", st.repo_owner, st.repo_name, st.viewer, number))
     elif kind == "viewed_ok":
@@ -194,31 +199,41 @@ def apply_result(st, res, jobs):
 # ---------- modal-driven actions ----------
 
 def open_comment_modal(stdscr, st, jobs):
-    if st.focus != FOCUS_DIFF or not st.active_pr:
-        st.status = "Focus the diff pane to comment on a hunk."
+    """Open the editor for the line/range picked in comment-selection mode."""
+    st.comment_mode = False
+    if not st.active_pr:
+        st.status = "No active PR."
         return
     path = cur_file_path(st)
     if not path:
         return
-    anchor = hunk_anchor_line(st, path)
-    if anchor is None:
-        st.status = "No commentable line in the current hunk."
+    target = line_target(st, path, st.comment_line)
+    if target is None:
+        st.status = "No commentable line selected."
         return
-    line, side = anchor
+    line, side = target
+    start_line = start_side = None
+    if st.comment_start is not None and st.comment_start != st.comment_line:
+        lo, hi = sorted((st.comment_start, st.comment_line))
+        lo_t, hi_t = line_target(st, path, lo), line_target(st, path, hi)
+        if lo_t and hi_t:
+            start_line, start_side = lo_t
+            line, side = hi_t
+    where = f"{path}:{start_line}-{line}" if start_line is not None else f"{path}:{line} ({side})"
     action, body = show_editor_modal(
-        stdscr,
-        f"Comment on {path}:{line} ({side})",
+        stdscr, f"Comment on {where}",
         "Enter: add to pending review · Shift+Enter: newline · Esc: cancel",
     )
     if action == "cancel" or not body.strip():
         return
     # Any confirm adds to the pending review, which is created/persisted
     # server-side so it survives restarts.
-    comment = PendingComment(path=path, body=body.strip(), line=line, side=side)
+    comment = PendingComment(path=path, body=body.strip(), line=line, side=side,
+                             start_line=start_line, start_side=start_side)
     st.pending.append(comment)  # optimistic; the reload replaces the list
     submit_job(jobs, st, ("add_pending", st.repo_owner, st.repo_name,
                           st.active_pr.number, st.viewer, st.active_pr.node_id, comment))
-    st.status = f"Adding comment on {path}:{line} to pending review…"
+    st.status = f"Adding comment on {where} to pending review…"
 
 
 def open_finish_modal(stdscr, st, jobs):

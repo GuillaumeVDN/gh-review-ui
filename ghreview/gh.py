@@ -22,7 +22,11 @@ def gh_json(args):
 
 
 def gh_graphql(query, **variables):
-    """Run a GraphQL query/mutation via `gh api graphql` with typed variables."""
+    """Run a GraphQL query/mutation via `gh api graphql` with typed variables.
+
+    Raises if the response carries a GraphQL ``errors`` payload, so a rejected
+    mutation surfaces instead of silently returning empty data.
+    """
     args = ["gh", "api", "graphql", "-f", f"query={query}"]
     for k, v in variables.items():
         if v is None:
@@ -33,4 +37,8 @@ def gh_graphql(query, **variables):
             args += ["-F", f"{k}={v}"]
         else:
             args += ["-f", f"{k}={v}"]
-    return json.loads(sh(args))
+    data = json.loads(sh(args))
+    if isinstance(data, dict) and data.get("errors"):
+        msgs = "; ".join(e.get("message", str(e)) for e in data["errors"])
+        raise RuntimeError(f"graphql: {msgs[:400]}")
+    return data

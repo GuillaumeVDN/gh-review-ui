@@ -10,7 +10,8 @@ from .gh import sh
 from .keys import get_key, disable_flow_control, KEY_ALT_J, KEY_ALT_K
 from .models import (State, N_PANES, FOCUS_PRS, FOCUS_COMMITS, FOCUS_PENDING,
                      FOCUS_FILES, FOCUS_DIFF)
-from .navigation import scroll_diff, jump_hunk, cur_file_path
+from .navigation import (scroll_diff, jump_hunk, cur_file_path,
+                         hunk_line_indices, first_change_index)
 from .tree import rebuild_tree, files_under_dir, fold_viewed_dirs, first_unviewed_index
 from .editor import open_current_in_editor
 from .modals import curs_set
@@ -134,6 +135,63 @@ def _jump_file(st, direction):
         i += direction
 
 
+def _enter_comment_mode(st):
+    """Start the in-hunk line picker for a comment."""
+    if not st.active_pr:
+        st.status = "No active PR."
+        return
+    path = cur_file_path(st)
+    idxs = hunk_line_indices(st, path) if path else []
+    if not idxs:
+        st.status = "No commentable line in the current hunk."
+        return
+    st.comment_mode = True
+    st.comment_start = None
+    fc = first_change_index(st, path)
+    st.comment_line = fc if fc is not None else idxs[0]
+    st.status = "Comment: j/k line · Shift+J/K range · Enter confirm · Esc cancel"
+
+
+def _move_comment(st, path, direction, extend):
+    idxs = hunk_line_indices(st, path)
+    if not idxs:
+        return
+    if st.comment_line not in idxs:
+        st.comment_line = idxs[0]
+    pos = idxs.index(st.comment_line)
+    pos = max(0, min(len(idxs) - 1, pos + direction))
+    if extend:
+        if st.comment_start is None:
+            st.comment_start = st.comment_line  # anchor the range before moving
+    else:
+        st.comment_start = None
+    st.comment_line = idxs[pos]
+
+
+def _handle_comment_mode(stdscr, st, jobs, ch):
+    """Keys while picking a line/range for a comment (captures navigation)."""
+    path = cur_file_path(st)
+    if ch == 27:
+        st.comment_mode = False
+        st.status = "Comment cancelled."
+    elif ch in (curses.KEY_DOWN, ord("j")):
+        _move_comment(st, path, +1, extend=False)
+    elif ch in (curses.KEY_UP, ord("k")):
+        _move_comment(st, path, -1, extend=False)
+    elif ch == ord("J"):
+        _move_comment(st, path, +1, extend=True)
+    elif ch == ord("K"):
+        _move_comment(st, path, -1, extend=True)
+    elif ch in (curses.KEY_ENTER, 10, 13):
+        try:
+            open_comment_modal(stdscr, st, jobs)
+        except Exception as e:
+            curs_set(0)
+            st.comment_mode = False
+            st.status = f"comment error: {type(e).__name__}: {e}"
+    return True
+
+
 def _open_file_or_dir(st):
     if not (0 <= st.file_idx < len(st.tree)):
         return
@@ -148,6 +206,9 @@ def _open_file_or_dir(st):
 
 def _handle_key(stdscr, st, jobs, ch):
     """Dispatch a key. Returns True to keep running, False to quit."""
+    # The in-hunk comment picker is modal: it captures navigation first.
+    if st.comment_mode:
+        return _handle_comment_mode(stdscr, st, jobs, ch)
     # --- global ---
     if ch == ord("q"):
         return False
@@ -190,13 +251,6 @@ def _handle_key(stdscr, st, jobs, ch):
         except Exception as e:
             curs_set(0)
             st.status = f"finish-review error: {type(e).__name__}: {e}"
-        return True
-    if ch == ord("c"):
-        try:
-            open_comment_modal(stdscr, st, jobs)
-        except Exception as e:
-            curs_set(0)
-            st.status = f"comment error: {type(e).__name__}: {e}"
         return True
     if ch == curses.KEY_MOUSE:
         _handle_mouse(st, jobs)
@@ -280,6 +334,8 @@ def _handle_key(stdscr, st, jobs, ch):
             st.diff_scroll = min(max_scroll, st.diff_scroll + page)
         elif ch == curses.KEY_PPAGE:
             st.diff_scroll = max(0, st.diff_scroll - page)
+        elif ch == ord("c"):
+            _enter_comment_mode(st)
         elif ch == ord("e"):
             open_current_in_editor(st)
         elif ch == 27:
@@ -315,9 +371,15 @@ def run(stdscr):
     st.repo_root = api.get_repo_root()
     st.viewer = api.get_viewer_login()
     if st.repo_owner:
-        # Only load the PR list; a PR is opened (into a worktree) on demand so
-        # the main checkout is never touched.
+        # Load the PR list; a PR is opened (into a worktree) on demand so the
+        # main checkout is never touched.
         submit_job(jobs, st, ("load_prs",))
+        # Reopen the PR reviewed last time (rebuilds its worktree), if any.
+        last = api.load_last_pr(st.repo_owner, st.repo_name)
+        if last is not None:
+            st.status = f"Reopening #{last} from last session…"
+            submit_job(jobs, st, ("open_pr", st.repo_root, st.repo_owner,
+                                  st.repo_name, last))
 
     prev_pr_idx = prev_focus = -1
     running = True

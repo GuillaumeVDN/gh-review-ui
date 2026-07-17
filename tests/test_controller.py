@@ -118,7 +118,10 @@ def test_apply_error_clears_busy_and_reports():
     assert "kaboom" in st.status
 
 
-def test_pr_opened_sets_worktree_and_triggers_load():
+def test_pr_opened_sets_worktree_and_triggers_load(monkeypatch):
+    saved = []
+    monkeypatch.setattr(controller.api, "save_last_pr",
+                        lambda o, n, num: saved.append((o, n, num)))
     st = State()
     st.repo_owner, st.repo_name, st.viewer = "o", "n", "me"
     st.busy.add("worktree")
@@ -126,6 +129,8 @@ def test_pr_opened_sets_worktree_and_triggers_load():
     controller.apply_result(st, ("pr_opened", 5, "/cache/pr-5"), jobs)
     assert st.active_worktree == "/cache/pr-5"
     assert "worktree" not in st.busy
+    # remembered for next launch
+    assert saved == [("o", "n", 5)]
     # load_active is submitted for that specific PR number
     assert jobs.get_nowait() == ("load_active", "o", "n", "me", 5)
 
@@ -144,3 +149,49 @@ def test_pane_at_hit_testing():
     assert controller.pane_at(st, 2, 3) == "prs"
     assert controller.pane_at(st, 1, 15) == "right"
     assert controller.pane_at(st, 50, 50) is None
+
+
+def _comment_state():
+    st = State()
+    st.repo_owner = st.repo_name = st.viewer = "x"
+    st.active_pr = PR(1, "t", "h", "a", node_id="PR")
+    st.files = [FileEntry("f.py", False)]
+    st.tree = [(0, "f.py", "file", 0, None)]
+    st.file_idx = 0
+    st.diff_by_file = {"f.py": ["@@ -1,2 +1,3 @@", " ctx", "+a", "+b"]}
+    st.info_by_file = {"f.py": [(None, None), (1, 1), (None, 2), (None, 3)]}
+    st.hunks_by_file = {"f.py": [(0, 4)]}
+    st.comment_mode = True
+    return st
+
+
+def test_open_comment_modal_single_line(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal", lambda *a, **k: ("enter", "nice"))
+    st = _comment_state()
+    st.comment_line, st.comment_start = 2, None   # the "+a" line (new-side 2)
+    jobs = queue.Queue()
+    controller.open_comment_modal(None, st, jobs)
+    assert st.comment_mode is False
+    comment = jobs.get_nowait()[-1]
+    assert (comment.line, comment.side) == (2, "RIGHT")
+    assert comment.start_line is None
+
+
+def test_open_comment_modal_range(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal", lambda *a, **k: ("enter", "nice"))
+    st = _comment_state()
+    st.comment_start, st.comment_line = 1, 3   # ctx(1) .. +b(3)
+    jobs = queue.Queue()
+    controller.open_comment_modal(None, st, jobs)
+    comment = jobs.get_nowait()[-1]
+    assert (comment.start_line, comment.start_side) == (1, "RIGHT")
+    assert (comment.line, comment.side) == (3, "RIGHT")
+
+
+def test_open_comment_modal_cancel_adds_nothing(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal", lambda *a, **k: ("cancel", ""))
+    st = _comment_state()
+    st.comment_line = 2
+    jobs = queue.Queue()
+    controller.open_comment_modal(None, st, jobs)
+    assert st.comment_mode is False and jobs.empty() and st.pending == []

@@ -40,9 +40,11 @@ class FileEntry:
 class PendingComment:
     path: str
     body: str
-    line: int          # line number on the chosen side
+    line: int          # line number on the chosen side (end line for a range)
     side: str          # "RIGHT" or "LEFT"
     comment_id: str = ""  # server node id once it exists in the pending review
+    start_line: Optional[int] = None  # multi-line range start (None = single line)
+    start_side: str = ""
 
 
 @dataclass
@@ -80,6 +82,11 @@ class State:
     hunks_by_file: dict = field(default_factory=dict)
     diff_scroll: int = 0
     diff_hunk_idx: int = 0  # currently-selected hunk (independent of scroll)
+
+    # In-hunk line/range picker used before opening the comment modal.
+    comment_mode: bool = False
+    comment_line: int = 0            # diff-line index of the cursor
+    comment_start: Optional[int] = None  # diff-line index of a range anchor
 
     # PR details for the right pane when PRs is focused
     pr_details: dict = field(default_factory=dict)  # number -> data or None (loading)

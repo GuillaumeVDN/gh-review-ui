@@ -3,6 +3,7 @@
 Built on :mod:`ghreview.gh`. These functions block on the network and are meant
 to run inside the worker thread.
 """
+import json
 import os
 
 from .gh import gh_json, gh_graphql, sh
@@ -186,6 +187,38 @@ def open_pr_worktree(repo_root, owner, name, number):
     return path
 
 
+# ---- session persistence (remember the last-opened PR per repo) ----
+
+def _session_file():
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "gh-review-ui", "last-pr.json")
+
+
+def save_last_pr(owner, name, number):
+    """Remember the PR most recently opened for ``owner/name``."""
+    path = _session_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+        data[f"{owner}/{name}"] = number
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_last_pr(owner, name):
+    """Return the last-opened PR number for ``owner/name``, or None."""
+    try:
+        with open(_session_file()) as f:
+            return json.load(f).get(f"{owner}/{name}")
+    except Exception:
+        return None
+
+
 # ---- viewed state ----
 
 def mark_viewed_api(pr_id, path, viewed):
@@ -290,17 +323,24 @@ def load_pending_comments(owner, name, number, login):
 
 
 def add_pending_comment_api(owner, name, number, login, pr_id, comment):
-    """Ensure a pending review exists, then add ``comment`` as a thread to it."""
-    review_id = _ensure_pending_review(owner, name, number, login, pr_id)
-    q = """
-    mutation($r:ID!, $path:String!, $line:Int!, $body:String!, $side:DiffSide!) {
-      addPullRequestReviewThread(input:{
-        pullRequestReviewId:$r, path:$path, line:$line, body:$body, side:$side
-      }) { thread { id } }
-    }
+    """Ensure a pending review exists, then add ``comment`` as a thread to it.
+
+    Includes ``startLine``/``startSide`` for a multi-line (range) comment.
     """
-    gh_graphql(q, r=review_id, path=comment.path, line=comment.line,
-               body=comment.body, side=comment.side)
+    review_id = _ensure_pending_review(owner, name, number, login, pr_id)
+    decls = "$r:ID!, $path:String!, $line:Int!, $body:String!, $side:DiffSide!"
+    fields = ("pullRequestReviewId:$r, path:$path, line:$line, body:$body, "
+              "side:$side")
+    variables = dict(r=review_id, path=comment.path, line=comment.line,
+                     body=comment.body, side=comment.side)
+    if comment.start_line is not None and comment.start_side:
+        decls += ", $startLine:Int!, $startSide:DiffSide!"
+        fields += ", startLine:$startLine, startSide:$startSide"
+        variables["startLine"] = comment.start_line
+        variables["startSide"] = comment.start_side
+    q = (f"mutation({decls}) {{ addPullRequestReviewThread(input:{{{fields}}}) "
+         f"{{ thread {{ id }} }} }}")
+    gh_graphql(q, **variables)
 
 
 def delete_pending_comment_api(comment_id):

@@ -159,3 +159,29 @@ def test_load_prs_queries_authored_requested_and_reviewed(monkeypatch):
     assert any("reviewed-by:@me" in s for s in searches)
     # deduped by number, sorted descending
     assert [p.number for p in prs] == [3, 2, 1]
+
+
+def test_add_pending_range_includes_start_line(monkeypatch):
+    from ghreview.models import PendingComment
+    found = {"data": {"repository": {"pullRequest": {
+        "id": "PR", "reviews": {"nodes": [{"id": "REV"}]}}}}}
+    fake = FakeGraphQL(responses={"reviews": found, "addPullRequestReviewThread": {}})
+    monkeypatch.setattr(api, "gh_graphql", fake)
+    c = PendingComment("a.py", "hi", 10, "RIGHT", start_line=5, start_side="RIGHT")
+    api.add_pending_comment_api("o", "n", 1, "me", "PR", c)
+    q, v = [(q, v) for q, v in fake.calls if "addPullRequestReviewThread" in q][0]
+    assert "startLine:$startLine" in q and "startSide:$startSide" in q
+    assert v["startLine"] == 5 and v["startSide"] == "RIGHT"
+    assert v["line"] == 10 and v["side"] == "RIGHT"
+
+
+def test_add_pending_single_omits_start_line(monkeypatch):
+    from ghreview.models import PendingComment
+    found = {"data": {"repository": {"pullRequest": {
+        "id": "PR", "reviews": {"nodes": [{"id": "REV"}]}}}}}
+    fake = FakeGraphQL(responses={"reviews": found, "addPullRequestReviewThread": {}})
+    monkeypatch.setattr(api, "gh_graphql", fake)
+    api.add_pending_comment_api("o", "n", 1, "me", "PR",
+                                PendingComment("a.py", "hi", 10, "RIGHT"))
+    q, v = [(q, v) for q, v in fake.calls if "addPullRequestReviewThread" in q][0]
+    assert "startLine" not in q and "startLine" not in v

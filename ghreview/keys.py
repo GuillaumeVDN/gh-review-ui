@@ -62,6 +62,10 @@ def get_key(win):
         if c2 != ord("["):
             if c2 in KEY_ALT:  # Alt+<key>: ESC arrived glued to the key byte
                 return KEY_ALT[c2]
+            if c2 in (10, 13, curses.KEY_ENTER):
+                # ESC-prefixed Enter (how some terminals send Shift/Alt+Enter):
+                # treat as a newline, not Escape.
+                return KEY_SHIFT_ENTER
             try:
                 curses.ungetch(c2)
             except (curses.error, OverflowError):

@@ -50,3 +50,11 @@ def test_alt_j_decoded():
 def test_bare_escape_then_timeout():
     from ghreview.keys import get_key
     assert get_key(FakeWin([27, -1])) == 27
+
+
+def test_esc_prefixed_enter_is_newline():
+    # Some terminals send Shift/Alt+Enter as ESC then CR/LF — must be a newline,
+    # not Escape (which would cancel the modal).
+    from ghreview.keys import get_key, KEY_SHIFT_ENTER
+    assert get_key(FakeWin([27, 13])) == KEY_SHIFT_ENTER
+    assert get_key(FakeWin([27, 10])) == KEY_SHIFT_ENTER

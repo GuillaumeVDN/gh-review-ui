@@ -7,7 +7,11 @@ unit-tested directly.
 """
 import curses
 
-HL_BG_COLOR = 23  # muted cyan — same hue as the @@ headers, but lighter
+HL_BG_COLOR = 152  # light cyan band for the focused hunk's changed lines
+# Dark fixed foregrounds so the +/- text stays readable on the light band,
+# regardless of how the theme remaps the base green/red.
+HL_ADD_FG = 22   # dark green
+HL_DEL_FG = 88   # dark red
 
 # Base pairs: (name, fg, bg). bg == -1 means the terminal default.
 _BASE = [
@@ -22,12 +26,10 @@ _BASE = [
     ("title",   curses.COLOR_YELLOW, -1),
     ("curhunk", curses.COLOR_GREEN, -1),
 ]
-# Highlighted-hunk background variants (need 256 colors).
+# Highlighted-hunk background variants for changed lines (need 256 colors).
 _HL = [
-    ("hl.add", curses.COLOR_GREEN, HL_BG_COLOR),
-    ("hl.del", curses.COLOR_RED, HL_BG_COLOR),
-    ("hl.ctx", -1, HL_BG_COLOR),
-    ("hl.hdr", curses.COLOR_WHITE, HL_BG_COLOR),
+    ("hl.add", HL_ADD_FG, HL_BG_COLOR),
+    ("hl.del", HL_DEL_FG, HL_BG_COLOR),
 ]
 
 _pairs = {}          # name -> pair index
@@ -88,14 +90,15 @@ def classify_diff_line(line):
 
 
 def diff_line_style(line, current=False):
-    """Attribute for a diff line, honoring the current-hunk highlight band."""
+    """Attribute for a diff line, honoring the current-hunk highlight band.
+
+    In the focused hunk only the actual changed lines (``+``/``-``) get the
+    background band; context and the ``@@`` header keep their normal styling —
+    the side-bar marks the hunk's extent.
+    """
     kind = classify_diff_line(line)
-    if current and hl_enabled:
-        return {
-            "add": style("hl.add"),
-            "del": style("hl.del"),
-            "hunk": style("hl.hdr", bold=True),
-        }.get(kind, style("hl.ctx"))
+    if current and hl_enabled and kind in ("add", "del"):
+        return style("hl.add" if kind == "add" else "hl.del")
     return {
         "add": style("add"),
         "del": style("del"),
@@ -106,7 +109,7 @@ def diff_line_style(line, current=False):
 
 def hunk_marker_style():
     """Attribute for the green side-bar marking the current hunk."""
-    return style("hl.add" if hl_enabled else "curhunk", bold=True)
+    return style("curhunk", bold=True)
 
 
 # Style map for markdown "kind" hints used by the PR summary pane.

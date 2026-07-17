@@ -1,7 +1,8 @@
 from ghreview.models import State, FileEntry
 from ghreview.navigation import (
-    cur_file_path, current_hunk_range, hunk_anchor_line, jump_hunk,
-    current_hunk_editor_line, hunk_for_comment, scroll_diff,
+    cur_file_path, current_hunk_range, jump_hunk, current_hunk_editor_line,
+    hunk_for_comment, scroll_diff, line_target, hunk_line_indices,
+    first_change_index,
 )
 from ghreview.models import PendingComment
 
@@ -63,11 +64,27 @@ def test_jump_hunk_advances_and_clamps():
     assert st.diff_hunk_idx == 0 and st.diff_scroll == 0
 
 
-def test_hunk_anchor_first_commentable_line_right_side():
+def test_line_target_by_kind():
+    st = diff_state()
+    # info rows: 1=ctx(1,1) 2=+added(_,2) 3=+added2(_,3) 5=keep(11,11) 6=-removed(12,_)
+    assert line_target(st, "f.py", 2) == (2, "RIGHT")   # added
+    assert line_target(st, "f.py", 6) == (12, "LEFT")   # deleted
+    assert line_target(st, "f.py", 1) == (1, "RIGHT")   # context → new side
+    assert line_target(st, "f.py", 0) is None           # @@ header row
+
+
+def test_hunk_line_indices_excludes_header():
+    st = diff_state()
+    st.diff_hunk_idx = 0                # hunk (0,4): header + ctx + 2 added
+    assert hunk_line_indices(st, "f.py") == [1, 2, 3]
+
+
+def test_first_change_index_prefers_changed_line():
     st = diff_state()
     st.diff_hunk_idx = 0
-    # first non-header line is the context line (new-side line 1)
-    assert hunk_anchor_line(st, "f.py") == (1, "RIGHT")
+    assert first_change_index(st, "f.py") == 2   # first +added, not the context
+    st.diff_hunk_idx = 1
+    assert first_change_index(st, "f.py") == 6   # the deletion
 
 
 def test_editor_line_is_first_added():

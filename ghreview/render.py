@@ -199,11 +199,19 @@ def render_files(stdscr, st, y, x, h, w):
 
 # ---------- right pane ----------
 
-def _draw_diff_line(stdscr, y, x, iw, line, current, marker_attr):
-    """Draw one diff line with an optional current-hunk marker + background."""
+def _draw_diff_line(stdscr, y, x, iw, line, current, marker_attr, selected=False):
+    """Draw one diff line with the current-hunk marker / comment selection."""
     attr = theme.diff_line_style(line, current)
+    if selected:
+        attr |= curses.A_REVERSE
     text = line.expandtabs(4).ljust(iw - 1)
-    safe_addstr(stdscr, y, x + 1, "▌" if current else " ", marker_attr if current else 0)
+    if selected:
+        marker, m_attr = "▶", theme.style("focus", bold=True)
+    elif current:
+        marker, m_attr = "▌", marker_attr
+    else:
+        marker, m_attr = " ", 0
+    safe_addstr(stdscr, y, x + 1, marker, m_attr)
     safe_addstr(stdscr, y, x + 2, text, attr, maxw=iw - 1)
 
 
@@ -215,15 +223,28 @@ def render_diff(stdscr, st, y, x, h, w):
     if not diff_lines and path:
         diff_lines = ["(no diff — file may be binary, removed, or too large)"]
     vh, iw = h - 2, w - 3
-    st.diff_scroll = min(st.diff_scroll, max(0, len(diff_lines) - vh))
+    # Keep the comment cursor on screen while picking a line/range.
+    if st.comment_mode and path:
+        if st.comment_line < st.diff_scroll:
+            st.diff_scroll = st.comment_line
+        elif st.comment_line >= st.diff_scroll + vh:
+            st.diff_scroll = st.comment_line - vh + 1
+    st.diff_scroll = max(0, min(st.diff_scroll, max(0, len(diff_lines) - vh)))
     # Only highlight the current hunk while the diff pane itself is focused.
     focused = st.focus == FOCUS_DIFF
     cur_hr = current_hunk_range(st, path) if (path and focused) else None
     marker_attr = theme.hunk_marker_style()
+    # Diff-line index range the comment picker currently spans.
+    if st.comment_mode:
+        anchor = st.comment_start if st.comment_start is not None else st.comment_line
+        sel_lo, sel_hi = sorted((anchor, st.comment_line))
+    else:
+        sel_lo, sel_hi = 1, 0  # empty range
     for i, ln in enumerate(diff_lines[st.diff_scroll:st.diff_scroll + vh]):
         line_idx = st.diff_scroll + i
         current = bool(cur_hr and cur_hr[0] <= line_idx < cur_hr[1])
-        _draw_diff_line(stdscr, y + 1 + i, x, iw, ln, current, marker_attr)
+        selected = sel_lo <= line_idx <= sel_hi
+        _draw_diff_line(stdscr, y + 1 + i, x, iw, ln, current, marker_attr, selected)
     draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.diff_scroll, vh, len(diff_lines),
                    st.focus == FOCUS_DIFF)
 

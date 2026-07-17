@@ -105,3 +105,20 @@ def test_editor_falls_back_to_repo_root(monkeypatch):
     st.file_idx = 0
     editor.open_current_in_editor(st, top=True)
     assert opened["path"] == os.path.join("/main/repo", "a.py")
+
+
+def test_last_pr_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert api.load_last_pr("o", "n") is None
+    api.save_last_pr("o", "n", 42)
+    api.save_last_pr("o", "other", 7)
+    assert api.load_last_pr("o", "n") == 42
+    assert api.load_last_pr("o", "other") == 7
+    # updating overwrites
+    api.save_last_pr("o", "n", 99)
+    assert api.load_last_pr("o", "n") == 99
+
+
+def test_last_pr_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "nope"))
+    assert api.load_last_pr("o", "n") is None

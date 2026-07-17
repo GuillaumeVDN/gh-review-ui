@@ -18,22 +18,51 @@ def current_hunk_range(st, path):
     return hunks[idx]
 
 
-def hunk_anchor_line(st, path):
-    """``(line_no, side)`` of the first commentable line of the current hunk."""
+def line_target(st, path, idx):
+    """``(line_no, side)`` a comment on diff-line ``idx`` should attach to.
+
+    Added → new/RIGHT, deleted → old/LEFT, context → new/RIGHT. Returns None for
+    non-line rows (headers, "\\ No newline").
+    """
+    info = st.info_by_file.get(path, [])
+    if not (0 <= idx < len(info)):
+        return None
+    old, new = info[idx]
+    if new is not None and old is None:
+        return (new, "RIGHT")
+    if old is not None and new is None:
+        return (old, "LEFT")
+    if new is not None:
+        return (new, "RIGHT")
+    if old is not None:
+        return (old, "LEFT")
+    return None
+
+
+def hunk_line_indices(st, path):
+    """Diff-line indices in the current hunk that a comment can attach to."""
     hr = current_hunk_range(st, path)
     info = st.info_by_file.get(path, [])
     if not hr:
-        return None
+        return []
     s, e = hr
-    for i in range(s + 1, e):
-        if i >= len(info):
-            break
-        old, new = info[i]
-        if new is not None:
-            return (new, "RIGHT")
-        if old is not None:
-            return (old, "LEFT")
-    return None
+    return [i for i in range(s + 1, e)
+            if i < len(info) and info[i] != (None, None)]
+
+
+def first_change_index(st, path):
+    """Diff-line index of the first added/deleted line in the current hunk."""
+    hr = current_hunk_range(st, path)
+    info = st.info_by_file.get(path, [])
+    if hr:
+        s, e = hr
+        for i in range(s + 1, e):
+            if i < len(info):
+                old, new = info[i]
+                if (new is not None) != (old is not None):  # exactly one side
+                    return i
+    idxs = hunk_line_indices(st, path)
+    return idxs[0] if idxs else None
 
 
 def scroll_diff(st, delta):

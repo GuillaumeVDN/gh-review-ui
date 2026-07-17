@@ -112,18 +112,25 @@ target hunk (with the anchored line marked) and the comment body below it.
 Diff pane:
 - `j` / `k` / arrows — jump to next / previous hunk
 - `PgDn` / `PgUp` — page down / up
-- `c` — comment on the current hunk
+- `c` — start the comment line picker (see below)
 - `e` — open the file in the editor at the current hunk's line
 - `Esc` — back to the files pane
 
-The currently-focused hunk is highlighted with a cyan background band (same hue
-as the `@@` headers, lighter) plus a green side-bar, so it stands out. The
-highlight only shows while the diff pane is focused.
+The currently-focused hunk's changed (`+`/`-`) lines are highlighted with a
+cyan background band plus a green side-bar, so it stands out. The highlight only
+shows while the diff pane is focused.
 
-### Comment modal (`c` in diff pane)
+### Commenting (`c` in diff pane)
 
-Opens a multi-line text editor anchored to the first commentable line in the
-current hunk (`RIGHT` side by default, `LEFT` if the hunk is a pure deletion).
+`c` enters a **line picker** inside the current hunk:
+
+- `j` / `k` — move the target line up / down (changed and context lines)
+- `Shift+J` / `Shift+K` — extend a multi-line range from the anchor
+- `Enter` — open the comment editor targeting that exact line / range
+- `Esc` — cancel
+
+The picked line (or range) is shown with a `▶` marker and reverse video. Then a
+multi-line text editor opens:
 
 - typing — insert text (long lines soft-wrap for display; no newline is added)
 - `Shift+Enter` — insert a newline
@@ -131,6 +138,9 @@ current hunk (`RIGHT` side by default, `LEFT` if the hunk is a pure deletion).
 - `Backspace` — delete character
 - Arrow keys / `Home` / `End` — move cursor
 - `Esc` — cancel
+
+Comments always attach to an actual changed line (or your picked line); a range
+becomes a GitHub multi-line comment (`startLine`/`startSide` … `line`/`side`).
 
 Adding a comment creates (or reuses) a **pending review on GitHub** and attaches
 the comment to it, so pending comments persist across restarts and show up on
