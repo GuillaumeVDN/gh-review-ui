@@ -1,7 +1,7 @@
 """The modal text editor buffer and its soft-wrap helper."""
 import curses
 
-from .keys import KEY_SHIFT_ENTER, KEY_CTRL_ENTER
+from .keys import KEY_SHIFT_ENTER, KEY_CTRL_ENTER, KEY_ALT_BACKSPACE
 
 
 class TextArea:
@@ -29,6 +29,32 @@ class TextArea:
         self.row += 1
         self.col = 0
 
+    def _backspace(self):
+        if self.col > 0:
+            line = self.lines[self.row]
+            self.lines[self.row] = line[:self.col - 1] + line[self.col:]
+            self.col -= 1
+        elif self.row > 0:
+            prev = self.lines[self.row - 1]
+            self.col = len(prev)
+            self.lines[self.row - 1] = prev + self.lines[self.row]
+            del self.lines[self.row]
+            self.row -= 1
+
+    def delete_word(self):
+        """Delete the word before the cursor (Alt+Backspace / Ctrl+W)."""
+        if self.col == 0:
+            self._backspace()  # at line start: join with the previous line
+            return
+        line = self.lines[self.row]
+        i = self.col
+        while i > 0 and line[i - 1].isspace():   # eat whitespace left of cursor
+            i -= 1
+        while i > 0 and not line[i - 1].isspace():  # then the word itself
+            i -= 1
+        self.lines[self.row] = line[:i] + line[self.col:]
+        self.col = i
+
     def handle(self, ch):
         if ch == 27:
             return "cancel"
@@ -38,16 +64,10 @@ class TextArea:
             return "enter"
         elif ch in (KEY_CTRL_ENTER, 24):              # Ctrl+Enter / Ctrl+X → alt confirm
             return "ctrl_enter"
+        elif ch in (KEY_ALT_BACKSPACE, 23):           # Alt+Backspace / Ctrl+W → delete word
+            self.delete_word()
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
-            if self.col > 0:
-                self.lines[self.row] = self.lines[self.row][:self.col - 1] + self.lines[self.row][self.col:]
-                self.col -= 1
-            elif self.row > 0:
-                prev = self.lines[self.row - 1]
-                self.col = len(prev)
-                self.lines[self.row - 1] = prev + self.lines[self.row]
-                del self.lines[self.row]
-                self.row -= 1
+            self._backspace()
         elif ch == curses.KEY_LEFT:
             if self.col > 0:
                 self.col -= 1

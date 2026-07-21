@@ -55,3 +55,41 @@ def test_wrap_textarea_multiline_cursor():
     ta.row, ta.col = 1, 5
     _, vr, vc = wrap_textarea(ta, 4)
     assert (vr, vc) == (2, 1)
+
+
+def test_delete_word_removes_previous_word():
+    from ghreview.keys import KEY_ALT_BACKSPACE
+    ta = TextArea("hello world")   # cursor at end (col 11)
+    ta.handle(KEY_ALT_BACKSPACE)
+    assert ta.text() == "hello " and ta.col == 6
+    ta.handle(KEY_ALT_BACKSPACE)
+    assert ta.text() == "" and ta.col == 0
+
+
+def test_delete_word_eats_trailing_space():
+    from ghreview.keys import KEY_ALT_BACKSPACE
+    ta = TextArea("foo bar   ")   # trailing spaces then cursor at end
+    ta.handle(KEY_ALT_BACKSPACE)
+    assert ta.text() == "foo "     # spaces + "bar" removed
+
+
+def test_delete_word_ctrl_w_alias():
+    ta = TextArea("alpha beta")
+    ta.handle(23)                  # Ctrl+W
+    assert ta.text() == "alpha "
+
+
+def test_delete_word_at_line_start_joins_previous():
+    from ghreview.keys import KEY_ALT_BACKSPACE
+    ta = TextArea("ab\ncd")
+    ta.row, ta.col = 1, 0
+    ta.handle(KEY_ALT_BACKSPACE)
+    assert ta.text() == "abcd" and (ta.row, ta.col) == (0, 2)
+
+
+def test_delete_word_mid_line():
+    from ghreview.keys import KEY_ALT_BACKSPACE
+    ta = TextArea("one two three")
+    ta.row, ta.col = 0, 8          # cursor at the start of "three" (after "two ")
+    ta.handle(KEY_ALT_BACKSPACE)
+    assert ta.text() == "one three" and ta.col == 4

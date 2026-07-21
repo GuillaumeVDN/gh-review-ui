@@ -13,6 +13,7 @@ KEY_CTRL_ENTER = 1_000_002
 KEY_ALT = {ord("j"): 1_000_010, ord("k"): 1_000_011}
 KEY_ALT_J = KEY_ALT[ord("j")]
 KEY_ALT_K = KEY_ALT[ord("k")]
+KEY_ALT_BACKSPACE = 1_000_012  # Alt+Backspace (ESC then a backspace byte)
 
 
 def classify_seq(params, final):
@@ -66,6 +67,9 @@ def get_key(win):
                 # ESC-prefixed Enter (how some terminals send Shift/Alt+Enter):
                 # treat as a newline, not Escape.
                 return KEY_SHIFT_ENTER
+            if c2 in (127, 8, curses.KEY_BACKSPACE):
+                # ESC-prefixed Backspace = Alt+Backspace (delete word).
+                return KEY_ALT_BACKSPACE
             try:
                 curses.ungetch(c2)
             except (curses.error, OverflowError):

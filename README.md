@@ -136,6 +136,7 @@ multi-line text editor opens:
 - `Shift+Enter` — insert a newline
 - `Enter` — add to the pending review
 - `Backspace` — delete character
+- `Alt+Backspace` / `Ctrl+W` — delete the previous word
 - Arrow keys / `Home` / `End` — move cursor
 - `Esc` — cancel
 

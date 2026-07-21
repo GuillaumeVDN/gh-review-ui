@@ -58,3 +58,10 @@ def test_esc_prefixed_enter_is_newline():
     from ghreview.keys import get_key, KEY_SHIFT_ENTER
     assert get_key(FakeWin([27, 13])) == KEY_SHIFT_ENTER
     assert get_key(FakeWin([27, 10])) == KEY_SHIFT_ENTER
+
+
+def test_alt_backspace_decoded():
+    # ESC-prefixed Backspace (127 or 8) → Alt+Backspace, not Escape.
+    from ghreview.keys import get_key, KEY_ALT_BACKSPACE
+    assert get_key(FakeWin([27, 127])) == KEY_ALT_BACKSPACE
+    assert get_key(FakeWin([27, 8])) == KEY_ALT_BACKSPACE
