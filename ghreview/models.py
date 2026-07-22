@@ -15,6 +15,7 @@ class PR:
     head: str
     author: str
     node_id: str = ""
+    category: str = "mine"  # "mine" (authored) or "review" (to/already reviewed)
 
 
 @dataclass

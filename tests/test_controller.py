@@ -195,3 +195,42 @@ def test_open_comment_modal_cancel_adds_nothing(monkeypatch):
     jobs = queue.Queue()
     controller.open_comment_modal(None, st, jobs)
     assert st.comment_mode is False and jobs.empty() and st.pending == []
+
+
+def test_open_edit_pending_modal_submits_update(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal",
+                        lambda *a, **k: ("enter", "edited body"))
+    st = State()
+    st.repo_owner = st.repo_name = st.viewer = "x"
+    st.active_pr = PR(1, "t", "h", "a", node_id="PR")
+    st.pending = [PendingComment("f.py", "old", 3, "RIGHT", comment_id="C1")]
+    st.pending_idx = 0
+    jobs = queue.Queue()
+    controller.open_edit_pending_modal(None, st, jobs)
+    assert st.pending[0].body == "edited body"           # optimistic update
+    job = jobs.get_nowait()
+    assert job[0] == "edit_pending" and job[-2] == "C1" and job[-1] == "edited body"
+
+
+def test_open_edit_pending_modal_needs_saved_comment(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal",
+                        lambda *a, **k: ("enter", "x"))
+    st = State()
+    st.active_pr = PR(1, "t", "h", "a", node_id="PR")
+    st.pending = [PendingComment("f.py", "old", 3, "RIGHT", comment_id="")]  # not saved yet
+    st.pending_idx = 0
+    jobs = queue.Queue()
+    controller.open_edit_pending_modal(None, st, jobs)
+    assert jobs.empty() and "not saved" in st.status
+
+
+def test_open_edit_pending_modal_cancel(monkeypatch):
+    monkeypatch.setattr(controller, "show_editor_modal", lambda *a, **k: ("cancel", ""))
+    st = State()
+    st.repo_owner = st.repo_name = st.viewer = "x"
+    st.active_pr = PR(1, "t", "h", "a", node_id="PR")
+    st.pending = [PendingComment("f.py", "old", 3, "RIGHT", comment_id="C1")]
+    st.pending_idx = 0
+    jobs = queue.Queue()
+    controller.open_edit_pending_modal(None, st, jobs)
+    assert jobs.empty() and st.pending[0].body == "old"

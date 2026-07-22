@@ -39,9 +39,15 @@ def get_repo_root():
 
 def load_prs():
     fields = "number,title,headRefName,author,id"
+    # (search, category): authored first so a PR I both own and was asked to
+    # review is filed under "mine".
+    searches = [
+        ("is:open author:@me", "mine"),
+        ("is:open review-requested:@me", "review"),
+        ("is:open reviewed-by:@me", "review"),
+    ]
     seen = {}
-    for search in ("is:open author:@me", "is:open review-requested:@me",
-                   "is:open reviewed-by:@me"):
+    for search, category in searches:
         try:
             data = gh_json(["pr", "list", "--limit", "50", "--search", search, "--json", fields])
         except Exception:
@@ -52,8 +58,10 @@ def load_prs():
             seen[p["number"]] = PR(
                 number=p["number"], title=p["title"], head=p["headRefName"],
                 author=p.get("author", {}).get("login", "?"), node_id=p["id"],
+                category=category,
             )
-    return sorted(seen.values(), key=lambda pr: -pr.number)
+    # "mine" group first, then "review"; newest PR first within each group.
+    return sorted(seen.values(), key=lambda pr: (0 if pr.category == "mine" else 1, -pr.number))
 
 
 def load_files(owner, name, number):
@@ -350,6 +358,17 @@ def delete_pending_comment_api(comment_id):
     }
     """
     gh_graphql(q, id=comment_id)
+
+
+def update_pending_comment_api(comment_id, body):
+    q = """
+    mutation($id:ID!, $body:String!) {
+      updatePullRequestReviewComment(input:{pullRequestReviewCommentId:$id, body:$body}) {
+        pullRequestReviewComment { id }
+      }
+    }
+    """
+    gh_graphql(q, id=comment_id, body=body)
 
 
 def submit_review_api(owner, name, number, login, pr_id, event, body):

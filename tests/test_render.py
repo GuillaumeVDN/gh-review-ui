@@ -46,3 +46,28 @@ def test_shortcuts_change_with_focus():
                           (FOCUS_FILES, "fold viewed"), (FOCUS_DIFF, "comment")]:
         st.focus = focus
         assert needle in shortcuts_for(st)
+
+
+def test_pr_rows_groups_with_headers():
+    from ghreview.render import pr_rows
+    from ghreview.models import PR
+    prs = [PR(3, "a", "h", "me", category="mine"),
+           PR(5, "b", "h", "x", category="review"),
+           PR(4, "c", "h", "y", category="review")]
+    rows = pr_rows(prs)
+    assert rows == [("hdr", "My PRs"), ("pr", 0),
+                    ("hdr", "Requested review"), ("pr", 1), ("pr", 2)]
+
+
+def test_pr_rows_single_group_no_extra_header():
+    from ghreview.render import pr_rows
+    from ghreview.models import PR
+    prs = [PR(1, "a", "h", "me", category="mine"),
+           PR(2, "b", "h", "me", category="mine")]
+    rows = pr_rows(prs)
+    assert rows == [("hdr", "My PRs"), ("pr", 0), ("pr", 1)]
+
+
+def test_pr_rows_empty():
+    from ghreview.render import pr_rows
+    assert pr_rows([]) == []

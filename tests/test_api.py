@@ -185,3 +185,33 @@ def test_add_pending_single_omits_start_line(monkeypatch):
                                 PendingComment("a.py", "hi", 10, "RIGHT"))
     q, v = [(q, v) for q, v in fake.calls if "addPullRequestReviewThread" in q][0]
     assert "startLine" not in q and "startLine" not in v
+
+
+def test_load_prs_categorizes_mine_vs_review(monkeypatch):
+    def fake_gh_json(args):
+        q = args[args.index("--search") + 1]
+        if "author:@me" in q:
+            return [{"number": 3, "title": "mine", "headRefName": "b3",
+                     "author": {"login": "me"}, "id": "i3"}]
+        if "review-requested:@me" in q:
+            return [{"number": 5, "title": "req", "headRefName": "b5",
+                     "author": {"login": "x"}, "id": "i5"}]
+        if "reviewed-by:@me" in q:
+            return [{"number": 4, "title": "rev", "headRefName": "b4",
+                     "author": {"login": "y"}, "id": "i4"}]
+        return []
+
+    monkeypatch.setattr(api, "gh_json", fake_gh_json)
+    prs = api.load_prs()
+    # mine group first (even though #3 < #5), then review newest-first
+    assert [(p.number, p.category) for p in prs] == [
+        (3, "mine"), (5, "review"), (4, "review")]
+
+
+def test_update_pending_comment_api(monkeypatch):
+    fake = FakeGraphQL()
+    monkeypatch.setattr(api, "gh_graphql", fake)
+    api.update_pending_comment_api("C1", "new body")
+    q, v = fake.calls[0]
+    assert "updatePullRequestReviewComment" in q
+    assert v == {"id": "C1", "body": "new body"}

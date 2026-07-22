@@ -69,6 +69,11 @@ def worker_loop(jobs, results):
                     api.delete_pending_comment_api(comment_id)
                 pending = api.load_pending_comments(owner, name, number, login)
                 results.put(("pending_list", pending, "Discarded pending comment"))
+            elif kind == "edit_pending":
+                _, owner, name, number, login, comment_id, body = job
+                api.update_pending_comment_api(comment_id, body)
+                pending = api.load_pending_comments(owner, name, number, login)
+                results.put(("pending_list", pending, "Comment updated"))
             elif kind == "submit_review":
                 _, owner, name, number, login, pr_id, event, body = job
                 api.submit_review_api(owner, name, number, login, pr_id, event, body)

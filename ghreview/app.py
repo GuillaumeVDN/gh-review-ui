@@ -20,6 +20,7 @@ from .worker import worker_loop
 from .controller import (
     submit_job, apply_result, maybe_load_details, pane_at,
     apply_commit_selection, open_comment_modal, open_finish_modal,
+    open_edit_pending_modal,
 )
 
 FOCUS_BY_DIGIT = {ord("0"): FOCUS_DIFF, ord("1"): FOCUS_PRS,
@@ -294,6 +295,13 @@ def _handle_key(stdscr, st, jobs, ch):
             except Exception as e:
                 curs_set(0)
                 st.status = f"finish-review error: {type(e).__name__}: {e}"
+        elif ch == ord("e"):
+            if "pending" not in st.busy:
+                try:
+                    open_edit_pending_modal(stdscr, st, jobs)
+                except Exception as e:
+                    curs_set(0)
+                    st.status = f"edit error: {type(e).__name__}: {e}"
         elif ch == ord("d"):
             if 0 <= st.pending_idx < len(st.pending) and "pending" not in st.busy and st.active_pr:
                 removed = st.pending.pop(st.pending_idx)

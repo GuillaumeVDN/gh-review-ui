@@ -3,8 +3,8 @@
 Minimal, lazygit-style terminal UI for reviewing GitHub PRs.
 
 Five panes (left column stacked, right side full-height):
-- **PRs** — open PRs you authored, have been requested to review, *or* have
-  already reviewed (still open).
+- **PRs** — open PRs, grouped into **My PRs** (you authored) and **Requested
+  review** (you've been asked to review, or already reviewed and still open).
 - **Commits** — commits of the active PR. All are selected by default (whole
   PR); unselect and pick a range (or a single commit) to review only those.
 - **Files** — file tree of the currently checked-out PR, with viewed-state.
@@ -104,6 +104,7 @@ Files pane:
 Pending pane:
 - `j` / `k` — move
 - `Enter` — open the submit-review modal
+- `e` — edit the highlighted comment (reopens the editor, updates it on GitHub)
 - `d` — discard the highlighted pending comment (deleted from the draft review on GitHub)
 
 While the Pending pane is focused the right pane shows the selected comment's

@@ -87,7 +87,7 @@ def shortcuts_for(st):
     if st.focus == FOCUS_COMMITS:
         return (f"Space: toggle · a: all/none · Enter: apply range · j/k: move · {common}")
     if st.focus == FOCUS_PENDING:
-        return f"Enter: submit review · j/k: move · d: delete · Shift+J/K: scroll diff · {common}"
+        return f"Enter: submit review · e: edit · d: delete · j/k: move · {common}"
     if st.focus == FOCUS_FILES:
         return (f"Enter: open/collapse · Space: viewed · e: editor · z: fold viewed · "
                 f"j/k: move · Alt+j/k: next/prev file · {common}")
@@ -96,23 +96,55 @@ def shortcuts_for(st):
 
 # ---------- left column: PRs / Commits / Files / Pending ----------
 
+PR_SECTION_LABELS = {"mine": "My PRs", "review": "Requested review"}
+
+
+def pr_rows(prs):
+    """Display rows for the PRs pane: section headers + PR indices.
+
+    Returns a list of ``("hdr", label)`` and ``("pr", index)`` tuples. Assumes
+    ``prs`` is grouped so all "mine" precede all "review".
+    """
+    rows = []
+    last_cat = None
+    for i, pr in enumerate(prs):
+        cat = getattr(pr, "category", "mine")
+        if cat != last_cat:
+            rows.append(("hdr", PR_SECTION_LABELS.get(cat, cat)))
+            last_cat = cat
+        rows.append(("pr", i))
+    return rows
+
+
 def render_prs(stdscr, st, y, x, h, w):
     draw_box(stdscr, y, x, h, w, f"[1] PRs [{st.repo_owner}/{st.repo_name}]",
              st.focus == FOCUS_PRS, busy="prs" in st.busy)
     vh, iw = h - 2, w - 3
-    st.pr_view_offset = clamp_view(st.pr_idx, st.pr_view_offset, vh, len(st.prs))
-    for i, pr in enumerate(st.prs[st.pr_view_offset:st.pr_view_offset + vh]):
-        idx = st.pr_view_offset + i
+    counts = {}
+    for p in st.prs:
+        counts[getattr(p, "category", "mine")] = counts.get(getattr(p, "category", "mine"), 0) + 1
+    rows = pr_rows(st.prs)
+    # Scroll so the selected PR's row stays visible (headers count as rows).
+    sel_row = next((r for r, (k, v) in enumerate(rows) if k == "pr" and v == st.pr_idx), 0)
+    st.pr_view_offset = clamp_view(sel_row, st.pr_view_offset, vh, len(rows))
+    for i, (kind, val) in enumerate(rows[st.pr_view_offset:st.pr_view_offset + vh]):
+        row_y = y + 1 + i
+        if kind == "hdr":
+            cat = "mine" if val == PR_SECTION_LABELS["mine"] else "review"
+            safe_addstr(stdscr, row_y, x + 1, f"{val} ({counts.get(cat, 0)})".ljust(iw),
+                        theme.style("keys", dim=True, bold=True), maxw=iw)
+            continue
+        pr = st.prs[val]
         active = st.active_pr and st.active_pr.number == pr.number
         line = f"{'● ' if active else '  '}#{pr.number} {pr.title}"
-        if idx == st.pr_idx and st.focus == FOCUS_PRS:
+        if val == st.pr_idx and st.focus == FOCUS_PRS:
             attr = selection_attr()
         elif active:
             attr = theme.style("active", bold=True)
         else:
             attr = 0
-        safe_addstr(stdscr, y + 1 + i, x + 1, line.ljust(iw), attr, maxw=iw)
-    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.pr_view_offset, vh, len(st.prs),
+        safe_addstr(stdscr, row_y, x + 1, line.ljust(iw), attr, maxw=iw)
+    draw_scrollbar(stdscr, y + 1, x + w - 2, vh, st.pr_view_offset, vh, len(rows),
                    st.focus == FOCUS_PRS)
 
 

@@ -17,6 +17,7 @@ JOB_TAGS = {
     "submit_review": "review",
     "add_pending": "pending",
     "discard_pending": "pending",
+    "edit_pending": "pending",
     "load_commit_diff": "commitdiff",
 }
 
@@ -234,6 +235,27 @@ def open_comment_modal(stdscr, st, jobs):
     submit_job(jobs, st, ("add_pending", st.repo_owner, st.repo_name,
                           st.active_pr.number, st.viewer, st.active_pr.node_id, comment))
     st.status = f"Adding comment on {where} to pending review…"
+
+
+def open_edit_pending_modal(stdscr, st, jobs):
+    """Reopen the editor on the selected pending comment and update it."""
+    if not st.active_pr or not (0 <= st.pending_idx < len(st.pending)):
+        return
+    c = st.pending[st.pending_idx]
+    if not c.comment_id:
+        st.status = "Comment not saved on GitHub yet — try again in a moment."
+        return
+    action, body = show_editor_modal(
+        stdscr, f"Edit comment on {c.path}:{c.line}",
+        "Enter: save · Shift+Enter: newline · Esc: cancel",
+        initial=c.body,
+    )
+    if action == "cancel" or not body.strip():
+        return
+    c.body = body.strip()  # optimistic; the reload replaces the list
+    submit_job(jobs, st, ("edit_pending", st.repo_owner, st.repo_name,
+                          st.active_pr.number, st.viewer, c.comment_id, body.strip()))
+    st.status = f"Updating comment on {c.path}:{c.line}…"
 
 
 def open_finish_modal(stdscr, st, jobs):
