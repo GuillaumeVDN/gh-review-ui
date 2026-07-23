@@ -71,3 +71,26 @@ def test_pr_rows_single_group_no_extra_header():
 def test_pr_rows_empty():
     from ghreview.render import pr_rows
     assert pr_rows([]) == []
+
+
+def test_reveal_scroll_no_change_when_visible():
+    from ghreview.render import reveal_scroll
+    # block [10,13) fully within [8, 8+10): stay put
+    assert reveal_scroll(8, 10, 13, 10) == 8
+
+
+def test_reveal_scroll_up_when_above():
+    from ghreview.render import reveal_scroll
+    assert reveal_scroll(20, 5, 8, 10) == 5   # target above viewport → scroll to it
+
+
+def test_reveal_scroll_down_minimal_when_below():
+    from ghreview.render import reveal_scroll
+    # block [15,18) below [0,10): scroll so its end (18) is the last row → 8
+    assert reveal_scroll(0, 15, 18, 10) == 8
+
+
+def test_reveal_scroll_tall_block_aligns_top():
+    from ghreview.render import reveal_scroll
+    # block taller than the viewport → align to its top
+    assert reveal_scroll(0, 5, 40, 10) == 5

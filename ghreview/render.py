@@ -73,6 +73,22 @@ def clamp_view(idx, view_offset, view_h, total):
     return view_offset
 
 
+def reveal_scroll(scroll, lo, hi, vh):
+    """Minimal scroll offset so the range ``[lo, hi)`` is visible in ``vh`` rows.
+
+    Returns ``scroll`` unchanged when the range is already fully on screen;
+    otherwise scrolls just enough. A range taller than the viewport aligns to
+    its top (``lo``).
+    """
+    if vh <= 0:
+        return scroll
+    if lo < scroll:
+        return lo
+    if hi > scroll + vh:
+        return lo if (hi - lo) > vh else hi - vh
+    return scroll
+
+
 def selection_attr():
     """Attribute for the focused, selected row."""
     return theme.style("sel", bold=True)
@@ -255,16 +271,18 @@ def render_diff(stdscr, st, y, x, h, w):
     if not diff_lines and path:
         diff_lines = ["(no diff — file may be binary, removed, or too large)"]
     vh, iw = h - 2, w - 3
-    # Keep the comment cursor on screen while picking a line/range.
-    if st.comment_mode and path:
-        if st.comment_line < st.diff_scroll:
-            st.diff_scroll = st.comment_line
-        elif st.comment_line >= st.diff_scroll + vh:
-            st.diff_scroll = st.comment_line - vh + 1
-    st.diff_scroll = max(0, min(st.diff_scroll, max(0, len(diff_lines) - vh)))
     # Only highlight the current hunk while the diff pane itself is focused.
     focused = st.focus == FOCUS_DIFF
     cur_hr = current_hunk_range(st, path) if (path and focused) else None
+    # Scroll just enough to reveal the focus — the comment cursor while picking,
+    # otherwise the selected block. No scroll if it's already fully on screen,
+    # so navigating to an already-visible hunk doesn't yank it to the top.
+    if st.comment_mode and path:
+        st.diff_scroll = reveal_scroll(st.diff_scroll, st.comment_line,
+                                       st.comment_line + 1, vh)
+    elif cur_hr:
+        st.diff_scroll = reveal_scroll(st.diff_scroll, cur_hr[0], cur_hr[1], vh)
+    st.diff_scroll = max(0, min(st.diff_scroll, max(0, len(diff_lines) - vh)))
     marker_attr = theme.hunk_marker_style()
     # Diff-line index range the comment picker currently spans.
     if st.comment_mode:

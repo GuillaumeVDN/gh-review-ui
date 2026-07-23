@@ -67,10 +67,32 @@ def parse_diff(raw):
 
 
 def compute_hunks(diff_lines):
-    """Return ``[(start_idx, end_idx_exclusive), ...]`` for each ``@@`` header."""
-    starts = [i for i, ln in enumerate(diff_lines) if ln.startswith("@@")]
-    ranges = []
-    for i, s in enumerate(starts):
-        e = starts[i + 1] if i + 1 < len(starts) else len(diff_lines)
-        ranges.append((s, e))
-    return ranges
+    """Return ``[(start, end_exclusive), ...]`` for each contiguous change block.
+
+    The app treats a "hunk" as a single diff block — a maximal run of added
+    (``+``) / removed (``-``) lines. Context lines, ``@@`` headers and file
+    headers break a run, so the extended context we render around changes never
+    merges separate edits into one giant navigable region. Example::
+
+        -test
+        +test2
+         context
+        -test3
+        +test4
+
+    yields two blocks (``-test/+test2`` and ``-test3/+test4``).
+    """
+    blocks = []
+    start = None
+    for i, ln in enumerate(diff_lines):
+        changed = ((ln.startswith("+") and not ln.startswith("+++")) or
+                   (ln.startswith("-") and not ln.startswith("---")))
+        if changed:
+            if start is None:
+                start = i
+        elif start is not None:
+            blocks.append((start, i))
+            start = None
+    if start is not None:
+        blocks.append((start, len(diff_lines)))
+    return blocks

@@ -30,7 +30,7 @@ def test_apply_active_populates_diff_and_tree():
     controller.apply_result(st, ("active", 7, "PRID", [FileEntry("f.py", False)],
                                  diff, info, pending, commits), queue.Queue())
     assert st.active_pr.number == 7
-    assert st.hunks_by_file["f.py"] == [(1, 3)]
+    assert st.hunks_by_file["f.py"] == [(2, 3)]  # change block = the +x line
     assert st.tree and st.pending == pending
     assert st.commits == commits and st.commit_selected == {"abc123"}
     assert "active" not in st.busy
@@ -71,7 +71,7 @@ def test_apply_commit_diff_filters_files_preserving_viewed():
     controller.apply_result(st, ("commit_diff", diff, info), queue.Queue())
     assert [f.path for f in st.files] == ["a.py"]
     assert st.files[0].viewed is True
-    assert st.hunks_by_file["a.py"] == [(1, 3)]
+    assert st.hunks_by_file["a.py"] == [(2, 3)]  # change block = the +x line
     assert "commitdiff" not in st.busy
 
 

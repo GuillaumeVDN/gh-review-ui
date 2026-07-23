@@ -1,5 +1,10 @@
-"""Cursor / hunk / selection logic over ``State`` (pure, no curses)."""
-from .diff import HUNK_RE
+"""Cursor / hunk / selection logic over ``State`` (pure, no curses).
+
+A "hunk" here is a diff block (a contiguous run of +/- lines, see
+:func:`ghreview.diff.compute_hunks`), so a block range starts on a real changed
+line rather than an ``@@`` header. The helpers still tolerate a header at the
+range start (they skip ``(None, None)`` rows), so they work either way.
+"""
 
 
 def cur_file_path(st):
@@ -46,7 +51,7 @@ def hunk_line_indices(st, path):
     if not hr:
         return []
     s, e = hr
-    return [i for i in range(s + 1, e)
+    return [i for i in range(s, e)
             if i < len(info) and info[i] != (None, None)]
 
 
@@ -56,7 +61,7 @@ def first_change_index(st, path):
     info = st.info_by_file.get(path, [])
     if hr:
         s, e = hr
-        for i in range(s + 1, e):
+        for i in range(s, e):
             if i < len(info):
                 old, new = info[i]
                 if (new is not None) != (old is not None):  # exactly one side
@@ -70,25 +75,25 @@ def scroll_diff(st, delta):
 
 
 def jump_hunk(st, direction):
-    """Select the next/previous hunk and scroll to keep it visible.
+    """Select the next/previous hunk.
 
-    The selected hunk is tracked independently of the scroll offset so it can
-    advance even when the whole diff already fits in the viewport.
+    Only the selection index moves here; scrolling to keep it visible (with a
+    minimal scroll — no jump if the target is already fully on screen) is done at
+    render time, which is where the viewport height is known.
     """
     path = cur_file_path(st)
     hunks = st.hunks_by_file.get(path, []) if path else []
     if not hunks:
         return
-    idx = max(0, min(len(hunks) - 1, st.diff_hunk_idx + direction))
-    st.diff_hunk_idx = idx
-    st.diff_scroll = hunks[idx][0]
+    st.diff_hunk_idx = max(0, min(len(hunks) - 1, st.diff_hunk_idx + direction))
 
 
 def current_hunk_editor_line(st, path):
     """New-file line to open in the editor for the selected hunk.
 
-    Prefer the first *added* line (``+``); fall back to the first line present on
-    the new side, then to the hunk header's new start.
+    Prefer the first *added* line (``+``); for a pure-deletion block fall back to
+    the nearest line that exists on the new side (a context line just after, or
+    before, the block).
     """
     hr = current_hunk_range(st, path)
     info = st.info_by_file.get(path, [])
@@ -99,14 +104,12 @@ def current_hunk_editor_line(st, path):
                 old, new = info[i]
                 if new is not None and old is None:
                     return new
-        for i in range(s, e):  # else first new-side line (pure deletion)
-            if i < len(info) and info[i][1] is not None:
+        for i in range(s, len(info)):  # nearest new-side line after the block
+            if info[i][1] is not None:
                 return info[i][1]
-        lines = st.diff_by_file.get(path, [])
-        if s < len(lines):
-            m = HUNK_RE.match(lines[s])
-            if m:
-                return int(m.group(3))
+        for i in range(min(s, len(info) - 1), -1, -1):  # else search backward
+            if info[i][1] is not None:
+                return info[i][1]
     return 1
 
 

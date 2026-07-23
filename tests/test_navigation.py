@@ -55,13 +55,16 @@ def test_current_hunk_tracks_index_not_scroll():
 
 def test_jump_hunk_advances_and_clamps():
     st = diff_state()
+    st.diff_scroll = 7
     assert st.diff_hunk_idx == 0
     jump_hunk(st, +1)
-    assert st.diff_hunk_idx == 1 and st.diff_scroll == 4
+    assert st.diff_hunk_idx == 1
     jump_hunk(st, +1)  # clamp at last
     assert st.diff_hunk_idx == 1
     jump_hunk(st, -1)
-    assert st.diff_hunk_idx == 0 and st.diff_scroll == 0
+    assert st.diff_hunk_idx == 0
+    # jump_hunk only moves the selection; scrolling is a render-time concern
+    assert st.diff_scroll == 7
 
 
 def test_line_target_by_kind():
@@ -136,3 +139,27 @@ def test_jump_file_skips_folders():
     assert st.file_idx == 3  # back to b.py
     _jump_file(st, -1)
     assert st.file_idx == 1  # skips "lib" and "src", lands on a.py
+
+
+def test_blocks_are_two_navigable_units():
+    from ghreview.diff import parse_diff, compute_hunks
+    raw = ("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@\n"
+           "-test\n+test2\n context\n-test3\n+test4\n")
+    lines, info = parse_diff(raw)
+    st = State()
+    st.files = [FileEntry("f", False)]
+    st.tree = [(0, "f", "file", 0, None)]
+    st.file_idx = 0
+    st.diff_by_file = lines
+    st.info_by_file = info
+    st.hunks_by_file = {"f": compute_hunks(lines["f"])}
+    st.diff_hunk_idx = 0
+
+    assert len(st.hunks_by_file["f"]) == 2
+    # first block: only its two changed lines are commentable (no context)
+    idx0 = hunk_line_indices(st, "f")
+    assert [lines["f"][i] for i in idx0] == ["-test", "+test2"]
+    # j moves to the second block
+    jump_hunk(st, +1)
+    idx1 = hunk_line_indices(st, "f")
+    assert [lines["f"][i] for i in idx1] == ["-test3", "+test4"]

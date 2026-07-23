@@ -111,15 +111,17 @@ While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.
 
 Diff pane:
-- `j` / `k` / arrows — jump to next / previous hunk
+- `j` / `k` / arrows — jump to next / previous change block
 - `PgDn` / `PgUp` — page down / up
 - `c` — start the comment line picker (see below)
-- `e` — open the file in the editor at the current hunk's line
+- `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
 
-The currently-focused hunk's changed (`+`/`-`) lines are highlighted with a
-cyan background band plus a green side-bar, so it stands out. The highlight only
-shows while the diff pane is focused.
+A "hunk" here is a **change block** — a contiguous run of `+`/`-` lines. Context
+(and the extra context rendered around edits) splits blocks, so two edits
+separated by an unchanged line are two separate blocks you can navigate and
+comment on independently. The focused block is highlighted with a cyan band plus
+a green side-bar (only while the diff pane is focused).
 
 ### Commenting (`c` in diff pane)
 

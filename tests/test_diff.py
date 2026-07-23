@@ -47,14 +47,26 @@ def test_context_line_has_both_numbers():
     assert fi[i] == (1, 1)
 
 
-def test_compute_hunks_two_hunks():
+def test_compute_hunks_are_change_blocks():
     lines, _ = parse_diff(SAMPLE)
-    hunks = compute_hunks(lines["foo.py"])
+    fl = lines["foo.py"]
+    hunks = compute_hunks(fl)
+    # two contiguous change runs: {-old,+new,+added} and {-gone,+fresh}
     assert len(hunks) == 2
-    # each range starts on an "@@" line and is contiguous/ordered
-    assert lines["foo.py"][hunks[0][0]].startswith("@@")
-    assert hunks[0][1] == hunks[1][0]
-    assert hunks[-1][1] == len(lines["foo.py"])
+    for s, e in hunks:
+        # every line inside a block is an actual +/- change (no context/@@)
+        for i in range(s, e):
+            assert fl[i][0] in "+-" and not fl[i].startswith(("+++", "---"))
+    assert [fl[s] for s, _ in hunks] == ["-old line", "-gone"]
+
+
+def test_context_splits_adjacent_changes_into_two_blocks():
+    lines, _ = parse_diff(
+        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@\n"
+        "-test\n+test2\n context\n-test3\n+test4\n"
+    )
+    hunks = compute_hunks(lines["f"])
+    assert len(hunks) == 2  # the context line separates the two edits
 
 
 def test_empty_diff():
