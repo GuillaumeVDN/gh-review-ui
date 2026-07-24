@@ -122,6 +122,13 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.commit_idx = 0;
                     st.commit_offset = 0;
                     set_diff(st, diff, info);
+                    st.status = format!(
+                        "#{n} · {} file{} · {} commit{}",
+                        st.files.len(),
+                        if st.files.len() == 1 { "" } else { "s" },
+                        st.commits.len(),
+                        if st.commits.len() == 1 { "" } else { "s" },
+                    );
                 }
             }
             st.file_idx = 0;

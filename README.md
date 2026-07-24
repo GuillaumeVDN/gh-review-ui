@@ -58,14 +58,14 @@ of the file, and worktrees are reused/refreshed on subsequent opens and on `r`.
 ## Keys
 
 Global:
-- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Pending → Files → Diff)
+- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending → Diff)
 - `0` / `1` / `2` / `3` / `4` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending)
 - `q` — quit
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
   focused, otherwise the diff (works from any pane)
-- `c` — comment on the current hunk (opens a modal editor)
-- `f` — finish review (submit the pending review)
+- `c` — comment on the current hunk (opens the line picker)
+- finish review — `Enter` in the Pending pane
 - mouse wheel — scroll the pane under the cursor (stops at the content edge)
 - click — focus a pane
 
@@ -147,7 +147,7 @@ Adding a comment creates (or reuses) a **pending review on GitHub** and attaches
 the comment to it, so pending comments persist across restarts and show up on
 github.com's review UI. They stay private until you finish the review.
 
-### Submit-review modal (`f`, or `Enter` in the Pending pane)
+### Submit-review modal (`Enter` in the Pending pane)
 
 A single modal with two halves:
 

@@ -77,7 +77,8 @@ pub fn load_prs() -> Result<Vec<Pr>> {
         }
     }
     let mut prs: Vec<Pr> = order.into_iter().filter_map(|n| seen.remove(&n)).collect();
-    prs.sort_by_key(|p| (if p.category == Category::Mine { 0 } else { 1 }, -p.number));
+    // "review" group first (others' PRs), then "mine"; newest first within each.
+    prs.sort_by_key(|p| (if p.category == Category::Review { 0 } else { 1 }, -p.number));
     Ok(prs)
 }
 

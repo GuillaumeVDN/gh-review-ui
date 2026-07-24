@@ -138,7 +138,6 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         KeyCode::Tab => st.focus = st.focus.next(),
         KeyCode::BackTab => st.focus = st.focus.prev(),
         KeyCode::Char('r') => refresh(st, tx),
-        KeyCode::Char('f') => controller::begin_review(st),
         _ => handle_pane_key(st, tx, k, area),
     }
 }

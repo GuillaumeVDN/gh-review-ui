@@ -89,7 +89,12 @@ pub fn status() -> Style {
     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
 }
 pub fn keys() -> Style {
-    Style::default().fg(Color::White).add_modifier(Modifier::DIM)
+    // Bottom action bar, lazygit-style: blue.
+    Style::default().fg(Color::Blue)
+}
+/// Colored "pastille" bar marking the selected row in a list pane.
+pub fn sel_marker() -> Style {
+    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
 }
 pub fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)

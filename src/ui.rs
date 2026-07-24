@@ -1,7 +1,7 @@
 //! Ratatui rendering of the panes + modal overlays.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -91,6 +91,17 @@ fn pad(s: &str, w: usize) -> String {
     }
 }
 
+/// A list row with a colored left-bar "pastille" when selected (no full-row
+/// highlight — lazygit-style), otherwise the item's base style.
+fn list_row(selected: bool, text: &str, base: Style, iw: usize) -> Line<'static> {
+    let mark = if selected { "▌" } else { " " };
+    let style = if selected { base.add_modifier(Modifier::BOLD) } else { base };
+    Line::from(vec![
+        Span::styled(mark.to_string(), theme::sel_marker()),
+        Span::styled(pad(text, iw.saturating_sub(1)), style),
+    ])
+}
+
 /// Section rows for the PRs pane: header labels + PR indices.
 pub fn pr_rows(st: &State) -> Vec<(bool, String, usize)> {
     // (is_header, text, pr_index)
@@ -133,13 +144,13 @@ pub fn render(f: &mut Frame, st: &mut State) {
 }
 
 fn shortcuts_for(st: &State) -> String {
-    let common = "0-4: focus · Tab: next · f: finish review · r: refresh · q: quit";
+    let common = "r: refresh · q: quit";
     match st.focus {
-        Focus::Prs => format!("Enter: open (worktree) · j/k: move · Shift+J/K: scroll summary · {common}"),
-        Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · j/k: move · {common}"),
-        Focus::Pending => format!("Enter: submit review · e: edit · d: delete · j/k: move · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z: fold · j/k: move · {common}"),
-        Focus::Diff => format!("j/k: next/prev block · c: comment · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Prs => format!("Enter: open (worktree) · {common}"),
+        Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
+        Focus::Pending => format!("Enter: submit review · e: edit · d: delete · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z: fold · {common}"),
+        Focus::Diff => format!("j/k: block · c: comment · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
 
@@ -161,14 +172,9 @@ fn render_prs(f: &mut Frame, st: &mut State, area: Rect) {
         let pr = &st.prs[*idx];
         let active = st.active_pr.as_ref().map_or(false, |a| a.number == pr.number);
         let text = format!("{}#{} {}", if active { "● " } else { "  " }, pr.number, pr.title);
-        let style = if *idx == st.pr_idx && st.focus == Focus::Prs {
-            theme::selection()
-        } else if active {
-            theme::active_pr()
-        } else {
-            Style::default()
-        };
-        lines.push(Line::styled(pad(&text, iw), style));
+        let base = if active { theme::active_pr() } else { Style::default() };
+        let selected = *idx == st.pr_idx && st.focus == Focus::Prs;
+        lines.push(list_row(selected, &text, base, iw));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -193,14 +199,9 @@ fn render_commits(f: &mut Frame, st: &mut State, area: Rect) {
     for (i, c) in st.commits.iter().enumerate().skip(st.commit_offset).take(vh) {
         let checked = st.commit_selected.contains(&c.oid);
         let text = format!("[{}] {} {}", if checked { "x" } else { " " }, c.short(), c.headline);
-        let style = if i == st.commit_idx && st.focus == Focus::Commits {
-            theme::selection()
-        } else if !checked {
-            theme::dim()
-        } else {
-            Style::default()
-        };
-        lines.push(Line::styled(pad(&text, iw), style));
+        let base = if checked { Style::default() } else { theme::dim() };
+        let selected = i == st.commit_idx && st.focus == Focus::Commits;
+        lines.push(list_row(selected, &text, base, iw));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -232,8 +233,8 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
                 )
             }
         };
-        let style = if i == st.file_idx && st.focus == Focus::Files { theme::selection() } else { base };
-        lines.push(Line::styled(pad(&text, iw), style));
+        let selected = i == st.file_idx && st.focus == Focus::Files;
+        lines.push(list_row(selected, &text, base, iw));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -254,8 +255,8 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
     for (i, c) in st.pending.iter().enumerate().skip(st.pending_offset).take(vh) {
         let first = c.body.lines().next().unwrap_or("");
         let text = format!("{}:{}  {}", c.path, c.line, first);
-        let style = if i == st.pending_idx && st.focus == Focus::Pending { theme::selection() } else { Style::default() };
-        lines.push(Line::styled(pad(&text, iw), style));
+        let selected = i == st.pending_idx && st.focus == Focus::Pending;
+        lines.push(list_row(selected, &text, Style::default(), iw));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
