@@ -15,29 +15,26 @@ Five panes (left column stacked, right side full-height):
   diff of the highlighted / opened file otherwise. The current hunk is
   marked with a green side-bar.
 
-Backed by the `gh` CLI (for auth, PR list, diff) and `git` worktrees (for
-checkout), plus GitHub's GraphQL API for the `viewedState` mutations and pending
-reviews. Zero Python dependencies — pure stdlib
-`curses` + threads.
+Written in **Rust** with [ratatui](https://ratatui.rs) + crossterm. Backed by the
+`gh` CLI (auth, PR list, diff) and `git` worktrees (checkout), plus GitHub's
+GraphQL API for `viewedState` mutations and pending reviews.
 
 ## Requirements
 
-- Python 3.10+
+- Rust (stable) + Cargo
 - [`gh` CLI](https://cli.github.com/) — authenticated (`gh auth login`)
+- `git`; and for the `e` editor shortcut, a running Neovim server + `hyprctl` (see below)
 - A terminal that supports 256 colors and mouse events (foot, kitty, alacritty, wezterm, ghostty, xterm…)
 
 ## Install
 
-Clone anywhere and either symlink or alias the executable:
-
 ```sh
-git clone https://github.com/GuillaumeVDN/gh-review-ui.git ~/Projects/github-pr-view-ui
+git clone https://github.com/GuillaumeVDN/gh-review-ui.git
+cd gh-review-ui
+cargo build --release
 
-# option A — symlink to a bin directory already on your PATH
-ln -s ~/Projects/github-pr-view-ui/gh-review-ui ~/.local/bin/gh-review-ui
-
-# option B — shell alias
-echo 'alias ghr="~/Projects/github-pr-view-ui/gh-review-ui"' >> ~/.bashrc
+# symlink the binary onto your PATH
+ln -s "$PWD/target/release/gh-review-ui" ~/.local/bin/gh-review-ui
 ```
 
 ## Run
@@ -45,7 +42,7 @@ echo 'alias ghr="~/Projects/github-pr-view-ui/gh-review-ui"' >> ~/.bashrc
 From any directory inside a GitHub repo checkout:
 
 ```sh
-gh-review-ui
+gh-review-ui        # or: cargo run --release
 ```
 
 On start it will:
@@ -163,14 +160,15 @@ A single modal with two halves:
 On submit, the existing pending review (with all its comments) is submitted with
 the chosen event.
 
-> `Shift+Enter` relies on the terminal's `modifyOtherKeys` (or kitty keyboard)
-> support — foot, kitty, wezterm, ghostty, alacritty and xterm all qualify.
+> `Shift+Enter` / `Ctrl+Enter` / `Alt+Backspace` rely on the terminal's keyboard
+> enhancement (kitty protocol) — foot, kitty, wezterm and ghostty qualify. The
+> app requests it on start; on terminals without it, `Ctrl+W` also deletes a word.
 
 ### Editor integration (`e`)
 
 `e` opens the file in a running Neovim server (`/tmp/nvim.sock`) at the relevant
 line and focuses the window via `hyprctl`. This is wired for an Omarchy/Hyprland
-+ Neovim setup; adjust `open_in_editor` in `ghreview/editor.py` for a different
++ Neovim setup; adjust `open_in_editor` in `src/editor.rs` for a different
 editor or window manager.
 
 ## Notes
@@ -183,39 +181,33 @@ editor or window manager.
 
 ## Project layout
 
-`gh-review-ui` is a thin launcher; the implementation lives in the `ghreview/`
-package, split so that almost all logic is curses-free and unit-testable:
+The crate (`src/`) is split so almost all logic is UI-free and unit-tested:
 
 | Module | Responsibility |
 | --- | --- |
-| `gh` | `gh` CLI / GraphQL subprocess wrappers |
-| `api` | GitHub domain calls (PRs, files, diffs, viewed-state, reviews) |
-| `models` | dataclasses + the central `State` |
-| `diff` | unified-diff parsing and hunk indexing |
+| `gh` | `gh` CLI / GraphQL and `git` subprocess wrappers |
+| `api` | GitHub domain calls (PRs, files, diffs, reviews, worktrees) |
+| `models` | data types + the central `State` |
+| `diff` | unified-diff parsing and change-block indexing |
 | `markdown` | markdown/HTML → styled terminal lines |
 | `tree` | file-tree building and folding |
 | `navigation` | cursor / hunk / selection logic over `State` |
-| `keys` | keyboard decoding (modifier+Enter, flow control) |
-| `theme` | color pairs + generic highlight/coloring helpers |
+| `theme` | ratatui `Style`s + diff/highlight helpers |
 | `textbuffer` | modal text editor + soft-wrapping |
-| `render` | curses drawing primitives and the panes |
-| `modals` | comment / finish-review modal loops |
-| `editor` | external-editor integration |
-| `worker` | background thread running blocking `gh` jobs |
+| `worker` | background thread running blocking `gh`/`git` jobs |
 | `controller` | state transitions + job orchestration |
-| `app` | curses bootstrap, main loop, entry point |
+| `ui` | ratatui rendering of panes and overlays |
+| `app` | terminal bootstrap, event loop, key/mouse dispatch |
 
 ## Development
 
-Requirements are still zero-dependency at runtime (stdlib `curses` + threads).
-The tests use `pytest`:
-
 ```sh
-python -m pytest
+cargo test        # unit tests
+cargo run         # debug run
+cargo build --release
 ```
 
-The suite covers the pure logic — diff parsing, markdown, the file tree, hunk
-navigation, key decoding, the text buffer/soft-wrap, theming, layout, the
-GitHub API request building (with a fake GraphQL client), and the controller's
-state transitions. The curses drawing code is exercised indirectly through
-those seams.
+The tests cover the pure logic — diff parsing / change blocks, markdown, the
+file tree, hunk navigation, the text buffer + soft-wrap, theming, and the
+layout/reveal-scroll math. The `gh` I/O and ratatui drawing are kept thin around
+those tested seams.
