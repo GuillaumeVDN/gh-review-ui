@@ -5,7 +5,7 @@ use std::sync::mpsc::Sender;
 use crate::api;
 use crate::diff::compute_hunks;
 use crate::models::{
-    Category, FileEntry, Overlay, PendingComment, Pr, State, REVIEW_EVENTS,
+    Category, FileEntry, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
 };
 use crate::navigation::{
     cur_file_path, first_change_index, hunk_line_indices, line_target,
@@ -393,8 +393,15 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
 }
 
 pub fn fold_viewed(st: &mut State) {
+    // Remember the file the cursor sat on so we can jump forward from it (folding
+    // may collapse it away, so capture the underlying file index, not the row).
+    let anchor = match st.tree.get(st.file_idx) {
+        Some(TreeRow::File { index, .. }) => Some(*index),
+        Some(TreeRow::Dir { path, .. }) => tree::files_under_dir(st, path).into_iter().next(),
+        None => None,
+    };
     let folded = tree::fold_viewed_dirs(st);
-    let jumped = tree::first_unviewed_index(st);
+    let jumped = tree::next_unviewed_index(st, anchor);
     if let Some(ti) = jumped {
         st.file_idx = ti;
         st.diff_scroll = 0;
@@ -403,6 +410,6 @@ pub fn fold_viewed(st: &mut State) {
     st.status = format!(
         "Folded {folded} viewed folder{}{}",
         if folded == 1 { "" } else { "s" },
-        if jumped.is_some() { " · jumped to first unviewed file" } else { " · no unviewed files" }
+        if jumped.is_some() { " · jumped to next unviewed file" } else { " · no unviewed files" }
     );
 }

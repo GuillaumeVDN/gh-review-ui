@@ -115,6 +115,52 @@ pub fn first_unviewed_index(st: &State) -> Option<usize> {
     })
 }
 
+/// Tree index of the "next" unviewed file relative to `anchor` (a file index into
+/// `st.files`, typically the file the cursor sat on). Prefers the closest unviewed
+/// file whose display order is *after* the anchor; if none remain after it, falls
+/// back to the closest one *before* it. With no anchor, returns the first unviewed
+/// file. The anchor itself is never returned.
+pub fn next_unviewed_index(st: &State, anchor: Option<usize>) -> Option<usize> {
+    // Stable display order over file indices, independent of the current collapse
+    // state, so a folded-away anchor still has a well-defined position.
+    let mut rank = vec![0usize; st.files.len()];
+    for (r, row) in build_tree(&st.files, &HashSet::new()).iter().enumerate() {
+        if let TreeRow::File { index, .. } = row {
+            rank[*index] = r;
+        }
+    }
+    let anchor_rank = anchor.map(|fi| rank[fi]);
+
+    let mut after: Option<(usize, usize)> = None; // (rank, tree_pos): smallest rank after anchor
+    let mut before: Option<(usize, usize)> = None; // (rank, tree_pos): largest rank before anchor
+    for (ti, row) in st.tree.iter().enumerate() {
+        let TreeRow::File { index, .. } = row else { continue };
+        if st.files[*index].viewed {
+            continue;
+        }
+        let r = rank[*index];
+        match anchor_rank {
+            Some(a) if r > a => {
+                if after.is_none_or(|(ar, _)| r < ar) {
+                    after = Some((r, ti));
+                }
+            }
+            Some(a) if r < a => {
+                if before.is_none_or(|(br, _)| r > br) {
+                    before = Some((r, ti));
+                }
+            }
+            Some(_) => {} // r == a: the anchor itself, skip
+            None => {
+                if after.is_none_or(|(ar, _)| r < ar) {
+                    after = Some((r, ti));
+                }
+            }
+        }
+    }
+    after.or(before).map(|(_, ti)| ti)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +223,78 @@ mod tests {
         rebuild(&mut st);
         let ti = first_unviewed_index(&st).unwrap();
         assert!(matches!(&st.tree[ti], TreeRow::File { index, .. } if st.files[*index].path == "b.py"));
+    }
+
+    /// Given a display order a,b,c,d,e, an anchor of `c` should jump to the first
+    /// unviewed file *after* c, not back to the first unviewed one at the top.
+    fn file_at<'a>(st: &'a State, ti: usize) -> &'a str {
+        match &st.tree[ti] {
+            TreeRow::File { index, .. } => &st.files[*index].path,
+            _ => panic!("row {ti} is not a file"),
+        }
+    }
+
+    fn idx_of(st: &State, path: &str) -> usize {
+        st.files.iter().position(|f| f.path == path).unwrap()
+    }
+
+    #[test]
+    fn next_unviewed_prefers_after_anchor() {
+        let mut st = State::default();
+        // a and c are unviewed and sit before/after the anchor d; e is unviewed after.
+        st.files = files(&[
+            ("a.py", false),
+            ("b.py", true),
+            ("c.py", true),
+            ("d.py", true),
+            ("e.py", false),
+        ]);
+        rebuild(&mut st);
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "d.py"))).unwrap();
+        assert_eq!(file_at(&st, ti), "e.py");
+    }
+
+    #[test]
+    fn next_unviewed_falls_back_to_closest_before() {
+        let mut st = State::default();
+        // Nothing unviewed after the anchor e; closest unviewed before is c (not a).
+        st.files = files(&[
+            ("a.py", false),
+            ("b.py", true),
+            ("c.py", false),
+            ("d.py", true),
+            ("e.py", true),
+        ]);
+        rebuild(&mut st);
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "e.py"))).unwrap();
+        assert_eq!(file_at(&st, ti), "c.py");
+    }
+
+    #[test]
+    fn next_unviewed_without_anchor_is_first() {
+        let mut st = State::default();
+        st.files = files(&[("a.py", true), ("b.py", false), ("c.py", false)]);
+        rebuild(&mut st);
+        let ti = next_unviewed_index(&st, None).unwrap();
+        assert_eq!(file_at(&st, ti), "b.py");
+    }
+
+    #[test]
+    fn next_unviewed_survives_folded_anchor() {
+        let mut st = State::default();
+        // The anchor dir "seen" is fully viewed and gets folded; the jump target
+        // must still be computed relative to where it sat in display order.
+        st.files = files(&[
+            ("aaa/x.py", false),
+            ("seen/a.py", true),
+            ("seen/b.py", true),
+            ("zzz/y.py", false),
+        ]);
+        rebuild(&mut st);
+        let anchor = idx_of(&st, "seen/a.py");
+        fold_viewed_dirs(&mut st);
+        assert!(st.collapsed_dirs.contains("seen"));
+        let ti = next_unviewed_index(&st, Some(anchor)).unwrap();
+        assert_eq!(file_at(&st, ti), "zzz/y.py");
     }
 }
