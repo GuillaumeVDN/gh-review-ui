@@ -29,6 +29,7 @@ fn set_diff(
     st.info_by_file = info;
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.diff_reveal_pending = true;
     st.comment_mode = false;
     st.comment_start = None;
 }
@@ -104,6 +105,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     set_diff(st, Default::default(), Default::default());
                 }
                 Some(n) => {
+                    // Opening a *different* PR expands the whole tree so every
+                    // file shows — even ones already viewed/folded last session.
+                    if st.active_pr.as_ref().map_or(true, |p| p.number != n) {
+                        st.collapsed_dirs.clear();
+                    }
                     let matched = st.prs.iter().find(|p| p.number == n).cloned();
                     let mut pr = matched.unwrap_or(Pr {
                         number: n,
@@ -221,6 +227,8 @@ pub fn enter_comment_mode(st: &mut State) {
     }
     st.comment_mode = true;
     st.comment_start = None;
+    st.comment_draft.clear(); // a fresh `c` starts a new comment
+    st.diff_reveal_pending = true;
     st.comment_line = first_change_index(st, &path).unwrap_or(idxs[0]);
     st.status = "Comment: j/k line · Shift+J/K range · Enter confirm · Esc cancel".into();
 }
@@ -241,6 +249,7 @@ pub fn move_comment(st: &mut State, direction: i64, extend: bool) {
         st.comment_start = None;
     }
     st.comment_line = idxs[pos];
+    st.diff_reveal_pending = true;
 }
 
 /// From the picker, open the comment editor overlay on the selected line/range.
@@ -263,7 +272,21 @@ pub fn begin_comment(st: &mut State) {
             }
         }
     }
-    st.overlay = Overlay::Comment { ta: TextArea::new(""), path, line, side, start_line, start_side };
+    // Restore any in-progress text so re-opening keeps what was written.
+    let ta = TextArea::new(&st.comment_draft);
+    st.overlay = Overlay::Comment { ta, path, line, side, start_line, start_side };
+}
+
+/// Close the comment editor back to the line picker, stashing the draft text
+/// and keeping the current selection.
+pub fn comment_to_picker(st: &mut State) {
+    let overlay = std::mem::replace(&mut st.overlay, Overlay::None);
+    if let Overlay::Comment { ta, .. } = overlay {
+        st.comment_draft = ta.text();
+        st.comment_mode = true; // resume selection with the same line/range
+        st.diff_reveal_pending = true;
+        st.status = "Line selection — Enter: resume editing · j/k/Shift+J/K: adjust · Esc: cancel".into();
+    }
 }
 
 pub fn confirm_comment(st: &mut State, tx: &Sender<Job>) {
@@ -275,6 +298,7 @@ pub fn confirm_comment(st: &mut State, tx: &Sender<Job>) {
     if body.is_empty() {
         return;
     }
+    st.comment_draft.clear(); // submitted — drop the draft
     let Some(pr) = st.active_pr.clone() else { return };
     let comment = PendingComment {
         path: path.clone(),

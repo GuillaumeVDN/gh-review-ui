@@ -120,6 +120,41 @@ impl TextArea {
         }
     }
 
+    /// Move to the start of the previous word (Ctrl+Left).
+    pub fn word_left(&mut self) {
+        if self.col == 0 {
+            self.left();
+            return;
+        }
+        let chars = self.cur_chars();
+        let mut i = self.col;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.col = i;
+    }
+
+    /// Move past the end of the current/next word (Ctrl+Right).
+    pub fn word_right(&mut self) {
+        let chars = self.cur_chars();
+        let n = chars.len();
+        if self.col >= n {
+            self.right();
+            return;
+        }
+        let mut i = self.col;
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.col = i;
+    }
+
     pub fn up(&mut self) {
         if self.row > 0 {
             self.row -= 1;
@@ -214,6 +249,20 @@ mod tests {
         ta.col = 0;
         ta.delete_word();
         assert_eq!(ta.text(), "abcd");
+    }
+
+    #[test]
+    fn word_motion() {
+        let mut ta = TextArea::new("one two three");
+        ta.col = 13;
+        ta.word_left();
+        assert_eq!(ta.col, 8); // start of "three"
+        ta.word_left();
+        assert_eq!(ta.col, 4); // start of "two"
+        ta.word_right();
+        assert_eq!(ta.col, 8); // past "two" + spaces → start of "three"
+        ta.word_right();
+        assert_eq!(ta.col, 13); // end
     }
 
     #[test]

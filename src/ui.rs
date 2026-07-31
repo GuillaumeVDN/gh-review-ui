@@ -284,10 +284,14 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
 
     let focused = st.focus == Focus::Diff;
     let cur_hr = if focused { path.as_ref().and_then(|p| current_hunk_range(st, p)) } else { None };
-    if st.comment_mode {
-        st.diff_scroll = reveal_scroll(st.diff_scroll, st.comment_line, st.comment_line + 1, vh);
-    } else if let Some((s, e)) = cur_hr {
-        st.diff_scroll = reveal_scroll(st.diff_scroll, s, e, vh);
+    // Only recenter after a keyboard navigation; mouse/PgUp/Dn scroll freely.
+    if st.diff_reveal_pending {
+        if st.comment_mode {
+            st.diff_scroll = reveal_scroll(st.diff_scroll, st.comment_line, st.comment_line + 1, vh);
+        } else if let Some((s, e)) = cur_hr {
+            st.diff_scroll = reveal_scroll(st.diff_scroll, s, e, vh);
+        }
+        st.diff_reveal_pending = false;
     }
     let max_scroll = diff_lines.len().saturating_sub(vh);
     st.diff_scroll = st.diff_scroll.min(max_scroll);
@@ -440,7 +444,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
             let inner = b.inner(rect);
             f.render_widget(Clear, rect);
             f.render_widget(b, rect);
-            draw_editor(f, ta, inner, "Enter: add · Shift+Enter: newline · Alt+Bksp: del word · Esc: cancel");
+            draw_editor(f, ta, inner, "Enter: add · Shift+Enter: newline · Ctrl+←/→: word · Ctrl+Bksp: del word · Esc: back to selection");
         }
         Overlay::Edit { ta, path, line, .. } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 18.min(area.height.saturating_sub(4)));

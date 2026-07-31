@@ -241,6 +241,7 @@ fn handle_comment_mode(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => {
             st.comment_mode = false;
+            st.comment_draft.clear();
             st.status = "Comment cancelled.".into();
         }
         KeyCode::Down | KeyCode::Char('j') => controller::move_comment(st, 1, false),
@@ -262,7 +263,13 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     let alt = m.contains(KeyModifiers::ALT);
 
     if k.code == KeyCode::Esc {
-        st.overlay = Overlay::None;
+        // Closing a new-comment editor returns to the line picker (keeping the
+        // draft + selection); other overlays just close.
+        if matches!(st.overlay, Overlay::Comment { .. }) {
+            controller::comment_to_picker(st);
+        } else {
+            st.overlay = Overlay::None;
+        }
         return;
     }
     // Review — choices mode
@@ -310,7 +317,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
         }
         KeyCode::Backspace => {
             if let Some(ta) = overlay_ta(st) {
-                if alt {
+                if alt || ctrl {
                     ta.delete_word();
                 } else {
                     ta.backspace();
@@ -324,12 +331,20 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
         }
         KeyCode::Left => {
             if let Some(ta) = overlay_ta(st) {
-                ta.left();
+                if ctrl {
+                    ta.word_left();
+                } else {
+                    ta.left();
+                }
             }
         }
         KeyCode::Right => {
             if let Some(ta) = overlay_ta(st) {
-                ta.right();
+                if ctrl {
+                    ta.word_right();
+                } else {
+                    ta.right();
+                }
             }
         }
         KeyCode::Up => {
@@ -401,6 +416,7 @@ fn open_file_or_dir(st: &mut State) {
             st.focus = Focus::Diff;
             st.diff_scroll = 0;
             st.diff_hunk_idx = 0;
+            st.diff_reveal_pending = true;
         }
         Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
         None => {}

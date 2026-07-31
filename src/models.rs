@@ -156,11 +156,17 @@ pub struct State {
     pub hunks_by_file: HashMap<String, Vec<Range>>,
     pub diff_scroll: usize,
     pub diff_hunk_idx: usize,
+    /// Set when a keyboard action should scroll the selected hunk/comment into
+    /// view on the next render; free scrolling (mouse/PgUp/Dn) leaves it unset.
+    pub diff_reveal_pending: bool,
 
     // In-hunk comment picker.
     pub comment_mode: bool,
     pub comment_line: usize,
     pub comment_start: Option<usize>,
+    /// In-progress comment text, kept while toggling between the editor and the
+    /// line picker so it isn't lost. Cleared on submit or a fresh `c`.
+    pub comment_draft: String,
 
     pub pr_details: HashMap<i64, Option<serde_json::Value>>,
     pub details_scroll: usize,

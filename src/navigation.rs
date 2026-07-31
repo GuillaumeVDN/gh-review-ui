@@ -76,6 +76,7 @@ pub fn jump_hunk(st: &mut State, direction: i64) {
     }
     let idx = (st.diff_hunk_idx as i64 + direction).clamp(0, len as i64 - 1);
     st.diff_hunk_idx = idx as usize;
+    st.diff_reveal_pending = true;
 }
 
 /// New-file line to open in the editor for the selected hunk.
