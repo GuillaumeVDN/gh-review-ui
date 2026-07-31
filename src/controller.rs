@@ -393,15 +393,24 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
 }
 
 pub fn fold_viewed(st: &mut State) {
-    // Remember the file the cursor sat on so we can jump forward from it (folding
-    // may collapse it away, so capture the underlying file index, not the row).
-    let anchor = match st.tree.get(st.file_idx) {
-        Some(TreeRow::File { index, .. }) => Some(*index),
-        Some(TreeRow::Dir { path, .. }) => tree::files_under_dir(st, path).into_iter().next(),
-        None => None,
+    // Capture the cursor context before folding collapses rows away (so we keep
+    // the underlying file index / dir path, not the volatile row position).
+    let (dir, file_anchor) = match st.tree.get(st.file_idx) {
+        Some(TreeRow::Dir { path, .. }) => (Some(path.clone()), None),
+        Some(TreeRow::File { index, .. }) => (None, Some(*index)),
+        None => (None, None),
     };
     let folded = tree::fold_viewed_dirs(st);
-    let jumped = tree::next_unviewed_index(st, anchor);
+    let jumped = if let Some(path) = dir {
+        // On a folder: dive to the first unviewed file inside it; only if it has
+        // none (fully viewed → just folded) fall back to jumping onward from it.
+        tree::first_unviewed_in_dir(st, &path).or_else(|| {
+            let anchor = tree::files_under_dir(st, &path).into_iter().next();
+            tree::next_unviewed_index(st, anchor)
+        })
+    } else {
+        tree::next_unviewed_index(st, file_anchor)
+    };
     if let Some(ti) = jumped {
         st.file_idx = ti;
         st.diff_scroll = 0;

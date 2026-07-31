@@ -115,6 +115,17 @@ pub fn first_unviewed_index(st: &State) -> Option<usize> {
     })
 }
 
+/// Tree index of the first unviewed file within `dir_path`'s subtree, if any.
+pub fn first_unviewed_in_dir(st: &State, dir_path: &str) -> Option<usize> {
+    let prefix = format!("{dir_path}/");
+    st.tree.iter().position(|row| match row {
+        TreeRow::File { index, .. } => {
+            !st.files[*index].viewed && st.files[*index].path.starts_with(&prefix)
+        }
+        _ => false,
+    })
+}
+
 /// Tree index of the "next" unviewed file relative to `anchor` (a file index into
 /// `st.files`, typically the file the cursor sat on). Prefers the closest unviewed
 /// file whose display order is *after* the anchor; if none remain after it, falls
@@ -277,6 +288,29 @@ mod tests {
         rebuild(&mut st);
         let ti = next_unviewed_index(&st, None).unwrap();
         assert_eq!(file_at(&st, ti), "b.py");
+    }
+
+    #[test]
+    fn first_unviewed_in_dir_dives_into_subtree() {
+        let mut st = State::default();
+        // Cursor on "src": jump to its first unviewed file (b.py), not a.py above it.
+        st.files = files(&[
+            ("a.py", false),
+            ("src/a.py", true),
+            ("src/b.py", false),
+            ("src/c.py", false),
+        ]);
+        rebuild(&mut st);
+        let ti = first_unviewed_in_dir(&st, "src").unwrap();
+        assert_eq!(file_at(&st, ti), "src/b.py");
+    }
+
+    #[test]
+    fn first_unviewed_in_dir_none_when_all_viewed() {
+        let mut st = State::default();
+        st.files = files(&[("src/a.py", true), ("src/b.py", true)]);
+        rebuild(&mut st);
+        assert!(first_unviewed_in_dir(&st, "src").is_none());
     }
 
     #[test]
