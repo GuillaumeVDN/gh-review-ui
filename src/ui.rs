@@ -91,6 +91,17 @@ fn pad(s: &str, w: usize) -> String {
     }
 }
 
+/// Hard-wrap a string into rows of at most `width` chars (column-based, so long
+/// code lines are split rather than truncated). Empty input yields one empty row.
+fn wrap_hard(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
+
 /// A list row with a colored left-bar "pastille" when selected (no full-row
 /// highlight — lazygit-style), otherwise the item's base style.
 fn list_row(selected: bool, text: &str, base: Style, iw: usize) -> Line<'static> {
@@ -293,8 +304,9 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         }
         st.diff_reveal_pending = false;
     }
-    let max_scroll = diff_lines.len().saturating_sub(vh);
-    st.diff_scroll = st.diff_scroll.min(max_scroll);
+    // Scroll is by diff-line index; allow reaching the last line (which may wrap
+    // into several rows) rather than clamping to len - vh.
+    st.diff_scroll = st.diff_scroll.min(diff_lines.len().saturating_sub(1));
 
     let (sel_lo, sel_hi) = if st.comment_mode {
         let anchor = st.comment_start.unwrap_or(st.comment_line);
@@ -303,18 +315,27 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (1usize, 0usize) // empty
     };
 
-    let mut out = Vec::new();
-    for (i, ln) in diff_lines.iter().enumerate().skip(st.diff_scroll).take(vh) {
+    let tw = iw.saturating_sub(1); // text width (1 col for the marker)
+    let mut out: Vec<Line> = Vec::new();
+    let mut i = st.diff_scroll;
+    while out.len() < vh && i < diff_lines.len() {
+        let ln = &diff_lines[i];
         let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
         let selected = sel_lo <= i && i <= sel_hi;
         let mut style = theme::diff_line_style(ln, current);
         if selected {
-            style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+            style = style.add_modifier(Modifier::REVERSED);
         }
-        let marker = if selected { "▶" } else if current { "▌" } else { " " };
         let m_style = if selected { theme::focus() } else if current { theme::hunk_marker() } else { Style::default() };
-        let text = pad(&ln.replace('\t', "    "), iw.saturating_sub(1));
-        out.push(Line::from(vec![Span::styled(marker, m_style), Span::styled(text, style)]));
+        // Wrap long lines onto continuation rows so nothing is cut off.
+        for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw).into_iter().enumerate() {
+            if out.len() >= vh {
+                break;
+            }
+            let marker = if k > 0 { " " } else if selected { "▶" } else if current { "▌" } else { " " };
+            out.push(Line::from(vec![Span::styled(marker, m_style), Span::styled(pad(&chunk, tw), style)]));
+        }
+        i += 1;
     }
     f.render_widget(Paragraph::new(out), inner);
 }
@@ -511,6 +532,13 @@ mod tests {
         assert_eq!(clamp_view(20, 0, 10, 100), 11);
         assert_eq!(clamp_view(3, 0, 10, 100), 0);
         assert_eq!(clamp_view(0, 0, 10, 0), 0);
+    }
+
+    #[test]
+    fn wrap_hard_splits_long_lines() {
+        assert_eq!(wrap_hard("abcdefg", 3), ["abc", "def", "g"]);
+        assert_eq!(wrap_hard("abc", 3), ["abc"]);
+        assert_eq!(wrap_hard("", 5), [""]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::models::{
     Category, FileEntry, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
 };
 use crate::navigation::{
-    cur_file_path, first_change_index, hunk_line_indices, line_target, next_commentable_after,
+    cur_file_path, current_hunk_range, first_change_index, hunk_line_indices, line_target,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -230,17 +230,17 @@ pub fn enter_comment_mode(st: &mut State) {
     st.comment_start = None;
     // Keep any saved draft for this file — commenting it again restores it.
     st.diff_reveal_pending = true;
-    // Continue just after the previous comment on this file, if any.
-    let cont = match &st.last_comment {
-        Some((p, idx)) if *p == path => next_commentable_after(st, &path, *idx),
+    // If the last comment was in the *currently selected* hunk, continue on the
+    // next commentable line of that hunk; otherwise start at the hunk's first line.
+    let same_hunk_next = match (&st.last_comment, current_hunk_range(st, &path)) {
+        (Some((p, idx)), Some((s, e))) if *p == path && s <= *idx && *idx < e => {
+            idxs.iter().copied().find(|&i| i > *idx)
+        }
         _ => None,
     };
-    if let Some((hi, li)) = cont {
-        st.diff_hunk_idx = hi;
-        st.comment_line = li;
-    } else {
-        st.comment_line = first_change_index(st, &path).unwrap_or(idxs[0]);
-    }
+    st.comment_line = same_hunk_next
+        .or_else(|| first_change_index(st, &path))
+        .unwrap_or(idxs[0]);
     st.status = "Comment: j/k line · Shift+J/K range · Enter confirm · Esc cancel".into();
 }
 
