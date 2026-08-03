@@ -2,6 +2,7 @@
 
 use std::process::{Command, Stdio};
 
+use crate::gh::sh;
 use crate::models::State;
 use crate::navigation::{cur_file_path, current_hunk_editor_line};
 
@@ -28,6 +29,37 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+fn git_head(dir: &str) -> Option<String> {
+    sh(&["git", "-C", dir, "rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
+}
+
+/// Where to open the file for editing.
+///
+/// Prefer the PR's review worktree so edits land on the reviewed branch —
+/// *unless* the main repo (where the app was launched) is already sitting on
+/// the PR's head commit (ignoring uncommitted changes). In that case the user
+/// is effectively working the same code, so open the main checkout instead.
+fn editor_root(st: &State) -> String {
+    let wt = st.active_worktree.trim_end_matches('/').to_string();
+    let repo = st.repo_root.trim_end_matches('/').to_string();
+    if !wt.is_empty() && !repo.is_empty() {
+        // PR head = the worktree's checked-out commit (newest PR commit).
+        let pr_head = st.commits.first().map(|c| c.oid.clone()).or_else(|| git_head(&wt));
+        if let (Some(a), Some(b)) = (pr_head, git_head(&repo)) {
+            if a == b {
+                return repo;
+            }
+        }
+    }
+    if !wt.is_empty() {
+        wt
+    } else if !repo.is_empty() {
+        repo
+    } else {
+        ".".to_string()
+    }
+}
+
 /// Open the selected file — at the top, or at the current hunk's line.
 pub fn open_current_in_editor(st: &mut State, top: bool) {
     let Some(path) = cur_file_path(st) else {
@@ -35,14 +67,7 @@ pub fn open_current_in_editor(st: &mut State, top: bool) {
         return;
     };
     let line = if top { 1 } else { current_hunk_editor_line(st, &path) };
-    // Prefer the PR's review worktree so edits land on the reviewed branch.
-    let root = if !st.active_worktree.is_empty() {
-        st.active_worktree.clone()
-    } else if !st.repo_root.is_empty() {
-        st.repo_root.clone()
-    } else {
-        ".".to_string()
-    };
+    let root = editor_root(st);
     let abs = format!("{}/{}", root.trim_end_matches('/'), path);
     open_in_editor(&abs, line);
     st.status = format!("Opening {path}:{line} in editor…");
