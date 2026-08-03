@@ -241,7 +241,7 @@ fn handle_comment_mode(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     match k.code {
         KeyCode::Esc => {
             st.comment_mode = false;
-            st.comment_draft.clear();
+            // Drafts are per-file and already saved; leaving the picker keeps them.
             st.status = "Comment cancelled.".into();
         }
         KeyCode::Down | KeyCode::Char('j') => controller::move_comment(st, 1, false),

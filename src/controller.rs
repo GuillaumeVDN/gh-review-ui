@@ -8,7 +8,7 @@ use crate::models::{
     Category, FileEntry, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
 };
 use crate::navigation::{
-    cur_file_path, first_change_index, hunk_line_indices, line_target,
+    cur_file_path, first_change_index, hunk_line_indices, line_target, next_commentable_after,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -32,6 +32,7 @@ fn set_diff(
     st.diff_reveal_pending = true;
     st.comment_mode = false;
     st.comment_start = None;
+    st.last_comment = None; // line indices don't survive a new diff
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {
@@ -227,9 +228,19 @@ pub fn enter_comment_mode(st: &mut State) {
     }
     st.comment_mode = true;
     st.comment_start = None;
-    st.comment_draft.clear(); // a fresh `c` starts a new comment
+    // Keep any saved draft for this file — commenting it again restores it.
     st.diff_reveal_pending = true;
-    st.comment_line = first_change_index(st, &path).unwrap_or(idxs[0]);
+    // Continue just after the previous comment on this file, if any.
+    let cont = match &st.last_comment {
+        Some((p, idx)) if *p == path => next_commentable_after(st, &path, *idx),
+        _ => None,
+    };
+    if let Some((hi, li)) = cont {
+        st.diff_hunk_idx = hi;
+        st.comment_line = li;
+    } else {
+        st.comment_line = first_change_index(st, &path).unwrap_or(idxs[0]);
+    }
     st.status = "Comment: j/k line · Shift+J/K range · Enter confirm · Esc cancel".into();
 }
 
@@ -272,17 +283,26 @@ pub fn begin_comment(st: &mut State) {
             }
         }
     }
-    // Restore any in-progress text so re-opening keeps what was written.
-    let ta = TextArea::new(&st.comment_draft);
+    // Restore this file's saved draft so re-opening keeps what was written.
+    let draft = st.comment_drafts.get(&path).cloned().unwrap_or_default();
+    let ta = TextArea::new(&draft);
     st.overlay = Overlay::Comment { ta, path, line, side, start_line, start_side };
 }
 
-/// Close the comment editor back to the line picker, stashing the draft text
+fn stash_draft(st: &mut State, path: &str, text: String) {
+    if text.trim().is_empty() {
+        st.comment_drafts.remove(path);
+    } else {
+        st.comment_drafts.insert(path.to_string(), text);
+    }
+}
+
+/// Close the comment editor back to the line picker, saving the draft (per file)
 /// and keeping the current selection.
 pub fn comment_to_picker(st: &mut State) {
     let overlay = std::mem::replace(&mut st.overlay, Overlay::None);
-    if let Overlay::Comment { ta, .. } = overlay {
-        st.comment_draft = ta.text();
+    if let Overlay::Comment { ta, path, .. } = overlay {
+        stash_draft(st, &path, ta.text());
         st.comment_mode = true; // resume selection with the same line/range
         st.diff_reveal_pending = true;
         st.status = "Line selection — Enter: resume editing · j/k/Shift+J/K: adjust · Esc: cancel".into();
@@ -298,7 +318,10 @@ pub fn confirm_comment(st: &mut State, tx: &Sender<Job>) {
     if body.is_empty() {
         return;
     }
-    st.comment_draft.clear(); // submitted — drop the draft
+    st.comment_drafts.remove(&path); // submitted — drop this file's draft
+    // Remember the end line so the next `c` on this file continues below it.
+    let end_idx = st.comment_start.map_or(st.comment_line, |s| s.max(st.comment_line));
+    st.last_comment = Some((path.clone(), end_idx));
     let Some(pr) = st.active_pr.clone() else { return };
     let comment = PendingComment {
         path: path.clone(),

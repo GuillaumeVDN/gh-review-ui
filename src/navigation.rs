@@ -62,6 +62,24 @@ pub fn first_change_index(st: &State, path: &str) -> Option<usize> {
     hunk_line_indices(st, path).first().copied()
 }
 
+/// `(hunk_idx, line_idx)` of the first commentable line after `after` (across
+/// all hunks of `path`), or None if `after` was the last one.
+pub fn next_commentable_after(st: &State, path: &str, after: usize) -> Option<(usize, usize)> {
+    let hunks = st.hunks_by_file.get(path)?;
+    let info = st.info_by_file.get(path)?;
+    let mut best: Option<(usize, usize)> = None; // (line_idx, hunk_idx)
+    for (hi, &(s, e)) in hunks.iter().enumerate() {
+        for i in s..e {
+            if i > after && info.get(i).map_or(false, |&t| t != (None, None)) {
+                if best.map_or(true, |(bi, _)| i < bi) {
+                    best = Some((i, hi));
+                }
+            }
+        }
+    }
+    best.map(|(li, hi)| (hi, li))
+}
+
 pub fn scroll_diff(st: &mut State, delta: i64) {
     let s = st.diff_scroll as i64 + delta;
     st.diff_scroll = s.max(0) as usize;
@@ -209,6 +227,17 @@ mod tests {
         assert_eq!(current_hunk_editor_line(&st, "f.py"), 2);
         st.diff_hunk_idx = 1;
         assert_eq!(current_hunk_editor_line(&st, "f.py"), 11); // pure-deletion fallback
+    }
+
+    #[test]
+    fn next_commentable() {
+        let st = diff_state();
+        // after +added (idx 2) → +added2 (idx 3) in hunk 0
+        assert_eq!(next_commentable_after(&st, "f.py", 2), Some((0, 3)));
+        // after +added2 (idx 3) → next hunk's first commentable line (keep, idx 5)
+        assert_eq!(next_commentable_after(&st, "f.py", 3), Some((1, 5)));
+        // after the last line → nothing
+        assert_eq!(next_commentable_after(&st, "f.py", 6), None);
     }
 
     #[test]

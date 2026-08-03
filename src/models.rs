@@ -164,9 +164,13 @@ pub struct State {
     pub comment_mode: bool,
     pub comment_line: usize,
     pub comment_start: Option<usize>,
-    /// In-progress comment text, kept while toggling between the editor and the
-    /// line picker so it isn't lost. Cleared on submit or a fresh `c`.
-    pub comment_draft: String,
+    /// In-progress comment text, keyed by file path, so a draft survives closing
+    /// the editor and switching files. Restored when commenting that file again;
+    /// dropped when the comment is submitted (or emptied).
+    pub comment_drafts: HashMap<String, String>,
+    /// (file path, end diff-line index) of the last submitted comment, so the
+    /// next `c` on that file starts on the following line.
+    pub last_comment: Option<(String, usize)>,
 
     pub pr_details: HashMap<i64, Option<serde_json::Value>>,
     pub details_scroll: usize,
