@@ -33,28 +33,50 @@ fn git_head(dir: &str) -> Option<String> {
     sh(&["git", "-C", dir, "rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
 }
 
+/// Local checkouts that might already hold the PR head: the repo the app was
+/// launched from, and the conventional `~/Projects/<repo-name>` clone.
+fn candidate_checkouts(st: &State) -> Vec<String> {
+    let mut v = Vec::new();
+    let repo = st.repo_root.trim_end_matches('/').to_string();
+    if !repo.is_empty() {
+        v.push(repo);
+    }
+    if !st.repo_name.is_empty() {
+        if let Ok(home) = std::env::var("HOME") {
+            let p = format!("{home}/Projects/{}", st.repo_name);
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+    }
+    v
+}
+
 /// Where to open the file for editing.
 ///
-/// Prefer the PR's review worktree so edits land on the reviewed branch —
-/// *unless* the main repo (where the app was launched) is already sitting on
-/// the PR's head commit (ignoring uncommitted changes). In that case the user
-/// is effectively working the same code, so open the main checkout instead.
+/// Prefer a local checkout already sitting on the PR's head commit (ignoring
+/// uncommitted changes) — the repo the app was launched from, or the matching
+/// `~/Projects/<repo-name>` clone — since that's the same code the user works
+/// on. Otherwise fall back to the PR's review worktree.
 fn editor_root(st: &State) -> String {
     let wt = st.active_worktree.trim_end_matches('/').to_string();
-    let repo = st.repo_root.trim_end_matches('/').to_string();
-    if !wt.is_empty() && !repo.is_empty() {
-        // PR head = the worktree's checked-out commit (newest PR commit).
-        let pr_head = st.commits.first().map(|c| c.oid.clone()).or_else(|| git_head(&wt));
-        if let (Some(a), Some(b)) = (pr_head, git_head(&repo)) {
-            if a == b {
-                return repo;
+    // PR head = the commit the worktree is checked out at.
+    let pr_head = st
+        .commits
+        .first()
+        .map(|c| c.oid.clone())
+        .or_else(|| if wt.is_empty() { None } else { git_head(&wt) });
+    if let Some(head) = pr_head {
+        for cand in candidate_checkouts(st) {
+            if git_head(&cand).as_deref() == Some(head.as_str()) {
+                return cand;
             }
         }
     }
     if !wt.is_empty() {
         wt
-    } else if !repo.is_empty() {
-        repo
+    } else if !st.repo_root.is_empty() {
+        st.repo_root.trim_end_matches('/').to_string()
     } else {
         ".".to_string()
     }
