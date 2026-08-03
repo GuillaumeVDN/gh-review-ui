@@ -8,13 +8,16 @@ use crate::navigation::{cur_file_path, current_hunk_editor_line};
 
 /// Fire-and-forget: open `abs_path` in the running nvim server at `line`.
 /// Wired for an Omarchy/Hyprland + Neovim setup (nvim on `/tmp/nvim.sock`).
+///
+/// Uses a single `:edit +{line} {file}` command so the buffer switch and the
+/// line jump happen atomically — two separate `--remote`/`--remote-send` calls
+/// race, sometimes jumping in the previous buffer (wrong file).
 pub fn open_in_editor(abs_path: &str, line: i64) {
+    let ex_path = abs_path.replace(' ', "\\ "); // escape spaces for the ex command
     let script = format!(
-        "nvim --server /tmp/nvim.sock --remote {q} \
-         && nvim --server /tmp/nvim.sock --remote-send \":{line}<CR>\" \
+        "nvim --server /tmp/nvim.sock --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" \
          && (hyprctl dispatch focuswindow class:org.omarchy.nvim | grep -q ok \
-             || hyprctl dispatch focuswindow title:^n$)",
-        q = shell_quote(abs_path),
+             || hyprctl dispatch focuswindow title:^n$)"
     );
     let _ = Command::new("/usr/bin/bash")
         .arg("-c")
@@ -23,10 +26,6 @@ pub fn open_in_editor(abs_path: &str, line: i64) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn git_head(dir: &str) -> Option<String> {
