@@ -56,6 +56,17 @@ impl TextArea {
         self.col += 1;
     }
 
+    /// Insert a (possibly multi-line) string at the cursor.
+    pub fn insert_str(&mut self, s: &str) {
+        for ch in s.chars() {
+            if ch == '\n' {
+                self.newline();
+            } else {
+                self.insert(ch);
+            }
+        }
+    }
+
     pub fn newline(&mut self) {
         let chars = self.cur_chars();
         let (left, right) = chars.split_at(self.col.min(chars.len()));
@@ -249,6 +260,14 @@ mod tests {
         ta.col = 0;
         ta.delete_word();
         assert_eq!(ta.text(), "abcd");
+    }
+
+    #[test]
+    fn insert_multiline_str() {
+        let mut ta = TextArea::new("x");
+        ta.insert_str("a\nb");
+        assert_eq!(ta.text(), "xa\nb");
+        assert_eq!((ta.row, ta.col), (1, 1));
     }
 
     #[test]

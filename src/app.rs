@@ -298,7 +298,9 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     // Editing mode (Comment / Edit / Review-editing)
     match k.code {
         KeyCode::Enter => {
-            if shift {
+            // Shift+Enter needs the kitty keyboard protocol (flaky across
+            // terminals); Alt+Enter is delivered reliably via the meta-escape.
+            if shift || alt {
                 if let Some(ta) = overlay_ta(st) {
                     ta.newline();
                 }
@@ -329,6 +331,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                 ta.delete_word();
             }
         }
+        KeyCode::Char('s') if ctrl => controller::insert_suggestion(st),
         KeyCode::Left => {
             if let Some(ta) = overlay_ta(st) {
                 if ctrl {

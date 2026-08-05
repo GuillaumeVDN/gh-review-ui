@@ -451,6 +451,17 @@ fn draw_editor(f: &mut Frame, ta: &textbuffer::TextArea, inner: Rect, help: &str
     }
 }
 
+/// The shared comment-editor modal (used by both new-comment and edit-comment):
+/// a centered box with a title, the wrapped text editor and a shortcuts line.
+fn draw_modal_editor(f: &mut Frame, area: Rect, ta: &textbuffer::TextArea, title: &str, help: &str) {
+    let rect = centered(area, 120.min(area.width.saturating_sub(4)), 18.min(area.height.saturating_sub(4)));
+    let b = block(title, true, false);
+    let inner = b.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(b, rect);
+    draw_editor(f, ta, inner, help);
+}
+
 fn render_overlay(f: &mut Frame, st: &State) {
     let area = f.area();
     match &st.overlay {
@@ -460,20 +471,12 @@ fn render_overlay(f: &mut Frame, st: &State) {
                 Some(s) => format!("{path}:{s}-{line}"),
                 None => format!("{path}:{line} ({side})"),
             };
-            let rect = centered(area, 90.min(area.width.saturating_sub(4)), 18.min(area.height.saturating_sub(4)));
-            let b = block(&format!("Comment on {where_}"), true, false);
-            let inner = b.inner(rect);
-            f.render_widget(Clear, rect);
-            f.render_widget(b, rect);
-            draw_editor(f, ta, inner, "Enter: add · Shift+Enter: newline · Ctrl+←/→: word · Ctrl+Bksp: del word · Esc: back to selection");
+            draw_modal_editor(f, area, ta, &format!("Comment on {where_}"),
+                "Enter: add · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: back");
         }
         Overlay::Edit { ta, path, line, .. } => {
-            let rect = centered(area, 90.min(area.width.saturating_sub(4)), 18.min(area.height.saturating_sub(4)));
-            let b = block(&format!("Edit comment on {path}:{line}"), true, false);
-            let inner = b.inner(rect);
-            f.render_widget(Clear, rect);
-            f.render_widget(b, rect);
-            draw_editor(f, ta, inner, "Enter: save · Shift+Enter: newline · Esc: cancel");
+            draw_modal_editor(f, area, ta, &format!("Edit comment on {path}:{line}"),
+                "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: cancel");
         }
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));

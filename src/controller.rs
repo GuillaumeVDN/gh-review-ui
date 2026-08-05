@@ -297,6 +297,75 @@ fn stash_draft(st: &mut State, path: &str, text: String) {
     }
 }
 
+fn strip_diff_prefix(l: &str) -> &str {
+    if l.starts_with(['+', '-', ' ']) {
+        &l[1..]
+    } else {
+        l
+    }
+}
+
+/// New-side (added/context) code for the diff-line index range `lo..=hi`.
+/// Only lines present on the new side are kept — that's what a suggestion replaces.
+fn code_by_diff_idx(st: &State, path: &str, lo: usize, hi: usize) -> Vec<String> {
+    let (Some(lines), Some(info)) = (st.diff_by_file.get(path), st.info_by_file.get(path)) else {
+        return Vec::new();
+    };
+    (lo..=hi)
+        .filter_map(|i| match (lines.get(i), info.get(i)) {
+            (Some(l), Some(&(_, Some(_)))) => Some(strip_diff_prefix(l).to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// New-side code whose new-side line number falls in `[lo_line, hi_line]`.
+fn code_by_new_line(st: &State, path: &str, lo_line: i64, hi_line: i64) -> Vec<String> {
+    let (Some(lines), Some(info)) = (st.diff_by_file.get(path), st.info_by_file.get(path)) else {
+        return Vec::new();
+    };
+    info.iter()
+        .enumerate()
+        .filter_map(|(i, &(_, new))| {
+            let n = new?;
+            (n >= lo_line && n <= hi_line)
+                .then(|| lines.get(i).map(|l| strip_diff_prefix(l).to_string()))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Insert a GitHub ```suggestion block prefilled with the commented code (the
+/// new-side content of the target line/range) into the open editor. Works both
+/// for a new comment (`Overlay::Comment`) and an edited one (`Overlay::Edit`).
+pub fn insert_suggestion(st: &mut State) {
+    let code = match &st.overlay {
+        Overlay::Comment { path, .. } => {
+            let path = path.clone();
+            let anchor = st.comment_start.unwrap_or(st.comment_line);
+            let (lo, hi) = (anchor.min(st.comment_line), anchor.max(st.comment_line));
+            code_by_diff_idx(st, &path, lo, hi)
+        }
+        Overlay::Edit { path, line, comment_id, .. } => {
+            let path = path.clone();
+            let hi_line = *line;
+            // Recover the range's start line from the matching pending comment.
+            let lo_line = st
+                .pending
+                .iter()
+                .find(|c| &c.comment_id == comment_id)
+                .and_then(|c| c.start_line)
+                .unwrap_or(hi_line);
+            code_by_new_line(st, &path, lo_line.min(hi_line), lo_line.max(hi_line))
+        }
+        _ => return,
+    };
+    let block = format!("```suggestion\n{}\n```", code.join("\n"));
+    if let Overlay::Comment { ta, .. } | Overlay::Edit { ta, .. } = &mut st.overlay {
+        ta.insert_str(&block);
+    }
+}
+
 /// Close the comment editor back to the line picker, saving the draft (per file)
 /// and keeping the current selection.
 pub fn comment_to_picker(st: &mut State) {
