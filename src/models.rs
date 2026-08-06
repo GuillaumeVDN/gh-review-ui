@@ -48,6 +48,31 @@ pub struct FileEntry {
     pub viewed: bool,
 }
 
+/// The kind of local worktree change for a [`EditEntry`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditKind {
+    Added,
+    Deleted,
+    Modified,
+}
+
+impl EditKind {
+    pub fn sigil(self) -> &'static str {
+        match self {
+            EditKind::Added => "A",
+            EditKind::Deleted => "D",
+            EditKind::Modified => "M",
+        }
+    }
+}
+
+/// A file changed locally in the PR worktree (vs the checked-out PR head).
+#[derive(Clone, Debug)]
+pub struct EditEntry {
+    pub path: String,
+    pub kind: EditKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingComment {
     pub path: String,
@@ -71,13 +96,14 @@ pub enum Focus {
     Prs,
     Commits,
     Files,
+    Edits,
     Pending,
     Diff,
 }
 
 /// Tab-cycle order (matches top-to-bottom pane layout, diff last).
-pub const FOCUS_ORDER: [Focus; 5] =
-    [Focus::Prs, Focus::Commits, Focus::Files, Focus::Pending, Focus::Diff];
+pub const FOCUS_ORDER: [Focus; 6] =
+    [Focus::Prs, Focus::Commits, Focus::Files, Focus::Edits, Focus::Pending, Focus::Diff];
 
 impl Focus {
     pub fn next(self) -> Focus {
@@ -94,7 +120,8 @@ impl Focus {
             '1' => Some(Focus::Prs),
             '2' => Some(Focus::Commits),
             '3' => Some(Focus::Files),
-            '4' => Some(Focus::Pending),
+            '4' => Some(Focus::Edits),
+            '5' => Some(Focus::Pending),
             _ => None,
         }
     }
@@ -124,6 +151,8 @@ pub enum Overlay {
     Edit { ta: TextArea, comment_id: String, path: String, line: i64 },
     /// Finish-review: description editor (top) + event choice (bottom).
     Review { ta: TextArea, editing: bool, choice: usize },
+    /// Commit message for the pending worktree edits (commit + push).
+    CommitMsg { ta: TextArea },
 }
 
 #[derive(Default)]
@@ -150,6 +179,19 @@ pub struct State {
     pub tree: Vec<TreeRow>,
     pub file_idx: usize,
     pub file_offset: usize,
+
+    // Pending edits: local worktree changes vs the checked-out PR head.
+    pub edit_files: Vec<EditEntry>,
+    pub edit_collapsed: HashSet<String>,
+    pub edit_tree: Vec<TreeRow>,
+    pub edit_idx: usize,
+    pub edit_offset: usize,
+    pub edit_diff_by_file: HashMap<String, Vec<String>>,
+    pub edit_info_by_file: HashMap<String, Vec<LineInfo>>,
+    pub edit_diff_scroll: usize,
+
+    /// First `g` of a pending `gg` (jump-to-top) chord, in the tree panes.
+    pub pending_g: bool,
 
     pub diff_by_file: HashMap<String, Vec<String>>,
     pub info_by_file: HashMap<String, Vec<LineInfo>>,

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
@@ -27,9 +27,10 @@ pub fn run() -> Result<()> {
         stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         EnableMouseCapture,
+        EnableFocusChange,
     );
     let result = event_loop(&mut terminal);
-    let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture);
+    let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
 }
@@ -70,6 +71,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
             controller::maybe_load_details(&mut st, &job_tx);
         }
+        // Entering the Pending-edits pane refreshes the worktree change list.
+        if st.focus == Focus::Edits && prev_focus != Some(Focus::Edits) {
+            controller::reload_edits(&mut st, &job_tx);
+        }
         prev_pr = st.pr_idx;
         prev_focus = Some(st.focus);
 
@@ -83,6 +88,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(&mut st, &job_tx, k, area),
                 Event::Mouse(m) => handle_mouse(&mut st, m, area),
+                // Returning to the TUI window re-scans the worktree for edits.
+                Event::FocusGained => controller::reload_edits(&mut st, &job_tx),
                 _ => {}
             }
         }
@@ -100,7 +107,10 @@ fn size_rect(terminal: &ratatui::DefaultTerminal) -> Rect {
 
 fn overlay_ta(st: &mut State) -> Option<&mut TextArea> {
     match &mut st.overlay {
-        Overlay::Comment { ta, .. } | Overlay::Edit { ta, .. } | Overlay::Review { ta, .. } => Some(ta),
+        Overlay::Comment { ta, .. }
+        | Overlay::Edit { ta, .. }
+        | Overlay::Review { ta, .. }
+        | Overlay::CommitMsg { ta } => Some(ta),
         Overlay::None => None,
     }
 }
@@ -114,9 +124,13 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         handle_comment_mode(st, tx, k);
         return;
     }
+    // Reset a half-typed `gg` chord on any other key.
+    if !matches!(k.code, KeyCode::Char('g')) {
+        st.pending_g = false;
+    }
     match k.code {
         KeyCode::Char('q') => st.should_quit = true,
-        KeyCode::Char(c @ '0'..='4') => {
+        KeyCode::Char(c @ '0'..='5') => {
             if let Some(f) = Focus::from_digit(c) {
                 st.focus = f;
             }
@@ -157,6 +171,7 @@ fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
         st.pr_details.remove(&n);
         controller::maybe_load_details(st, tx);
     }
+    controller::reload_edits(st, tx);
     st.status = "Refreshing…".into();
 }
 
@@ -208,20 +223,55 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
         Focus::Files => match k.code {
             KeyCode::Char('j') if alt => jump_file(st, 1),
             KeyCode::Char('k') if alt => jump_file(st, -1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                st.file_idx = (st.file_idx + 1).min(st.tree.len().saturating_sub(1));
-                st.diff_scroll = 0;
-                st.diff_hunk_idx = 0;
+            KeyCode::Down | KeyCode::Char('j') => set_file_idx(st, st.file_idx + 1),
+            KeyCode::Up | KeyCode::Char('k') => set_file_idx(st, st.file_idx.saturating_sub(1)),
+            KeyCode::Char('g') => {
+                if st.pending_g {
+                    set_file_idx(st, 0);
+                    st.pending_g = false;
+                } else {
+                    st.pending_g = true;
+                }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                st.file_idx = st.file_idx.saturating_sub(1);
-                st.diff_scroll = 0;
-                st.diff_hunk_idx = 0;
-            }
+            KeyCode::Char('G') => set_file_idx(st, st.tree.len().saturating_sub(1)),
             KeyCode::Enter => open_file_or_dir(st),
             KeyCode::Char(' ') => controller::mark_viewed(st, tx),
             KeyCode::Char('z') => controller::fold_viewed(st),
+            KeyCode::Char('Z') => {
+                st.collapsed_dirs.clear();
+                crate::tree::rebuild(st);
+                st.status = "Unfolded all folders.".into();
+            }
             KeyCode::Char('e') => editor::open_current_in_editor(st, true),
+            _ => {}
+        },
+        Focus::Edits => match k.code {
+            KeyCode::Down | KeyCode::Char('j') => set_edit_idx(st, st.edit_idx + 1),
+            KeyCode::Up | KeyCode::Char('k') => set_edit_idx(st, st.edit_idx.saturating_sub(1)),
+            KeyCode::Char('g') => {
+                if st.pending_g {
+                    set_edit_idx(st, 0);
+                    st.pending_g = false;
+                } else {
+                    st.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => set_edit_idx(st, st.edit_tree.len().saturating_sub(1)),
+            KeyCode::PageDown => st.edit_diff_scroll += page,
+            KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
+            KeyCode::Enter => controller::begin_commit_edits(st),
+            KeyCode::Char('d') => controller::discard_edit(st, tx),
+            KeyCode::Char('z') => {
+                if let Some(TreeRow::Dir { path, .. }) = st.edit_tree.get(st.edit_idx).cloned() {
+                    controller::toggle_collapse_edit(st, &path);
+                }
+            }
+            KeyCode::Char('Z') => {
+                st.edit_collapsed.clear();
+                crate::tree::rebuild_edits(st);
+                st.status = "Unfolded all folders.".into();
+            }
+            KeyCode::Char('e') => editor::open_current_edit_in_editor(st),
             _ => {}
         },
         Focus::Diff => match k.code {
@@ -308,6 +358,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                 match &st.overlay {
                     Overlay::Comment { .. } => controller::confirm_comment(st, tx),
                     Overlay::Edit { .. } => controller::confirm_edit(st, tx),
+                    Overlay::CommitMsg { .. } => controller::confirm_commit_edits(st, tx),
                     Overlay::Review { .. } => {
                         if let Overlay::Review { editing, .. } = &mut st.overlay {
                             *editing = false;
@@ -400,6 +451,17 @@ fn toggle_all_commits(st: &mut State) {
     }
 }
 
+fn set_file_idx(st: &mut State, idx: usize) {
+    st.file_idx = idx.min(st.tree.len().saturating_sub(1));
+    st.diff_scroll = 0;
+    st.diff_hunk_idx = 0;
+}
+
+fn set_edit_idx(st: &mut State, idx: usize) {
+    st.edit_idx = idx.min(st.edit_tree.len().saturating_sub(1));
+    st.edit_diff_scroll = 0;
+}
+
 fn jump_file(st: &mut State, direction: i64) {
     let mut i = st.file_idx as i64 + direction;
     while i >= 0 && (i as usize) < st.tree.len() {
@@ -452,6 +514,8 @@ fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
         Some(Focus::Commits)
     } else if hit(rects.files) {
         Some(Focus::Files)
+    } else if hit(rects.edits) {
+        Some(Focus::Edits)
     } else if hit(rects.pending) {
         Some(Focus::Pending)
     } else if hit(rects.right) {
@@ -474,10 +538,13 @@ fn scroll_pane(st: &mut State, pane: Focus, delta: i64) {
         Focus::Prs => bump(&mut st.pr_offset, delta),
         Focus::Commits => bump(&mut st.commit_offset, delta),
         Focus::Files => bump(&mut st.file_offset, delta),
+        Focus::Edits => bump(&mut st.edit_offset, delta),
         Focus::Pending => bump(&mut st.pending_offset, delta),
         Focus::Diff => {
             if st.focus == Focus::Prs {
                 bump(&mut st.details_scroll, delta);
+            } else if st.focus == Focus::Edits {
+                bump(&mut st.edit_diff_scroll, delta);
             } else {
                 nav::scroll_diff(st, delta);
             }

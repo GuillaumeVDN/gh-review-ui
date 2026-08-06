@@ -1,8 +1,8 @@
 //! Unified-diff parsing and change-block indexing (pure).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::models::{LineInfo, Range};
+use crate::models::{EditEntry, EditKind, LineInfo, Range};
 
 /// Parse `@@ -old[,n] +new[,n] @@` → (old_start, new_start).
 pub fn parse_hunk_header(line: &str) -> Option<(i64, i64)> {
@@ -89,6 +89,81 @@ pub fn parse_diff(raw: &str) -> (HashMap<String, Vec<String>>, HashMap<String, V
     }
     flush!();
     (per_file, per_info)
+}
+
+/// Classify one file's diff block as added / deleted / modified from its
+/// `new file mode` / `deleted file mode` markers (else a content change).
+pub fn edit_kind(diff_lines: &[String]) -> EditKind {
+    for l in diff_lines {
+        if l.starts_with("new file mode") {
+            return EditKind::Added;
+        }
+        if l.starts_with("deleted file mode") {
+            return EditKind::Deleted;
+        }
+    }
+    EditKind::Modified
+}
+
+/// Parse a `git diff` of the worktree into the list of changed files (sorted,
+/// with their change kind). This is exactly the set that will be committed, so
+/// it must never pick up anything outside the diff.
+pub fn classify_edits(raw: &str) -> Vec<EditEntry> {
+    let (per_file, _) = parse_diff(raw);
+    let mut out: Vec<EditEntry> = per_file
+        .iter()
+        .map(|(path, lines)| EditEntry { path: path.clone(), kind: edit_kind(lines) })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn strip_diff_marker(l: &str) -> &str {
+    if l.starts_with(['+', '-', ' ']) {
+        &l[1..]
+    } else {
+        l
+    }
+}
+
+/// How to overlay a *local* diff (PR head → worktree) onto the PR review diff.
+///
+/// The local diff's old side is the PR head, which is exactly the review diff's
+/// new side — so we key everything by head line number:
+/// - `deleted_heads`: head lines removed/replaced locally (drawn struck-through);
+/// - `adds_after`: new local content to insert right after a given head line;
+/// - `adds_top`: local content added before the first head line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalOverlay {
+    pub deleted_heads: HashSet<i64>,
+    pub adds_after: HashMap<i64, Vec<String>>,
+    pub adds_top: Vec<String>,
+}
+
+pub fn local_overlay(lines: &[String], info: &[LineInfo]) -> LocalOverlay {
+    let mut ov = LocalOverlay::default();
+    let mut last_head = 0i64;
+    for (i, &(old, new)) in info.iter().enumerate() {
+        match (old, new) {
+            (Some(h), None) => {
+                // Head line removed (or the old half of a modification).
+                ov.deleted_heads.insert(h);
+                last_head = h;
+            }
+            (None, Some(_)) => {
+                // New local content — anchor it after the last head line seen.
+                let content = strip_diff_marker(lines.get(i).map(String::as_str).unwrap_or("")).to_string();
+                if last_head == 0 {
+                    ov.adds_top.push(content);
+                } else {
+                    ov.adds_after.entry(last_head).or_default().push(content);
+                }
+            }
+            (Some(h), Some(_)) => last_head = h, // unchanged head line
+            (None, None) => {}                   // header / hunk / marker line
+        }
+    }
+    ov
 }
 
 /// Contiguous runs of changed (`+`/`-`) lines — the app's navigable "hunks".
@@ -184,6 +259,112 @@ mod tests {
         let (f, i) = parse_diff("");
         assert!(f.is_empty() && i.is_empty());
         assert!(compute_hunks(&[]).is_empty());
+    }
+
+    fn added_file() -> &'static str {
+        "diff --git a/new.txt b/new.txt\n\
+         new file mode 100644\n\
+         index 0000000..e69de29\n\
+         --- /dev/null\n\
+         +++ b/new.txt\n\
+         @@ -0,0 +1,2 @@\n\
+         +hello\n\
+         +world\n"
+    }
+    fn deleted_file() -> &'static str {
+        "diff --git a/gone.txt b/gone.txt\n\
+         deleted file mode 100644\n\
+         index e69de29..0000000\n\
+         --- a/gone.txt\n\
+         +++ /dev/null\n\
+         @@ -1 +0,0 @@\n\
+         -bye\n"
+    }
+    fn modified_file() -> &'static str {
+        "diff --git a/mod.txt b/mod.txt\n\
+         index 1111111..2222222 100644\n\
+         --- a/mod.txt\n\
+         +++ b/mod.txt\n\
+         @@ -1 +1 @@\n\
+         -old\n\
+         +new\n"
+    }
+
+    #[test]
+    fn edit_kind_from_markers() {
+        let (f, _) = parse_diff(added_file());
+        assert_eq!(edit_kind(&f["new.txt"]), EditKind::Added);
+        let (f, _) = parse_diff(deleted_file());
+        assert_eq!(edit_kind(&f["gone.txt"]), EditKind::Deleted);
+        let (f, _) = parse_diff(modified_file());
+        assert_eq!(edit_kind(&f["mod.txt"]), EditKind::Modified);
+    }
+
+    #[test]
+    fn classify_edits_lists_only_diffed_files() {
+        let raw = format!("{}{}{}", added_file(), deleted_file(), modified_file());
+        let edits = classify_edits(&raw);
+        assert_eq!(
+            edits.iter().map(|e| (e.path.as_str(), e.kind)).collect::<Vec<_>>(),
+            vec![
+                ("gone.txt", EditKind::Deleted),
+                ("mod.txt", EditKind::Modified),
+                ("new.txt", EditKind::Added),
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_edits_empty_is_nothing() {
+        // No diff → nothing to commit.
+        assert!(classify_edits("").is_empty());
+        assert!(classify_edits("\n").is_empty());
+    }
+
+    #[test]
+    fn classify_edits_rename_keeps_only_new_path() {
+        // A rename lists the new path (what will be committed), not the old one.
+        let raw = "diff --git a/old.txt b/new.txt\n\
+                   similarity index 100%\n\
+                   rename from old.txt\n\
+                   rename to new.txt\n";
+        let edits = classify_edits(raw);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "new.txt");
+        assert_eq!(edits[0].kind, EditKind::Modified);
+    }
+
+    #[test]
+    fn local_overlay_maps_changes() {
+        // Local diff: modify head line 47, delete head line 49.
+        let raw = "diff --git a/f b/f\n--- a/f\n+++ b/f\n\
+                   @@ -46,5 +46,4 @@\n ctx46\n-old47\n+new47\n ctx48\n-gone49\n";
+        let (files, info) = parse_diff(raw);
+        let ov = local_overlay(&files["f"], &info["f"]);
+        assert!(ov.deleted_heads.contains(&47) && ov.deleted_heads.contains(&49));
+        assert_eq!(ov.deleted_heads.len(), 2);
+        assert_eq!(ov.adds_after.get(&47), Some(&vec!["new47".to_string()]));
+        assert!(ov.adds_top.is_empty());
+    }
+
+    #[test]
+    fn local_overlay_top_addition() {
+        // A pure addition before any head line lands in `adds_top`.
+        let raw = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1,2 @@\n+first\n+second\n";
+        let (files, info) = parse_diff(raw);
+        let ov = local_overlay(&files["f"], &info["f"]);
+        assert_eq!(ov.adds_top, vec!["first".to_string(), "second".to_string()]);
+        assert!(ov.deleted_heads.is_empty() && ov.adds_after.is_empty());
+    }
+
+    #[test]
+    fn classify_edits_binary_is_modified() {
+        let raw = "diff --git a/img.png b/img.png\n\
+                   index 1111111..2222222 100644\n\
+                   Binary files a/img.png and b/img.png differ\n";
+        let edits = classify_edits(raw);
+        assert_eq!(edits.iter().map(|e| (e.path.as_str(), e.kind)).collect::<Vec<_>>(),
+                   vec![("img.png", EditKind::Modified)]);
     }
 
     #[test]

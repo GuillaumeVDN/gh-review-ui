@@ -1,5 +1,7 @@
 //! Ratatui rendering of the panes + modal overlays.
 
+use std::collections::HashSet;
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -7,16 +9,17 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
-use crate::models::{Focus, Overlay, State, TreeRow, REVIEW_EVENTS};
+use crate::models::{Focus, Overlay, PendingComment, State, TreeRow, REVIEW_EVENTS};
 use crate::navigation::{cur_file_path, current_hunk_range, hunk_for_comment};
 use crate::textbuffer;
 use crate::theme;
 
-/// Rectangles of the four left panes + the right pane (for mouse hit-testing).
+/// Rectangles of the five left panes + the right pane (for mouse hit-testing).
 pub struct PaneRects {
     pub prs: Rect,
     pub commits: Rect,
     pub files: Rect,
+    pub edits: Rect,
     pub pending: Rect,
     pub right: Rect,
     pub body: Rect,
@@ -32,16 +35,26 @@ pub fn compute_layout(area: Rect) -> (PaneRects, Rect, Rect) {
     let bh = body.height;
     let pr_h = (bh * 2 / 9).max(6);
     let commits_h = (bh / 6).max(4);
+    let edits_h = (bh / 8).max(3);
     let pending_h = (bh / 8).max(3);
     let rows = Layout::vertical([
         Constraint::Length(pr_h),
         Constraint::Length(commits_h),
         Constraint::Min(3),
+        Constraint::Length(edits_h),
         Constraint::Length(pending_h),
     ])
     .split(left);
     (
-        PaneRects { prs: rows[0], commits: rows[1], files: rows[2], pending: rows[3], right, body },
+        PaneRects {
+            prs: rows[0],
+            commits: rows[1],
+            files: rows[2],
+            edits: rows[3],
+            pending: rows[4],
+            right,
+            body,
+        },
         status,
         help,
     )
@@ -102,6 +115,20 @@ fn wrap_hard(s: &str, width: usize) -> Vec<String> {
     chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
+/// Shared tree/list renderer: given one `(text, base_style)` per row, handle
+/// the scroll window and the selection pastille. Used by the Files and
+/// Pending-edits panes.
+fn render_rows(f: &mut Frame, inner: Rect, rows: &[(String, Style)], sel_idx: usize, offset: &mut usize, focused: bool) {
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    *offset = clamp_view(sel_idx, *offset, vh, rows.len());
+    let mut lines = Vec::new();
+    for (i, (text, base)) in rows.iter().enumerate().skip(*offset).take(vh) {
+        let selected = i == sel_idx && focused;
+        lines.push(list_row(selected, text, *base, iw));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// A list row with a colored left-bar "pastille" when selected (no full-row
 /// highlight — lazygit-style), otherwise the item's base style.
 fn list_row(selected: bool, text: &str, base: Style, iw: usize) -> Line<'static> {
@@ -139,11 +166,13 @@ pub fn render(f: &mut Frame, st: &mut State) {
     render_prs(f, st, rects.prs);
     render_commits(f, st, rects.commits);
     render_files(f, st, rects.files);
+    render_edits(f, st, rects.edits);
     render_pending(f, st, rects.pending);
     match st.focus {
         Focus::Prs => render_pr_details(f, st, rects.right),
         Focus::Commits => render_commit_detail(f, st, rects.right),
         Focus::Pending => render_pending_detail(f, st, rects.right),
+        Focus::Edits => render_edit_diff(f, st, rects.right),
         _ => render_diff(f, st, rects.right),
     }
 
@@ -160,7 +189,8 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Prs => format!("Enter: open (worktree) · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("Enter: submit review · e: edit · d: delete · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z: fold · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
+        Focus::Edits => format!("Enter: commit+push · e: editor · d: revert · Z: unfold · gg/G · {common}"),
         Focus::Diff => format!("j/k: block · c: comment · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
@@ -227,14 +257,14 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
     let b = block(&title, st.focus == Focus::Files, busy);
     let inner = b.inner(area);
     f.render_widget(b, area);
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
-    st.file_offset = clamp_view(st.file_idx, st.file_offset, vh, st.tree.len());
-    let mut lines = Vec::new();
-    for (i, row) in st.tree.iter().enumerate().skip(st.file_offset).take(vh) {
-        let (text, base) = match row {
+    let focused = st.focus == Focus::Files;
+    let rows: Vec<(String, Style)> = st
+        .tree
+        .iter()
+        .map(|row| match row {
             TreeRow::Dir { depth, name, collapsed, .. } => (
                 format!("{}{} {}/", "  ".repeat(*depth), if *collapsed { "▶" } else { "▼" }, name),
-                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
             TreeRow::File { depth, name, index } => {
                 let viewed = st.files[*index].viewed;
@@ -243,15 +273,52 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
                     if viewed { theme::dim() } else { Style::default() },
                 )
             }
-        };
-        let selected = i == st.file_idx && st.focus == Focus::Files;
-        lines.push(list_row(selected, &text, base, iw));
+        })
+        .collect();
+    render_rows(f, inner, &rows, st.file_idx, &mut st.file_offset, focused);
+}
+
+fn render_edits(f: &mut Frame, st: &mut State, area: Rect) {
+    let title = if st.edit_files.is_empty() {
+        "[4] Pending edits".to_string()
+    } else {
+        format!("[4] Pending edits ({})", st.edit_files.len())
+    };
+    let busy = st.busy.contains("edits") || st.busy.contains("editcommit");
+    let b = block(&title, st.focus == Focus::Edits, busy);
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    if st.edit_files.is_empty() {
+        f.render_widget(Paragraph::new(Line::styled("No local changes", theme::dim())), inner);
+        return;
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    let focused = st.focus == Focus::Edits;
+    let rows: Vec<(String, Style)> = st
+        .edit_tree
+        .iter()
+        .map(|row| match row {
+            TreeRow::Dir { depth, name, collapsed, .. } => (
+                format!("{}{} {}/", "  ".repeat(*depth), if *collapsed { "▶" } else { "▼" }, name),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            TreeRow::File { depth, name, index } => {
+                let kind = st.edit_files[*index].kind;
+                (
+                    format!("{}{} {}", "  ".repeat(*depth), kind.sigil(), name),
+                    theme::edit_kind_style(kind),
+                )
+            }
+        })
+        .collect();
+    render_rows(f, inner, &rows, st.edit_idx, &mut st.edit_offset, focused);
 }
 
 fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
-    let title = format!("[4] Pending ({})", st.pending.len());
+    let title = if st.pending.is_empty() {
+        "[5] Pending comments".to_string()
+    } else {
+        format!("[5] Pending comments ({})", st.pending.len())
+    };
     let busy = st.busy.contains("review") || st.busy.contains("pending");
     let b = block(&title, st.focus == Focus::Pending, busy);
     let inner = b.inner(area);
@@ -274,8 +341,9 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
 
 fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let path = cur_file_path(st);
+    let has_local = path.as_ref().map_or(false, |p| st.edit_diff_by_file.contains_key(p));
     let title = match &path {
-        Some(p) => format!("[0] Diff — {p}"),
+        Some(p) => format!("[0] Diff — {p}{}", if has_local { "  · +local edits" } else { "" }),
         None => "[0] Diff".to_string(),
     };
     let b = block(&title, st.focus == Focus::Diff, false);
@@ -315,25 +383,120 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (1usize, 0usize) // empty
     };
 
+    // Pending comments to show inline, under the diff line they anchor to.
+    let pending_here: Vec<&PendingComment> = match &path {
+        Some(p) => st.pending.iter().filter(|c| &c.path == p).collect(),
+        None => Vec::new(),
+    };
+    let info_here = path.as_ref().and_then(|p| st.info_by_file.get(p));
+
+    // Local (uncommitted) worktree edits to overlay in orange, keyed by PR-head
+    // (= review new-side) line number.
+    let overlay = path.as_ref().and_then(|p| {
+        match (st.edit_diff_by_file.get(p), st.edit_info_by_file.get(p)) {
+            (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
+            _ => None,
+        }
+    });
+
+    // PR-deleted line contents: a locally re-added line matching one is a
+    // *restore* (shown like context, leading space) rather than a new `+` line.
+    let pr_deleted: HashSet<&str> = diff_lines
+        .iter()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .map(|l| &l[1..])
+        .collect();
+
     let tw = iw.saturating_sub(1); // text width (1 col for the marker)
+    // Emit local additions (orange, "▎" marker) — as many wrapped rows as fit.
+    // Keep the diff column aligned: real additions/edits get a `+`, a restored
+    // line gets a space so it lines up with the surrounding context.
+    let push_adds = |out: &mut Vec<Line>, adds: &[String]| {
+        for add in adds {
+            let prefix = if pr_deleted.contains(add.as_str()) { ' ' } else { '+' };
+            let shown = format!("{prefix}{}", add.replace('\t', "    "));
+            for (k, chunk) in wrap_hard(&shown, tw).into_iter().enumerate() {
+                if out.len() >= vh {
+                    return;
+                }
+                let marker = if k > 0 { " " } else { "▎" };
+                out.push(Line::from(vec![
+                    Span::styled(marker, theme::local_marker()),
+                    Span::styled(pad(&chunk, tw), theme::local_add()),
+                ]));
+            }
+        }
+    };
+
     let mut out: Vec<Line> = Vec::new();
+    let mut top_done = false;
     let mut i = st.diff_scroll;
     while out.len() < vh && i < diff_lines.len() {
         let ln = &diff_lines[i];
+        let new_side = info_here.and_then(|info| info.get(i)).and_then(|&(_, n)| n);
         let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
         let selected = sel_lo <= i && i <= sel_hi;
+        // A head line removed locally: draw it struck-through in orange.
+        let local_del = overlay
+            .as_ref()
+            .zip(new_side)
+            .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
+
+        // Local additions anchored before the first head line show once, up top.
+        if let (Some(ov), false) = (&overlay, top_done) {
+            if new_side.is_some() {
+                push_adds(&mut out, &ov.adds_top);
+                top_done = true;
+            }
+        }
+
         let mut style = theme::diff_line_style(ln, current);
+        if local_del {
+            style = theme::local_del();
+        }
         if selected {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        let m_style = if selected { theme::focus() } else if current { theme::hunk_marker() } else { Style::default() };
+        let base_marker = if selected { "▶" } else if local_del { "▎" } else if current { "▌" } else { " " };
+        let m_style = if selected {
+            theme::focus()
+        } else if local_del {
+            theme::local_marker()
+        } else if current {
+            theme::hunk_marker()
+        } else {
+            Style::default()
+        };
         // Wrap long lines onto continuation rows so nothing is cut off.
         for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw).into_iter().enumerate() {
             if out.len() >= vh {
                 break;
             }
-            let marker = if k > 0 { " " } else if selected { "▶" } else if current { "▌" } else { " " };
+            let marker = if k > 0 { " " } else { base_marker };
             out.push(Line::from(vec![Span::styled(marker, m_style), Span::styled(pad(&chunk, tw), style)]));
+        }
+        // Local additions inserted after this head line (orange).
+        if let (Some(ov), Some(l)) = (&overlay, new_side) {
+            if let Some(adds) = ov.adds_after.get(&l) {
+                push_adds(&mut out, adds);
+            }
+        }
+        // Inline any pending comment anchored to this line.
+        if let Some(&(old, new)) = info_here.and_then(|info| info.get(i)) {
+            for c in &pending_here {
+                let hit = if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) };
+                if !hit {
+                    continue;
+                }
+                for (bi, bl) in c.body.lines().enumerate() {
+                    if out.len() >= vh {
+                        break;
+                    }
+                    let gutter = if bi == 0 { "▏💬 " } else { "▏   " };
+                    let text = format!("{gutter}{}", bl.replace('\t', "    "));
+                    out.push(Line::from(Span::styled(pad(&text, iw), theme::comment_inline())));
+                }
+            }
         }
         i += 1;
     }
@@ -419,6 +582,47 @@ fn render_pending_detail(f: &mut Frame, st: &State, area: Rect) {
     f.render_widget(Paragraph::new(out), inner);
 }
 
+/// The right pane while the Pending-edits pane is focused: the local diff of the
+/// selected changed file (exactly what will be committed).
+fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
+    let path = match st.edit_tree.get(st.edit_idx) {
+        Some(TreeRow::File { index, .. }) => st.edit_files.get(*index).map(|e| e.path.clone()),
+        _ => None,
+    };
+    let title = match &path {
+        Some(p) => format!("[4] Pending edits — {p}"),
+        None => "[4] Pending edits".to_string(),
+    };
+    let b = block(&title, st.focus == Focus::Edits, false);
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    let tw = iw.saturating_sub(1);
+
+    let empty = Vec::new();
+    let lines_vec = path.as_ref().and_then(|p| st.edit_diff_by_file.get(p)).unwrap_or(&empty);
+    if lines_vec.is_empty() {
+        let msg = if path.is_some() { "(no diff)" } else { "Select a changed file (or edit one with 'e')" };
+        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
+        return;
+    }
+    st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
+    let mut out: Vec<Line> = Vec::new();
+    let mut i = st.edit_diff_scroll;
+    while out.len() < vh && i < lines_vec.len() {
+        let ln = &lines_vec[i];
+        let style = theme::diff_line_style(ln, false);
+        for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
+            if out.len() >= vh {
+                break;
+            }
+            out.push(Line::from(Span::styled(pad(&chunk, tw), style)));
+        }
+        i += 1;
+    }
+    f.render_widget(Paragraph::new(out), inner);
+}
+
 // ---- overlays ----
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -477,6 +681,13 @@ fn render_overlay(f: &mut Frame, st: &State) {
         Overlay::Edit { ta, path, line, .. } => {
             draw_modal_editor(f, area, ta, &format!("Edit comment on {path}:{line}"),
                 "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: cancel");
+        }
+        Overlay::CommitMsg { ta } => {
+            let n = st.edit_files.len();
+            let branch = st.active_pr.as_ref().map_or("", |p| p.head.as_str());
+            draw_modal_editor(f, area, ta,
+                &format!("Commit {n} file(s) → push to {branch}"),
+                "Enter: commit + push · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
         }
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));

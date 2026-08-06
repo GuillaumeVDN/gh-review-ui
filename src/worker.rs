@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::api;
-use crate::models::{Commit, FileEntry, LineInfo, PendingComment, Pr};
+use crate::models::{Commit, EditEntry, FileEntry, LineInfo, PendingComment, Pr};
 
 type Diff = HashMap<String, Vec<String>>;
 type Info = HashMap<String, Vec<LineInfo>>;
@@ -26,6 +26,17 @@ pub enum Job {
     DiscardPending { owner: String, name: String, number: i64, login: String, comment_id: String },
     EditPending { owner: String, name: String, number: i64, login: String, comment_id: String, body: String },
     SubmitReview { owner: String, name: String, number: i64, login: String, pr_id: String, event: String, body: String },
+    LoadEdits { wt: String },
+    DiscardEdit { wt: String, path: String, added: bool },
+    CommitEdits {
+        wt: String,
+        repo_root: String,
+        owner: String,
+        name: String,
+        branch: String,
+        message: String,
+        paths: Vec<String>,
+    },
     Quit,
 }
 
@@ -47,6 +58,8 @@ pub enum Msg {
     PrDetails { number: i64, data: Value },
     PendingList { pending: Vec<PendingComment>, status: String },
     ReviewSubmitted(String),
+    Edits { files: Vec<EditEntry>, diff: Diff, info: Info },
+    EditsCommitted { status: String },
     Error { kind: String, msg: String },
 }
 
@@ -61,6 +74,8 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::LoadPrDetails(_) => "details",
         Job::AddPending { .. } | Job::DiscardPending { .. } | Job::EditPending { .. } => "pending",
         Job::SubmitReview { .. } => "review",
+        Job::LoadEdits { .. } | Job::DiscardEdit { .. } => "edits",
+        Job::CommitEdits { .. } => "editcommit",
         Job::Quit => "",
     }
 }
@@ -131,6 +146,26 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
         Job::SubmitReview { owner, name, number, login, pr_id, event, body } => {
             api::submit_review_api(owner, name, *number, login, pr_id, event, body)?;
             Msg::ReviewSubmitted(event.clone())
+        }
+        Job::LoadEdits { wt } => {
+            let (files, diff, info) = api::load_edits(wt);
+            Msg::Edits { files, diff, info }
+        }
+        Job::DiscardEdit { wt, path, added } => {
+            api::discard_edit(wt, path, *added)?;
+            let (files, diff, info) = api::load_edits(wt);
+            Msg::Edits { files, diff, info }
+        }
+        Job::CommitEdits { wt, repo_root, owner, name, branch, message, paths } => {
+            let remote = api::base_remote(repo_root, owner, name);
+            let pushed = api::commit_edit_files(wt, &remote, branch, message, paths)?;
+            Msg::EditsCommitted {
+                status: if pushed {
+                    format!("Committed {} file(s) and pushed to {branch}", paths.len())
+                } else {
+                    "No local changes to commit".into()
+                },
+            }
         }
         Job::Quit => unreachable!(),
     })

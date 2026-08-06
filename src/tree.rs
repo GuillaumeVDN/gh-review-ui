@@ -11,9 +11,16 @@ enum Node {
 
 /// Build the display rows (dirs before files, case-insensitive) for `files`.
 pub fn build_tree(files: &[FileEntry], collapsed: &HashSet<String>) -> Vec<TreeRow> {
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    build_tree_from_paths(&paths, collapsed)
+}
+
+/// Build the display rows for a bare list of paths; `TreeRow::File.index` refers
+/// to the position in `paths`. Shared by the Files and Pending-edits panes.
+pub fn build_tree_from_paths(paths: &[String], collapsed: &HashSet<String>) -> Vec<TreeRow> {
     let mut root = Node::Dir(HashMap::new());
-    for (i, f) in files.iter().enumerate() {
-        let parts: Vec<&str> = f.path.split('/').collect();
+    for (i, path) in paths.iter().enumerate() {
+        let parts: Vec<&str> = path.split('/').collect();
         let mut node = &mut root;
         for p in &parts[..parts.len() - 1] {
             let map = match node {
@@ -72,6 +79,15 @@ pub fn rebuild(st: &mut State) {
     st.tree = build_tree(&st.files, &st.collapsed_dirs);
     if st.file_idx >= st.tree.len() {
         st.file_idx = st.tree.len().saturating_sub(1);
+    }
+}
+
+/// Rebuild the Pending-edits tree from the current `edit_files`.
+pub fn rebuild_edits(st: &mut State) {
+    let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
+    st.edit_tree = build_tree_from_paths(&paths, &st.edit_collapsed);
+    if st.edit_idx >= st.edit_tree.len() {
+        st.edit_idx = st.edit_tree.len().saturating_sub(1);
     }
 }
 

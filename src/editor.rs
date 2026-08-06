@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 
 use crate::gh::sh;
-use crate::models::State;
+use crate::models::{State, TreeRow};
 use crate::navigation::{cur_file_path, current_hunk_editor_line};
 
 /// Fire-and-forget: open `abs_path` in the running nvim server at `line`.
@@ -79,6 +79,23 @@ fn editor_root(st: &State) -> String {
     } else {
         ".".to_string()
     }
+}
+
+/// Open the selected pending-edit file in the worktree (where the change lives,
+/// so further edits stay detectable and committable on the PR's safe branch).
+pub fn open_current_edit_in_editor(st: &mut State) {
+    let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
+        st.status = "No file selected.".into();
+        return;
+    };
+    let Some(entry) = st.edit_files.get(index).cloned() else { return };
+    if st.active_worktree.is_empty() {
+        st.status = "No worktree.".into();
+        return;
+    }
+    let abs = format!("{}/{}", st.active_worktree.trim_end_matches('/'), entry.path);
+    open_in_editor(&abs, 1);
+    st.status = format!("Opening {} in editor…", entry.path);
 }
 
 /// Open the selected file — at the top, or at the current hunk's line.

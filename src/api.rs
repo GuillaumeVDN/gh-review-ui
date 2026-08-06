@@ -135,7 +135,12 @@ pub fn load_diff(number: i64) -> Result<(Diff, Info)> {
 }
 
 pub fn load_diff_range(first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> {
-    let raw = sh(&["git", "diff", &format!("-U{DIFF_CONTEXT}"), &format!("{first_oid}^..{last_oid}")])?;
+    let raw = sh(&[
+        "git", "diff",
+        &format!("-U{DIFF_CONTEXT}"),
+        "--src-prefix=a/", "--dst-prefix=b/",
+        &format!("{first_oid}^..{last_oid}"),
+    ])?;
     Ok(parse_diff(&raw))
 }
 
@@ -226,6 +231,81 @@ pub fn open_pr_worktree(repo_root: &str, owner: &str, name: &str, number: i64) -
         sh(&["git", "-C", repo_root, "worktree", "add", "--force", "-B", &branch, &path_str, &sha])?;
     }
     Ok(path_str)
+}
+
+// ---- pending edits (local worktree changes) ----
+
+/// A unified diff of the worktree against its checked-out commit, including
+/// untracked files (shown as additions) and deletions. The index is left clean.
+///
+/// `add -N` makes untracked files visible to `git diff` without staging content;
+/// `reset -q` then drops those intent-to-add marks so a later commit stages
+/// exactly the paths we ask for.
+pub fn worktree_diff(wt: &str) -> String {
+    let _ = sh(&["git", "-C", wt, "add", "-N", "."]);
+    // Force standard a/ b/ prefixes; a user's diff.mnemonicPrefix / diff.noprefix
+    // would otherwise emit i/ w/ (or none), which the parser can't key on.
+    let raw = sh(&["git", "-C", wt, "diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap_or_default();
+    let _ = sh(&["git", "-C", wt, "reset", "-q"]);
+    raw
+}
+
+/// The changed files in `wt` (sorted, with kinds), their per-file diff, and the
+/// per-file line info (used to overlay local edits onto the PR diff).
+pub fn load_edits(wt: &str) -> (Vec<crate::models::EditEntry>, Diff, Info) {
+    let raw = worktree_diff(wt);
+    let edits = crate::diff::classify_edits(&raw);
+    let (diff, info) = parse_diff(&raw);
+    (edits, diff, info)
+}
+
+/// Revert a single file's local change: delete an untracked new file, else
+/// restore the tracked file (or a deletion) from the checked-out commit.
+pub fn discard_edit(wt: &str, path: &str, added: bool) -> Result<()> {
+    if added {
+        std::fs::remove_file(std::path::Path::new(wt).join(path)).ok();
+        sh(&["git", "-C", wt, "reset", "-q", "--", path]).ok();
+        Ok(())
+    } else {
+        sh(&["git", "-C", wt, "checkout", "--", path]).map(|_| ())
+    }
+}
+
+/// Stage exactly `paths`, commit with `message`, then push (non-force) to the
+/// PR head `branch` on `remote`. Returns `false` (no-op) when `paths` is empty.
+pub fn commit_edit_files(
+    wt: &str,
+    remote: &str,
+    branch: &str,
+    message: &str,
+    paths: &[String],
+) -> Result<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    if branch.is_empty() {
+        return Err(anyhow!("unknown PR head branch — cannot push"));
+    }
+    // Refuse to push unless the PR head branch already exists on this remote, so
+    // a non-force push updates the PR and never creates a stray branch (e.g. for
+    // a fork PR whose head lives on another remote). Checked before committing.
+    let remote_ref = sh(&["git", "-C", wt, "ls-remote", "--heads", remote, branch]).unwrap_or_default();
+    if remote_ref.trim().is_empty() {
+        return Err(anyhow!(
+            "branch '{branch}' not found on '{remote}' (fork PR?) — nothing committed or pushed"
+        ));
+    }
+    let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
+    for p in paths {
+        add_args.push(p.as_str());
+    }
+    sh(&add_args)?;
+    // Skip pre-commit / commit-msg / pre-push hooks — review fixups shouldn't be
+    // blocked by the project's local hooks.
+    sh(&["git", "-C", wt, "commit", "--no-verify", "-m", message])?;
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    sh(&["git", "-C", wt, "push", "--no-verify", remote, &refspec])?;
+    Ok(true)
 }
 
 // ---- viewed state ----

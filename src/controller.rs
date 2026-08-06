@@ -86,6 +86,16 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             if st.pr_idx >= st.prs.len() {
                 st.pr_idx = st.prs.len().saturating_sub(1);
             }
+            // Backfill the active PR's head branch (needed to push edits) when it
+            // was opened before the list — e.g. reopened from last session.
+            let head = st
+                .active_pr
+                .as_ref()
+                .filter(|a| a.head.is_empty())
+                .and_then(|a| st.prs.iter().find(|p| p.number == a.number).map(|p| p.head.clone()));
+            if let (Some(h), Some(a)) = (head, st.active_pr.as_mut()) {
+                a.head = h;
+            }
         }
         Msg::Active { number, pr_id, files, diff, info, pending, commits } => {
             st.busy.remove("active");
@@ -141,6 +151,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.file_idx = 0;
             st.file_offset = 0;
             tree::rebuild(st);
+            reload_edits(st, tx);
         }
         Msg::CommitDiff { diff, info } => {
             st.busy.remove("commitdiff");
@@ -205,6 +216,22 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.pending_idx = 0;
             st.busy.remove("review");
             st.status = format!("Review submitted ({event})");
+        }
+        Msg::Edits { files, diff, info } => {
+            st.busy.remove("edits");
+            st.edit_files = files;
+            st.edit_diff_by_file = diff;
+            st.edit_info_by_file = info;
+            st.edit_diff_scroll = 0;
+            tree::rebuild_edits(st);
+            if st.edit_idx >= st.edit_tree.len() {
+                st.edit_idx = st.edit_tree.len().saturating_sub(1);
+            }
+        }
+        Msg::EditsCommitted { status } => {
+            st.busy.remove("editcommit");
+            st.status = status;
+            reload_edits(st, tx); // now clean
         }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
@@ -537,4 +564,91 @@ pub fn fold_viewed(st: &mut State) {
         if folded == 1 { "" } else { "s" },
         if jumped.is_some() { " · jumped to next unviewed file" } else { " · no unviewed files" }
     );
+}
+
+// ---- pending edits (local worktree changes) ----
+
+/// Refresh the pending-edits list from the worktree (no-op without a worktree).
+pub fn reload_edits(st: &mut State, tx: &Sender<Job>) {
+    if st.active_worktree.is_empty() || st.busy.contains("edits") {
+        return;
+    }
+    let wt = st.active_worktree.clone();
+    submit(st, tx, Job::LoadEdits { wt });
+}
+
+/// Revert the selected file's local change.
+pub fn discard_edit(st: &mut State, tx: &Sender<Job>) {
+    if st.busy.contains("edits") {
+        return;
+    }
+    let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
+        return;
+    };
+    let Some(entry) = st.edit_files.get(index).cloned() else { return };
+    if st.active_worktree.is_empty() {
+        return;
+    }
+    let wt = st.active_worktree.clone();
+    let added = entry.kind == crate::models::EditKind::Added;
+    st.status = format!("Reverting local changes to {}…", entry.path);
+    submit(st, tx, Job::DiscardEdit { wt, path: entry.path, added });
+}
+
+/// Open the commit-message modal for the pending edits (if any).
+pub fn begin_commit_edits(st: &mut State) {
+    if st.active_worktree.is_empty() {
+        st.status = "No worktree — nothing to commit.".into();
+        return;
+    }
+    if st.edit_files.is_empty() {
+        st.status = "No local changes to commit.".into();
+        return;
+    }
+    let head = st.active_pr.as_ref().map_or("", |p| p.head.as_str());
+    if head.is_empty() {
+        st.status = "Unknown PR head branch — cannot commit/push.".into();
+        return;
+    }
+    st.overlay = Overlay::CommitMsg { ta: TextArea::new("") };
+}
+
+/// Commit + push the pending edits with the entered message.
+pub fn confirm_commit_edits(st: &mut State, tx: &Sender<Job>) {
+    let Overlay::CommitMsg { ta } = &st.overlay else { return };
+    let message = ta.text().trim().to_string();
+    if message.is_empty() {
+        st.status = "Commit message is empty.".into();
+        return;
+    }
+    let Some(pr) = st.active_pr.clone() else { return };
+    if pr.head.is_empty() || st.active_worktree.is_empty() || st.edit_files.is_empty() {
+        return;
+    }
+    let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
+    st.overlay = Overlay::None;
+    st.status = format!("Committing {} file(s) and pushing to {}…", paths.len(), pr.head);
+    submit(
+        st,
+        tx,
+        Job::CommitEdits {
+            wt: st.active_worktree.clone(),
+            repo_root: st.repo_root.clone(),
+            owner: st.repo_owner.clone(),
+            name: st.repo_name.clone(),
+            branch: pr.head,
+            message,
+            paths,
+        },
+    );
+}
+
+/// Collapse/expand a directory in the Pending-edits tree.
+pub fn toggle_collapse_edit(st: &mut State, path: &str) {
+    if st.edit_collapsed.contains(path) {
+        st.edit_collapsed.remove(path);
+    } else {
+        st.edit_collapsed.insert(path.to_string());
+    }
+    tree::rebuild_edits(st);
 }

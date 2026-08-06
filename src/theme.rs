@@ -64,6 +64,34 @@ pub fn comment_marker() -> Style {
     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
 }
 
+/// Inline pending-comment body shown under a diff line.
+pub fn comment_inline() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+// Local (uncommitted worktree) edits overlaid on the PR diff, in orange.
+const LOCAL: Color = Color::Indexed(208); // orange
+
+pub fn local_add() -> Style {
+    Style::default().fg(LOCAL)
+}
+pub fn local_del() -> Style {
+    Style::default().fg(LOCAL).add_modifier(Modifier::CROSSED_OUT)
+}
+pub fn local_marker() -> Style {
+    Style::default().fg(LOCAL).add_modifier(Modifier::BOLD)
+}
+
+/// Row style for a pending-edit entry, by change kind.
+pub fn edit_kind_style(kind: crate::models::EditKind) -> Style {
+    use crate::models::EditKind;
+    match kind {
+        EditKind::Added => Style::default().fg(Color::Green),
+        EditKind::Deleted => Style::default().fg(Color::Red),
+        EditKind::Modified => Style::default().fg(Color::Yellow),
+    }
+}
+
 // ---- pane styles ----
 
 pub fn selection() -> Style {
