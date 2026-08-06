@@ -1,10 +1,49 @@
 //! External-editor integration (open a file at a line in a running nvim).
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::gh::sh;
 use crate::models::{State, TreeRow};
 use crate::navigation::{cur_file_path, current_hunk_editor_line};
+
+fn cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    PathBuf::from(base).join("gh-review-ui")
+}
+
+/// Launch a new Ghostty window running an interactive `claude` seeded with
+/// `prompt`, in `cwd` (the PR worktree, so Claude can open the real files).
+///
+/// The prompt is written to a temp file and read back into claude's argument
+/// (`claude "$(cat file)"`) so a large multi-line diff survives intact without
+/// depending on env-var propagation; the file is removed once read.
+pub fn ask_claude(prompt: &str, cwd: &str) -> Result<(), String> {
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let file = dir.join(format!("ask-{ts}.txt"));
+    std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
+    let fp = file.display().to_string();
+    // Read the prompt, delete the temp file, then hand off to claude in
+    // auto-mode (skip permission prompts so it can read files freely).
+    let script =
+        format!("p=\"$(cat '{fp}')\"; rm -f '{fp}'; exec claude --dangerously-skip-permissions \"$p\"");
+    Command::new("ghostty")
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(script)
+        .current_dir(if cwd.is_empty() { "." } else { cwd })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
 
 /// Fire-and-forget: open `abs_path` in the running nvim server at `line`.
 /// Wired for an Omarchy/Hyprland + Neovim setup (nvim on `/tmp/nvim.sock`).

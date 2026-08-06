@@ -4,8 +4,9 @@ use std::sync::mpsc::Sender;
 
 use crate::api;
 use crate::diff::compute_hunks;
+use crate::editor;
 use crate::models::{
-    Category, FileEntry, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
+    Category, FileEntry, Focus, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
 };
 use crate::navigation::{
     cur_file_path, current_hunk_range, first_change_index, hunk_line_indices, line_target,
@@ -33,6 +34,33 @@ fn set_diff(
     st.comment_mode = false;
     st.comment_start = None;
     st.last_comment = None; // line indices don't survive a new diff
+}
+
+/// Check out a PR in a worktree: wipe the previous PR's panels (so they read
+/// "Loading…"), focus the Files pane, and kick off the open.
+pub fn begin_open_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
+    st.files.clear();
+    st.tree.clear();
+    st.file_idx = 0;
+    st.file_offset = 0;
+    st.commits.clear();
+    st.commit_selected.clear();
+    st.commit_idx = 0;
+    st.commit_offset = 0;
+    st.pending.clear();
+    st.pending_idx = 0;
+    st.pending_offset = 0;
+    st.edit_files.clear();
+    st.edit_tree.clear();
+    st.edit_diff_by_file.clear();
+    st.edit_info_by_file.clear();
+    st.edit_idx = 0;
+    st.edit_offset = 0;
+    set_diff(st, Default::default(), Default::default());
+    st.focus = Focus::Files;
+    st.status = format!("Opening #{} in a worktree…", pr.number);
+    let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
+    submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {
@@ -237,6 +265,63 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove(&kind);
             st.status = format!("[{kind}] {msg}");
         }
+    }
+}
+
+// ---- ask Claude about a hunk ----
+
+/// Open the "ask Claude" modal for the currently selected hunk.
+pub fn begin_ask(st: &mut State) {
+    if cur_file_path(st).is_none() {
+        st.status = "No file/hunk selected.".into();
+        return;
+    }
+    st.overlay = Overlay::Ask { ta: TextArea::new("") };
+}
+
+/// Build a prompt from the selected hunk + question and launch Claude in a new
+/// Ghostty window.
+pub fn confirm_ask(st: &mut State) {
+    let Overlay::Ask { ta } = &st.overlay else { return };
+    let question = ta.text().trim().to_string();
+    let path = cur_file_path(st);
+
+    // A few context lines of diff around the selected change block.
+    let mut snippet = String::new();
+    if let Some(p) = &path {
+        if let (Some(lines), Some((s, e))) = (st.diff_by_file.get(p), current_hunk_range(st, p)) {
+            let lo = s.saturating_sub(6);
+            let hi = (e + 6).min(lines.len());
+            for l in &lines[lo..hi] {
+                snippet.push_str(l);
+                snippet.push('\n');
+            }
+        }
+    }
+    st.overlay = Overlay::None;
+    if question.is_empty() {
+        st.status = "Ask cancelled (empty question).".into();
+        return;
+    }
+
+    let (num, title) = st
+        .active_pr
+        .as_ref()
+        .map(|p| (p.number, p.title.clone()))
+        .unwrap_or((0, String::new()));
+    let file = path.as_deref().unwrap_or("?");
+    let prompt = format!(
+        "I'm reviewing GitHub PR #{num} ({title}) and have a question about a change.\n\n\
+         File: {file}\n\
+         You're running in the PR's checked-out worktree, so you can open that file for full context.\n\n\
+         The relevant diff hunk:\n\
+         ```diff\n{snippet}```\n\n\
+         My question:\n{question}\n"
+    );
+    let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
+    match editor::ask_claude(&prompt, &cwd) {
+        Ok(()) => st.status = "Launched Claude in a new terminal…".into(),
+        Err(e) => st.status = format!("Failed to launch Claude: {e}"),
     }
 }
 
@@ -643,12 +728,3 @@ pub fn confirm_commit_edits(st: &mut State, tx: &Sender<Job>) {
     );
 }
 
-/// Collapse/expand a directory in the Pending-edits tree.
-pub fn toggle_collapse_edit(st: &mut State, path: &str) {
-    if st.edit_collapsed.contains(path) {
-        st.edit_collapsed.remove(path);
-    } else {
-        st.edit_collapsed.insert(path.to_string());
-    }
-    tree::rebuild_edits(st);
-}

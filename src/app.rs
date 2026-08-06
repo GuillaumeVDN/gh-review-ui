@@ -110,7 +110,8 @@ fn overlay_ta(st: &mut State) -> Option<&mut TextArea> {
         Overlay::Comment { ta, .. }
         | Overlay::Edit { ta, .. }
         | Overlay::Review { ta, .. }
-        | Overlay::CommitMsg { ta } => Some(ta),
+        | Overlay::CommitMsg { ta }
+        | Overlay::Ask { ta } => Some(ta),
         Overlay::None => None,
     }
 }
@@ -189,9 +190,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Enter => {
                 if !st.prs.is_empty() && !st.busy.contains("worktree") && !st.busy.contains("active") {
                     let pr = st.prs[st.pr_idx].clone();
-                    st.status = format!("Opening #{} in a worktree…", pr.number);
-                    let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
-                    controller::submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
+                    controller::begin_open_pr(st, tx, pr);
                 }
             }
             _ => {}
@@ -207,10 +206,11 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Pending => match k.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                st.pending_idx = (st.pending_idx + 1).min(st.pending.len().saturating_sub(1));
-            }
-            KeyCode::Up | KeyCode::Char('k') => st.pending_idx = st.pending_idx.saturating_sub(1),
+            KeyCode::Char('j') if alt => pending_jump_file(st, 1),
+            KeyCode::Char('k') if alt => pending_jump_file(st, -1),
+            KeyCode::Down | KeyCode::Char('j') => pending_move(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => pending_move(st, -1),
+            KeyCode::Char('z') => pending_jump_file(st, 1),
             KeyCode::Enter => controller::begin_review(st),
             KeyCode::Char('e') => {
                 if !st.busy.contains("pending") {
@@ -246,6 +246,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Edits => match k.code {
+            KeyCode::Char('j') if alt => jump_edit_file(st, 1),
+            KeyCode::Char('k') if alt => jump_edit_file(st, -1),
             KeyCode::Down | KeyCode::Char('j') => set_edit_idx(st, st.edit_idx + 1),
             KeyCode::Up | KeyCode::Char('k') => set_edit_idx(st, st.edit_idx.saturating_sub(1)),
             KeyCode::Char('g') => {
@@ -257,15 +259,11 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('G') => set_edit_idx(st, st.edit_tree.len().saturating_sub(1)),
+            KeyCode::Char('z') => jump_edit_file(st, 1),
             KeyCode::PageDown => st.edit_diff_scroll += page,
             KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
             KeyCode::Enter => controller::begin_commit_edits(st),
             KeyCode::Char('d') => controller::discard_edit(st, tx),
-            KeyCode::Char('z') => {
-                if let Some(TreeRow::Dir { path, .. }) = st.edit_tree.get(st.edit_idx).cloned() {
-                    controller::toggle_collapse_edit(st, &path);
-                }
-            }
             KeyCode::Char('Z') => {
                 st.edit_collapsed.clear();
                 crate::tree::rebuild_edits(st);
@@ -280,6 +278,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Char('c') => controller::enter_comment_mode(st),
+            KeyCode::Char('a') => controller::begin_ask(st),
             KeyCode::Char('e') => editor::open_current_in_editor(st, false),
             KeyCode::Esc => st.focus = Focus::Files,
             _ => {}
@@ -359,6 +358,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                     Overlay::Comment { .. } => controller::confirm_comment(st, tx),
                     Overlay::Edit { .. } => controller::confirm_edit(st, tx),
                     Overlay::CommitMsg { .. } => controller::confirm_commit_edits(st, tx),
+                    Overlay::Ask { .. } => controller::confirm_ask(st),
                     Overlay::Review { .. } => {
                         if let Overlay::Review { editing, .. } = &mut st.overlay {
                             *editing = false;
@@ -475,6 +475,64 @@ fn jump_file(st: &mut State, direction: i64) {
     }
 }
 
+/// Move to the next/previous file row in the Pending-edits tree (skipping dirs).
+fn jump_edit_file(st: &mut State, direction: i64) {
+    let mut i = st.edit_idx as i64 + direction;
+    while i >= 0 && (i as usize) < st.edit_tree.len() {
+        if matches!(st.edit_tree[i as usize], TreeRow::File { .. }) {
+            set_edit_idx(st, i as usize);
+            return;
+        }
+        i += direction;
+    }
+}
+
+/// Move the pending-comment selection by one, in display (tree) order.
+fn pending_move(st: &mut State, direction: i64) {
+    let order = nav::pending_order(st);
+    if order.is_empty() {
+        return;
+    }
+    let pos = order.iter().position(|&i| i == st.pending_idx).unwrap_or(0);
+    let np = (pos as i64 + direction).clamp(0, order.len() as i64 - 1) as usize;
+    st.pending_idx = order[np];
+}
+
+/// Jump the pending-comment selection to the first comment of the next/previous
+/// file group.
+fn pending_jump_file(st: &mut State, direction: i64) {
+    let order = nav::pending_order(st);
+    if order.is_empty() {
+        return;
+    }
+    let pos = order.iter().position(|&i| i == st.pending_idx).unwrap_or(0);
+    let cur = st.pending[order[pos]].path.clone();
+    if direction > 0 {
+        for j in pos + 1..order.len() {
+            if st.pending[order[j]].path != cur {
+                st.pending_idx = order[j];
+                return;
+            }
+        }
+    } else {
+        // Back up to the start of the current group, then to the start of the one before.
+        let mut start = pos;
+        while start > 0 && st.pending[order[start - 1]].path == cur {
+            start -= 1;
+        }
+        if start == 0 {
+            st.pending_idx = order[0];
+            return;
+        }
+        let prev = st.pending[order[start - 1]].path.clone();
+        let mut ps = start - 1;
+        while ps > 0 && st.pending[order[ps - 1]].path == prev {
+            ps -= 1;
+        }
+        st.pending_idx = order[ps];
+    }
+}
+
 fn open_file_or_dir(st: &mut State) {
     match st.tree.get(st.file_idx).cloned() {
         Some(TreeRow::File { .. }) => {
@@ -505,7 +563,7 @@ fn discard_pending(st: &mut State, tx: &mpsc::Sender<Job>) {
 }
 
 fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
-    let (rects, _, _) = ui::compute_layout(area);
+    let (rects, _, _) = ui::compute_layout(area, st.focus);
     let (col, row) = (m.column, m.row);
     let hit = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
     let pane = if hit(rects.prs) {

@@ -6,6 +6,27 @@
 
 use crate::models::{PendingComment, Range, State, TreeRow};
 
+/// Pending-comment indices in the Pending pane's display (tree) order: grouped
+/// by file, files in the same order as the rendered tree.
+pub fn pending_order(st: &State) -> Vec<usize> {
+    let mut paths: Vec<String> = st.pending.iter().map(|c| c.path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    let tree = crate::tree::build_tree_from_paths(&paths, &std::collections::HashSet::new());
+    let mut order = Vec::new();
+    for row in tree {
+        if let TreeRow::File { index, .. } = row {
+            let path = &paths[index];
+            for (ci, c) in st.pending.iter().enumerate() {
+                if &c.path == path {
+                    order.push(ci);
+                }
+            }
+        }
+    }
+    order
+}
+
 pub fn cur_file_path(st: &State) -> Option<String> {
     match st.tree.get(st.file_idx) {
         Some(TreeRow::File { index, .. }) => Some(st.files[*index].path.clone()),

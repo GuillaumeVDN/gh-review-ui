@@ -25,26 +25,28 @@ pub struct PaneRects {
     pub body: Rect,
 }
 
-pub fn compute_layout(area: Rect) -> (PaneRects, Rect, Rect) {
+pub fn compute_layout(area: Rect, focus: Focus) -> (PaneRects, Rect, Rect) {
     let root = Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     let (body, status, help) = (root[0], root[1], root[2]);
     let left_w = (area.width / 3).max(38).min(area.width.saturating_sub(20));
     let cols = Layout::horizontal([Constraint::Length(left_w), Constraint::Min(0)]).split(body);
     let (left, right) = (cols[0], cols[1]);
-    let bh = body.height;
-    let pr_h = (bh * 2 / 9).max(6);
-    let commits_h = (bh / 6).max(4);
-    let edits_h = (bh / 8).max(3);
-    let pending_h = (bh / 8).max(3);
-    let rows = Layout::vertical([
-        Constraint::Length(pr_h),
-        Constraint::Length(commits_h),
-        Constraint::Min(3),
-        Constraint::Length(edits_h),
-        Constraint::Length(pending_h),
-    ])
-    .split(left);
+    // The focused left pane (or Files while viewing the diff) expands to fill the
+    // column; the others shrink to a compact height. Left-pane order: PRs,
+    // Commits, Files, Edits, Pending.
+    let expanded = match focus {
+        Focus::Prs => 0,
+        Focus::Commits => 1,
+        Focus::Files | Focus::Diff => 2,
+        Focus::Edits => 3,
+        Focus::Pending => 4,
+    };
+    let small = [6u16, 5, 5, 4, 4];
+    let constraints: Vec<Constraint> = (0..5)
+        .map(|i| if i == expanded { Constraint::Min(3) } else { Constraint::Length(small[i]) })
+        .collect();
+    let rows = Layout::vertical(constraints).split(left);
     (
         PaneRects {
             prs: rows[0],
@@ -88,6 +90,12 @@ pub fn reveal_scroll(scroll: usize, lo: usize, hi: usize, vh: usize) -> usize {
     scroll
 }
 
+/// True while a PR checkout is in flight (worktree fetch + active load), so the
+/// panes read "Loading…" instead of stale/empty content.
+fn is_loading(st: &State) -> bool {
+    st.busy.contains("worktree") || st.busy.contains("active")
+}
+
 fn block(title: &str, focused: bool, busy: bool) -> Block<'static> {
     let bs = if focused { theme::border_focused() } else { theme::border_dim() };
     let ts = if focused { theme::border_focused() } else { theme::title() };
@@ -129,6 +137,70 @@ fn render_rows(f: &mut Frame, inner: Rect, rows: &[(String, Style)], sel_idx: us
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Word-wrap `body` to `width`, prefixing the first line with `prefix` and each
+/// continuation line with a hanging indent the width of `prefix` (so wrapped
+/// text lines up under the title). Over-long words are hard-split.
+fn wrap_indented(prefix: &str, body: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let plen = prefix.chars().count();
+    let avail = width.saturating_sub(plen).max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let cur_len = |s: &str| s.chars().count();
+    for word in body.split(' ') {
+        if cur_len(word) > avail {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            for chunk in chars.chunks(avail) {
+                lines.push(chunk.iter().collect());
+            }
+            cur = lines.pop().unwrap_or_default(); // keep the tail to append onto
+            continue;
+        }
+        let would = if cur.is_empty() { cur_len(word) } else { cur_len(&cur) + 1 + cur_len(word) };
+        if would > avail && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    let indent = " ".repeat(plen);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("{prefix}{l}") } else { format!("{indent}{l}") })
+        .collect()
+}
+
+/// Render a list whose rows may span several display lines. `rows` is the full
+/// flattened set of display lines; `sel_line` is the display-line index to keep
+/// visible. Each row is `(marker, marker_style, text, text_style)`.
+fn render_line_list(
+    f: &mut Frame,
+    inner: Rect,
+    rows: &[(&'static str, Style, String, Style)],
+    sel_line: usize,
+    offset: &mut usize,
+) {
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    *offset = clamp_view(sel_line, *offset, vh, rows.len());
+    let mut out = Vec::new();
+    for (marker, mstyle, text, tstyle) in rows.iter().skip(*offset).take(vh) {
+        out.push(Line::from(vec![
+            Span::styled(*marker, *mstyle),
+            Span::styled(pad(text, iw.saturating_sub(1)), *tstyle),
+        ]));
+    }
+    f.render_widget(Paragraph::new(out), inner);
+}
+
 /// A list row with a colored left-bar "pastille" when selected (no full-row
 /// highlight — lazygit-style), otherwise the item's base style.
 fn list_row(selected: bool, text: &str, base: Style, iw: usize) -> Line<'static> {
@@ -162,7 +234,7 @@ pub fn pr_rows(st: &State) -> Vec<(bool, String, usize)> {
 }
 
 pub fn render(f: &mut Frame, st: &mut State) {
-    let (rects, status_area, help_area) = compute_layout(f.area());
+    let (rects, status_area, help_area) = compute_layout(f.area(), st.focus);
     render_prs(f, st, rects.prs);
     render_commits(f, st, rects.commits);
     render_files(f, st, rects.files);
@@ -188,36 +260,50 @@ fn shortcuts_for(st: &State) -> String {
     match st.focus {
         Focus::Prs => format!("Enter: open (worktree) · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
-        Focus::Pending => format!("Enter: submit review · e: edit · d: delete · {common}"),
+        Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
-        Focus::Edits => format!("Enter: commit+push · e: editor · d: revert · Z: unfold · gg/G · {common}"),
-        Focus::Diff => format!("j/k: block · c: comment · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Edits => format!("Enter: commit+push · e: editor · d: revert · Alt+j/k/z: next file · gg/G · {common}"),
+        Focus::Diff => format!("j/k: block · c: comment · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
 
 fn render_prs(f: &mut Frame, st: &mut State, area: Rect) {
     let title = format!("[1] PRs [{}/{}]", st.repo_owner, st.repo_name);
-    let b = block(&title, st.focus == Focus::Prs, st.busy.contains("prs"));
+    let focused = st.focus == Focus::Prs;
+    let b = block(&title, focused, st.busy.contains("prs"));
     let inner = b.inner(area);
     f.render_widget(b, area);
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
-    let rows = pr_rows(st);
-    let sel_row = rows.iter().position(|(h, _, i)| !h && *i == st.pr_idx).unwrap_or(0);
-    st.pr_offset = clamp_view(sel_row, st.pr_offset, vh, rows.len());
-    let mut lines = Vec::new();
-    for (is_hdr, text, idx) in rows.iter().skip(st.pr_offset).take(vh) {
-        if *is_hdr {
-            lines.push(Line::styled(pad(text, iw), theme::section_header()));
+    let iw = inner.width as usize;
+    let tw = iw.saturating_sub(1);
+
+    let mut rows: Vec<(&'static str, Style, String, Style)> = Vec::new();
+    let mut sel_line = 0;
+    for (is_hdr, text, idx) in pr_rows(st) {
+        if is_hdr {
+            rows.push((" ", theme::section_header(), text, theme::section_header()));
             continue;
         }
-        let pr = &st.prs[*idx];
+        let pr = &st.prs[idx];
         let active = st.active_pr.as_ref().map_or(false, |a| a.number == pr.number);
-        let text = format!("{}#{} {}", if active { "● " } else { "  " }, pr.number, pr.title);
-        let base = if active { theme::active_pr() } else { Style::default() };
-        let selected = *idx == st.pr_idx && st.focus == Focus::Prs;
-        lines.push(list_row(selected, &text, base, iw));
+        let selected = idx == st.pr_idx && focused;
+        let prefix = format!("{}#{} ", if active { "● " } else { "  " }, pr.number);
+        let mut base = if active { theme::active_pr() } else { Style::default() };
+        if selected {
+            base = base.add_modifier(Modifier::BOLD);
+        }
+        for (li, line) in wrap_indented(&prefix, &pr.title, tw).into_iter().enumerate() {
+            let first = li == 0;
+            if selected && first {
+                sel_line = rows.len();
+            }
+            let marker = if selected && first { "▌" } else { " " };
+            rows.push((marker, theme::sel_marker(), line, base));
+        }
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    if !focused {
+        sel_line = st.pr_offset;
+    }
+    render_line_list(f, inner, &rows, sel_line, &mut st.pr_offset);
 }
 
 fn render_commits(f: &mut Frame, st: &mut State, area: Rect) {
@@ -227,24 +313,39 @@ fn render_commits(f: &mut Frame, st: &mut State, area: Rect) {
         format!("[2] Commits ({}/{})", st.commit_selected.len(), st.commits.len())
     };
     let busy = st.busy.contains("active") || st.busy.contains("commitdiff");
-    let b = block(&title, st.focus == Focus::Commits, busy);
+    let focused = st.focus == Focus::Commits;
+    let b = block(&title, focused, busy);
     let inner = b.inner(area);
     f.render_widget(b, area);
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    let tw = (inner.width as usize).saturating_sub(1);
     if st.commits.is_empty() {
-        f.render_widget(Paragraph::new(Line::styled("No commits", theme::dim())), inner);
+        let msg = if is_loading(st) { "Loading…" } else { "No commits" };
+        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
         return;
     }
-    st.commit_offset = clamp_view(st.commit_idx, st.commit_offset, vh, st.commits.len());
-    let mut lines = Vec::new();
-    for (i, c) in st.commits.iter().enumerate().skip(st.commit_offset).take(vh) {
+    let mut rows: Vec<(&'static str, Style, String, Style)> = Vec::new();
+    let mut sel_line = 0;
+    for (i, c) in st.commits.iter().enumerate() {
         let checked = st.commit_selected.contains(&c.oid);
-        let text = format!("[{}] {} {}", if checked { "x" } else { " " }, c.short(), c.headline);
-        let base = if checked { Style::default() } else { theme::dim() };
-        let selected = i == st.commit_idx && st.focus == Focus::Commits;
-        lines.push(list_row(selected, &text, base, iw));
+        let selected = i == st.commit_idx && focused;
+        let prefix = format!("[{}] {} ", if checked { "x" } else { " " }, c.short());
+        let mut base = if checked { Style::default() } else { theme::dim() };
+        if selected {
+            base = base.add_modifier(Modifier::BOLD);
+        }
+        for (li, line) in wrap_indented(&prefix, &c.headline, tw).into_iter().enumerate() {
+            let first = li == 0;
+            if selected && first {
+                sel_line = rows.len();
+            }
+            let marker = if selected && first { "▌" } else { " " };
+            rows.push((marker, theme::sel_marker(), line, base));
+        }
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    if !focused {
+        sel_line = st.commit_offset;
+    }
+    render_line_list(f, inner, &rows, sel_line, &mut st.commit_offset);
 }
 
 fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
@@ -258,6 +359,11 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
     let inner = b.inner(area);
     f.render_widget(b, area);
     let focused = st.focus == Focus::Files;
+    if st.tree.is_empty() {
+        let msg = if is_loading(st) { "Loading…" } else { "No files" };
+        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
+        return;
+    }
     let rows: Vec<(String, Style)> = st
         .tree
         .iter()
@@ -289,7 +395,8 @@ fn render_edits(f: &mut Frame, st: &mut State, area: Rect) {
     let inner = b.inner(area);
     f.render_widget(b, area);
     if st.edit_files.is_empty() {
-        f.render_widget(Paragraph::new(Line::styled("No local changes", theme::dim())), inner);
+        let msg = if is_loading(st) || st.busy.contains("edits") { "Loading…" } else { "No local changes" };
+        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
         return;
     }
     let focused = st.focus == Focus::Edits;
@@ -323,18 +430,58 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
     let b = block(&title, st.focus == Focus::Pending, busy);
     let inner = b.inner(area);
     f.render_widget(b, area);
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    let focused = st.focus == Focus::Pending;
     if st.pending.is_empty() {
-        f.render_widget(Paragraph::new(Line::styled("No pending comments", theme::dim())), inner);
+        let msg = if is_loading(st) { "Loading…" } else { "No pending comments" };
+        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
         return;
     }
-    st.pending_offset = clamp_view(st.pending_idx, st.pending_offset, vh, st.pending.len());
+    // Group comments into a file tree; each file's comments hang under it.
+    let mut paths: Vec<String> = st.pending.iter().map(|c| c.path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    let tree = crate::tree::build_tree_from_paths(&paths, &HashSet::new());
+    // rows: (text, style, Some(comment_idx) for selectable leaves)
+    let mut rows: Vec<(String, Style, Option<usize>)> = Vec::new();
+    for row in &tree {
+        match row {
+            TreeRow::Dir { depth, name, .. } => rows.push((
+                format!("{}{}/", "  ".repeat(*depth), name),
+                Style::default().add_modifier(Modifier::BOLD),
+                None,
+            )),
+            TreeRow::File { depth, name, index } => {
+                rows.push((
+                    format!("{}{}", "  ".repeat(*depth), name),
+                    theme::title(),
+                    None,
+                ));
+                let path = &paths[*index];
+                for (ci, c) in st.pending.iter().enumerate() {
+                    if &c.path != path {
+                        continue;
+                    }
+                    let first = c.body.lines().next().unwrap_or("");
+                    rows.push((
+                        format!("{}{}: {first}", "  ".repeat(depth + 1), c.line),
+                        Style::default(),
+                        Some(ci),
+                    ));
+                }
+            }
+        }
+    }
+    let sel_row = if focused {
+        rows.iter().position(|(_, _, ci)| *ci == Some(st.pending_idx)).unwrap_or(0)
+    } else {
+        st.pending_offset
+    };
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    st.pending_offset = clamp_view(sel_row, st.pending_offset, vh, rows.len());
     let mut lines = Vec::new();
-    for (i, c) in st.pending.iter().enumerate().skip(st.pending_offset).take(vh) {
-        let first = c.body.lines().next().unwrap_or("");
-        let text = format!("{}:{}  {}", c.path, c.line, first);
-        let selected = i == st.pending_idx && st.focus == Focus::Pending;
-        lines.push(list_row(selected, &text, Style::default(), iw));
+    for (text, style, ci) in rows.iter().skip(st.pending_offset).take(vh) {
+        let selected = focused && ci.is_some() && *ci == Some(st.pending_idx);
+        lines.push(list_row(selected, text, *style, iw));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -350,6 +497,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let inner = b.inner(area);
     f.render_widget(b, area);
     let (vh, iw) = (inner.height as usize, inner.width as usize);
+
+    if is_loading(st) && st.diff_by_file.is_empty() {
+        f.render_widget(Paragraph::new(Line::styled("Loading…", theme::dim())), inner);
+        return;
+    }
 
     let empty = Vec::new();
     let lines_vec = path.as_ref().and_then(|p| st.diff_by_file.get(p)).unwrap_or(&empty);
@@ -689,6 +841,10 @@ fn render_overlay(f: &mut Frame, st: &State) {
                 &format!("Commit {n} file(s) → push to {branch}"),
                 "Enter: commit + push · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
         }
+        Overlay::Ask { ta } => {
+            draw_modal_editor(f, area, ta, "Ask Claude about this hunk",
+                "Enter: launch Claude · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+        }
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));
             let title = format!("Finish review · {} pending comment{}", st.pending.len(), if st.pending.len() == 1 { "" } else { "s" });
@@ -746,6 +902,26 @@ mod tests {
         assert_eq!(clamp_view(20, 0, 10, 100), 11);
         assert_eq!(clamp_view(3, 0, 10, 100), 0);
         assert_eq!(clamp_view(0, 0, 10, 0), 0);
+    }
+
+    #[test]
+    fn wrap_indented_hangs_continuation() {
+        let out = wrap_indented("● #42 ", "alpha beta gamma delta", 14);
+        // First line carries the prefix; continuations align under the title.
+        assert_eq!(out[0], "● #42 alpha");
+        assert!(out.len() >= 2);
+        for l in &out[1..] {
+            assert!(l.starts_with("      "), "continuation should be indented: {l:?}");
+        }
+        // Nothing exceeds the width.
+        assert!(out.iter().all(|l| l.chars().count() <= 14));
+    }
+
+    #[test]
+    fn wrap_indented_hard_splits_long_word() {
+        let out = wrap_indented("x ", "supercalifragilistic", 8);
+        assert!(out.iter().all(|l| l.chars().count() <= 8));
+        assert_eq!(out[0], "x superc");
     }
 
     #[test]

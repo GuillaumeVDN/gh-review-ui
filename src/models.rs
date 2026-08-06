@@ -153,6 +153,8 @@ pub enum Overlay {
     Review { ta: TextArea, editing: bool, choice: usize },
     /// Commit message for the pending worktree edits (commit + push).
     CommitMsg { ta: TextArea },
+    /// Free-text question to launch a Claude session about the selected hunk.
+    Ask { ta: TextArea },
 }
 
 #[derive(Default)]
