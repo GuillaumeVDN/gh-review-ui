@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::diff::parse_diff;
-use crate::gh::{gh_graphql, gh_json, sh, Var};
+use crate::gh::{gh_graphql, gh_json, sh, sh_cwd, Var};
 use crate::models::{Category, Commit, FileEntry, LineInfo, Pr, PendingComment};
 
 /// Lines of context around each hunk (git's default is 3).
@@ -316,6 +316,24 @@ pub fn commit_edit_files(
     let refspec = format!("HEAD:refs/heads/{branch}");
     sh(&["git", "-C", wt, "push", "--no-verify", remote, &refspec])?;
     Ok(true)
+}
+
+/// Check out PR `number` into the local dev checkout `dir` (e.g. ~/Projects/<repo>),
+/// but only if its working tree is clean. Uses `gh pr checkout` so the branch is
+/// created/updated to the PR head.
+pub fn checkout_pr_local(dir: &str, owner: &str, name: &str, number: i64) -> Result<String> {
+    if !std::path::Path::new(dir).is_dir() {
+        return Err(anyhow!("{dir} does not exist"));
+    }
+    sh_cwd(dir, &["git", "rev-parse", "--is-inside-work-tree"])
+        .map_err(|_| anyhow!("{dir} is not a git repository"))?;
+    let status = sh_cwd(dir, &["git", "status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        return Err(anyhow!("{dir}: working tree not clean — commit or stash first"));
+    }
+    let repo = format!("{owner}/{name}");
+    sh_cwd(dir, &["gh", "-R", &repo, "pr", "checkout", &number.to_string()])?;
+    Ok(format!("Checked out #{number} in {dir}"))
 }
 
 // ---- viewed state ----

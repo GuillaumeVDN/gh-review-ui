@@ -67,6 +67,17 @@ pub fn open_in_editor(abs_path: &str, line: i64) {
         .spawn();
 }
 
+/// Open a PR in the default web browser (fire-and-forget).
+pub fn open_pr_in_browser(owner: &str, name: &str, number: i64) {
+    let repo = format!("{owner}/{name}");
+    let _ = Command::new("gh")
+        .args(["-R", &repo, "pr", "view", &number.to_string(), "--web"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn spawn_bash(script: &str, cwd: &str) {
     let mut c = Command::new("/usr/bin/bash");
     c.arg("-c").arg(script);

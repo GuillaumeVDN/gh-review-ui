@@ -242,6 +242,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                     controller::begin_open_pr(st, tx, pr);
                 }
             }
+            KeyCode::Char('C') => checkout_local(st, tx),
+            KeyCode::Char('o') => open_pr_browser(st),
             _ => {}
         },
         Focus::Commits => match k.code {
@@ -598,6 +600,30 @@ fn open_file_or_dir(st: &mut State) {
         Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
         None => {}
     }
+}
+
+fn open_pr_browser(st: &mut State) {
+    if st.prs.is_empty() {
+        return;
+    }
+    let number = st.prs[st.pr_idx].number;
+    editor::open_pr_in_browser(&st.repo_owner, &st.repo_name, number);
+    st.status = format!("Opening #{number} in browser…");
+}
+
+fn checkout_local(st: &mut State, tx: &mpsc::Sender<Job>) {
+    if st.prs.is_empty() || st.busy.contains("checkout") {
+        return;
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        st.status = "HOME not set.".into();
+        return;
+    };
+    let number = st.prs[st.pr_idx].number;
+    let (owner, name) = (st.repo_owner.clone(), st.repo_name.clone());
+    let dir = format!("{home}/Projects/{name}");
+    st.status = format!("Checking out #{number} in {dir}…");
+    controller::submit(st, tx, Job::CheckoutLocal { dir, owner, name, number });
 }
 
 fn discard_pending(st: &mut State, tx: &mpsc::Sender<Job>) {

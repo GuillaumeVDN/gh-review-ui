@@ -263,6 +263,10 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.status = status;
             reload_edits(st, tx); // now clean
         }
+        Msg::Done { kind, msg } => {
+            st.busy.remove(&kind);
+            st.status = msg;
+        }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
             st.status = format!("[{kind}] {msg}");

@@ -37,6 +37,7 @@ pub enum Job {
         message: String,
         paths: Vec<String>,
     },
+    CheckoutLocal { dir: String, owner: String, name: String, number: i64 },
     Quit,
 }
 
@@ -60,6 +61,8 @@ pub enum Msg {
     ReviewSubmitted(String),
     Edits { files: Vec<EditEntry>, diff: Diff, info: Info },
     EditsCommitted { status: String },
+    /// Generic "job done" notice: clears `kind` from busy and shows `msg`.
+    Done { kind: String, msg: String },
     Error { kind: String, msg: String },
 }
 
@@ -76,6 +79,7 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::SubmitReview { .. } => "review",
         Job::LoadEdits { .. } | Job::DiscardEdit { .. } => "edits",
         Job::CommitEdits { .. } => "editcommit",
+        Job::CheckoutLocal { .. } => "checkout",
         Job::Quit => "",
     }
 }
@@ -166,6 +170,10 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
                     "No local changes to commit".into()
                 },
             }
+        }
+        Job::CheckoutLocal { dir, owner, name, number } => {
+            let msg = api::checkout_pr_local(dir, owner, name, *number)?;
+            Msg::Done { kind: "checkout".into(), msg }
         }
         Job::Quit => unreachable!(),
     })

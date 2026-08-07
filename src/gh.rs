@@ -30,7 +30,17 @@ impl From<i64> for Var {
 
 /// Run a command, returning stdout; error on non-zero exit.
 pub fn sh(args: &[&str]) -> Result<String> {
-    let out = Command::new(args[0]).args(&args[1..]).output()?;
+    sh_cwd("", args)
+}
+
+/// Like [`sh`], but run the command in `dir` (empty = inherit the cwd).
+pub fn sh_cwd(dir: &str, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new(args[0]);
+    cmd.args(&args[1..]);
+    if !dir.is_empty() {
+        cmd.current_dir(dir);
+    }
+    let out = cmd.output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr });
         let msg: String = err.trim().replace('\n', " | ").chars().take(400).collect();
