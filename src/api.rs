@@ -252,7 +252,16 @@ pub fn open_pr_worktree(repo_root: &str, owner: &str, name: &str, number: i64) -
 /// `reset -q` then drops those intent-to-add marks so a later commit stages
 /// exactly the paths we ask for.
 pub fn worktree_diff(wt: &str) -> String {
-    let _ = sh(&["git", "-C", wt, "add", "-N", "."]);
+    // Intent-to-add only the *untracked* files so they show in `git diff` as
+    // additions. A blanket `add -N .` would also stage tracked deletions, which
+    // then vanish from the unstaged diff (so they'd go undetected).
+    let untracked = sh(&["git", "-C", wt, "ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+    let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
+    if !files.is_empty() {
+        let mut args: Vec<&str> = vec!["git", "-C", wt, "add", "-N", "--"];
+        args.extend_from_slice(&files);
+        let _ = sh(&args);
+    }
     // Force standard a/ b/ prefixes; a user's diff.mnemonicPrefix / diff.noprefix
     // would otherwise emit i/ w/ (or none), which the parser can't key on.
     let raw = sh(&["git", "-C", wt, "diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap_or_default();
