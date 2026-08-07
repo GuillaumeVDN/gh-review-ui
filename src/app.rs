@@ -61,6 +61,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
     let mut prev_pr = usize::MAX;
     let mut prev_focus: Option<Focus> = None;
+    let mut graceful = false;
     loop {
         while let Ok(msg) = msg_rx.try_recv() {
             controller::apply_msg(&mut st, msg, &job_tx);
@@ -78,24 +79,72 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         prev_pr = st.pr_idx;
         prev_focus = Some(st.focus);
 
-        terminal.draw(|f| ui::render(f, &mut st))?;
+        // Detect a closed per-worktree editor; ungroup once the last one is gone.
+        poll_worktree_editors(&mut st);
+
+        // A draw/read error means the terminal went away (window closed) — leave
+        // the loop so cleanup still runs.
+        if terminal.draw(|f| ui::render(f, &mut st)).is_err() {
+            break;
+        }
         if st.should_quit {
+            graceful = true;
             break;
         }
 
-        if event::poll(Duration::from_millis(80))? {
-            let area = size_rect(terminal);
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(&mut st, &job_tx, k, area),
-                Event::Mouse(m) => handle_mouse(&mut st, m, area),
+        let area = size_rect(terminal);
+        match event::poll(Duration::from_millis(80)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => handle_key(&mut st, &job_tx, k, area),
+                Ok(Event::Mouse(m)) => handle_mouse(&mut st, m, area),
                 // Returning to the TUI window re-scans the worktree for edits.
-                Event::FocusGained => controller::reload_edits(&mut st, &job_tx),
-                _ => {}
-            }
+                Ok(Event::FocusGained) => controller::reload_edits(&mut st, &job_tx),
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            Ok(false) => {}
+            Err(_) => break,
         }
     }
+    cleanup_editors(&mut st, graceful);
     let _ = job_tx.send(Job::Quit);
     Ok(())
+}
+
+/// Remove closed per-worktree editors from tracking; when the last one is gone,
+/// dissolve the group we created.
+fn poll_worktree_editors(st: &mut State) {
+    if st.worktree_editors.is_empty() {
+        return;
+    }
+    let mut closed = Vec::new();
+    for (sock, seen_alive) in st.worktree_editors.iter_mut() {
+        if editor::socket_exists(sock) {
+            *seen_alive = true; // it has come up
+        } else if *seen_alive {
+            closed.push(sock.clone()); // was up, now gone
+        }
+    }
+    for sock in &closed {
+        st.worktree_editors.remove(sock);
+    }
+    if !closed.is_empty() && st.worktree_editors.is_empty() && st.entered_group {
+        editor::ungroup_active();
+        st.entered_group = false;
+    }
+}
+
+/// On exit: close the Neovim windows we launched, and (on a clean quit, while the
+/// TUI window is still focused) leave the Hyprland group.
+fn cleanup_editors(st: &mut State, graceful: bool) {
+    if graceful && st.entered_group {
+        editor::ungroup_active();
+        st.entered_group = false;
+    }
+    for sock in st.worktree_editors.keys() {
+        editor::close_worktree_editor(sock);
+    }
+    st.worktree_editors.clear();
 }
 
 fn size_rect(terminal: &ratatui::DefaultTerminal) -> Rect {
@@ -298,8 +347,8 @@ fn handle_comment_mode(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
         KeyCode::Char('J') => controller::move_comment(st, 1, true),
         KeyCode::Char('K') => controller::move_comment(st, -1, true),
         KeyCode::Enter => {
-            controller::begin_comment(st);
-            let _ = tx; // begin_comment only opens the overlay
+            controller::begin_comment_or_edit(st);
+            let _ = tx; // only opens an overlay
         }
         _ => {}
     }
@@ -383,6 +432,11 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
             }
         }
         KeyCode::Char('s') if ctrl => controller::insert_suggestion(st),
+        KeyCode::Char('d') if ctrl => {
+            if matches!(st.overlay, Overlay::Edit { .. }) {
+                controller::delete_editing_comment(st, tx);
+            }
+        }
         KeyCode::Left => {
             if let Some(ta) = overlay_ta(st) {
                 if ctrl {

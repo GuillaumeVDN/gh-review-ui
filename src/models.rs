@@ -24,6 +24,8 @@ pub struct Pr {
     pub author: String,
     pub node_id: String,
     pub category: Category,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +196,12 @@ pub struct State {
 
     /// First `g` of a pending `gg` (jump-to-top) chord, in the tree panes.
     pub pending_g: bool,
+
+    /// Per-worktree Neovim sockets we launched (value = confirmed-alive at least
+    /// once), and whether we created the Hyprland window group ourselves — both
+    /// used to tear things down on exit / when the editor is closed.
+    pub worktree_editors: HashMap<String, bool>,
+    pub entered_group: bool,
 
     pub diff_by_file: HashMap<String, Vec<String>>,
     pub info_by_file: HashMap<String, Vec<LineInfo>>,

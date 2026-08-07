@@ -67,6 +67,112 @@ pub fn open_in_editor(abs_path: &str, line: i64) {
         .spawn();
 }
 
+fn spawn_bash(script: &str, cwd: &str) {
+    let mut c = Command::new("/usr/bin/bash");
+    c.arg("-c").arg(script);
+    if !cwd.is_empty() {
+        c.current_dir(cwd);
+    }
+    let _ = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
+/// A stable per-worktree id (…/worktrees/owner__repo/pr-N → owner__repo__pr-N).
+fn worktree_id(worktree: &str) -> String {
+    let comps: Vec<&str> = worktree.trim_end_matches('/').rsplit('/').take(2).collect();
+    let raw = format!("{}__{}", comps.get(1).unwrap_or(&""), comps.first().unwrap_or(&""));
+    raw.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect()
+}
+
+/// Whether a nvim server is already listening on `sock`.
+fn nvim_server_alive(sock: &str) -> bool {
+    Command::new("nvim")
+        .args(["--server", sock, "--remote-expr", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Whether the focused Hyprland window is already part of a group.
+fn in_group() -> bool {
+    Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v["grouped"].as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Whether a per-worktree Neovim socket file still exists (cheap liveness proxy;
+/// Neovim removes it on exit).
+pub fn socket_exists(sock: &str) -> bool {
+    std::path::Path::new(sock).exists()
+}
+
+/// Ask a per-worktree Neovim to quit (closes its Ghostty window).
+pub fn close_worktree_editor(sock: &str) {
+    let script = format!("nvim --server {sock} --remote-send \"<C-\\><C-N>:qa!<CR>\"");
+    spawn_bash(&script, "");
+}
+
+/// Dissolve the current Hyprland group if the active window is grouped.
+pub fn ungroup_active() {
+    if in_group() {
+        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+    }
+}
+
+/// Open `abs_path` at `line` in a per-worktree Neovim, launched in its own
+/// Ghostty window (grouped as a tab beside the TUI) the first time. Subsequent
+/// opens reuse that Neovim over its dedicated socket. Rooted at the worktree so
+/// project-wide search/replace works.
+pub fn open_in_worktree_editor(st: &mut State, worktree: &str, abs_path: &str, line: i64) {
+    let id = worktree_id(worktree);
+    let sock = format!("/tmp/nvim-ghr-{id}.sock");
+    let title = format!("ghr:{id}");
+    st.worktree_editors.entry(sock.clone()).or_insert(false);
+    if nvim_server_alive(&sock) {
+        // Already open: jump to the file/line and focus its window.
+        let ex_path = abs_path.replace(' ', "\\ ");
+        let script = format!(
+            "nvim --server {sock} --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" ; \
+             hyprctl dispatch focuswindow title:{title}"
+        );
+        spawn_bash(&script, worktree);
+        return;
+    }
+    // First open for this worktree: make sure the TUI window forms a group so the
+    // new terminal opens as a tab beside it, then launch Ghostty + Neovim.
+    if !in_group() {
+        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+        st.entered_group = true;
+    }
+    let _ = Command::new("ghostty")
+        .arg(format!("--title={title}"))
+        .arg("-e")
+        .arg("nvim")
+        .arg("--listen")
+        .arg(&sock)
+        .arg("-c")
+        .arg("set notitle")
+        .arg(format!("+{line}"))
+        // Open the file explorer, then (once it has settled, since it may grab
+        // focus asynchronously) return focus to the file being edited.
+        .arg("-c")
+        .arg("NvimTreeOpen")
+        .arg("-c")
+        .arg("lua vim.defer_fn(function() pcall(vim.cmd, 'wincmd p') end, 120)")
+        .arg(abs_path)
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn git_head(dir: &str) -> Option<String> {
     sh(&["git", "-C", dir, "rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
 }
@@ -132,20 +238,30 @@ pub fn open_current_edit_in_editor(st: &mut State) {
         st.status = "No worktree.".into();
         return;
     }
-    let abs = format!("{}/{}", st.active_worktree.trim_end_matches('/'), entry.path);
-    open_in_editor(&abs, 1);
+    let wt = st.active_worktree.trim_end_matches('/').to_string();
+    let abs = format!("{}/{}", wt, entry.path);
+    open_in_worktree_editor(st, &wt, &abs, 1);
     st.status = format!("Opening {} in editor…", entry.path);
 }
 
 /// Open the selected file — at the top, or at the current hunk's line.
+///
+/// When the file resolves to a local checkout already on the PR head (the launch
+/// repo / `~/Projects/<repo>`), reuse the shared `/tmp/nvim.sock` editor. When it
+/// resolves to the review worktree, use a dedicated per-worktree Neovim window.
 pub fn open_current_in_editor(st: &mut State, top: bool) {
     let Some(path) = cur_file_path(st) else {
         st.status = "No file selected.".into();
         return;
     };
     let line = if top { 1 } else { current_hunk_editor_line(st, &path) };
-    let root = editor_root(st);
-    let abs = format!("{}/{}", root.trim_end_matches('/'), path);
-    open_in_editor(&abs, line);
+    let root = editor_root(st).trim_end_matches('/').to_string();
+    let abs = format!("{root}/{path}");
+    let wt = st.active_worktree.trim_end_matches('/').to_string();
+    if !wt.is_empty() && root == wt {
+        open_in_worktree_editor(st, &wt, &abs, line);
+    } else {
+        open_in_editor(&abs, line);
+    }
     st.status = format!("Opening {path}:{line} in editor…");
 }

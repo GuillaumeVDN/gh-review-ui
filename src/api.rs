@@ -52,7 +52,7 @@ pub fn load_prs() -> Result<Vec<Pr>> {
     for (search, category) in searches {
         let data = gh_json(&[
             "pr", "list", "--limit", "50", "--search", search, "--json",
-            "number,title,headRefName,author,id",
+            "number,title,headRefName,author,id,createdAt,updatedAt",
         ])
         .unwrap_or(Value::Array(vec![]));
         if let Some(arr) = data.as_array() {
@@ -71,14 +71,24 @@ pub fn load_prs() -> Result<Vec<Pr>> {
                         author: p["author"]["login"].as_str().unwrap_or("?").to_string(),
                         node_id: p["id"].as_str().unwrap_or("").to_string(),
                         category,
+                        created_at: p["createdAt"].as_str().unwrap_or("").to_string(),
+                        updated_at: p["updatedAt"].as_str().unwrap_or("").to_string(),
                     },
                 );
             }
         }
     }
     let mut prs: Vec<Pr> = order.into_iter().filter_map(|n| seen.remove(&n)).collect();
-    // "review" group first (others' PRs), then "mine"; newest first within each.
-    prs.sort_by_key(|p| (if p.category == Category::Review { 0 } else { 1 }, -p.number));
+    // "review" group first (others' PRs), then "mine". Within review: oldest
+    // review request first (by PR creation date, ascending). Within mine: most
+    // recently updated first (descending).
+    let rank = |p: &Pr| if p.category == Category::Review { 0 } else { 1 };
+    prs.sort_by(|a, b| {
+        rank(a).cmp(&rank(b)).then_with(|| match a.category {
+            Category::Review => a.created_at.cmp(&b.created_at),
+            Category::Mine => b.updated_at.cmp(&a.updated_at),
+        })
+    });
     Ok(prs)
 }
 
@@ -393,7 +403,7 @@ pub fn load_pending_comments(owner: &str, name: &str, number: i64, login: &str) 
       repository(owner:$owner, name:$name) {
         pullRequest(number:$number) {
           reviews(first:10, author:$login, states:[PENDING]) {
-            nodes { comments(first:100) { nodes { id path body line originalLine } } }
+            nodes { comments(first:100) { nodes { id path body line originalLine startLine originalStartLine } } }
           }
         }
       }
@@ -408,14 +418,17 @@ pub fn load_pending_comments(owner: &str, name: &str, number: i64, login: &str) 
             if let Some(comments) = r["comments"]["nodes"].as_array() {
                 for c in comments {
                     let line = c["line"].as_i64().or_else(|| c["originalLine"].as_i64()).unwrap_or(0);
+                    let start_line = c["startLine"].as_i64().or_else(|| c["originalStartLine"].as_i64());
+                    // Only a real multi-line range (start differs from end).
+                    let start_line = start_line.filter(|&s| s != line);
                     out.push(PendingComment {
                         path: c["path"].as_str().unwrap_or("").to_string(),
                         body: c["body"].as_str().unwrap_or("").to_string(),
                         line,
                         side: "RIGHT".to_string(),
                         comment_id: c["id"].as_str().unwrap_or("").to_string(),
-                        start_line: None,
-                        start_side: String::new(),
+                        start_side: if start_line.is_some() { "RIGHT".to_string() } else { String::new() },
+                        start_line,
                     });
                 }
             }

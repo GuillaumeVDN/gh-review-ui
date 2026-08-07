@@ -157,6 +157,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                         author: String::new(),
                         node_id: pr_id.clone(),
                         category: Category::Review,
+                        created_at: String::new(),
+                        updated_at: String::new(),
                     });
                     pr.node_id = pr_id;
                     st.active_pr = Some(pr);
@@ -327,6 +329,28 @@ pub fn confirm_ask(st: &mut State) {
 
 // ---- comment line picker ----
 
+/// From the picker, confirm on the current line: edit the comment anchored on
+/// that exact line if there is one, otherwise start a new comment.
+pub fn begin_comment_or_edit(st: &mut State) {
+    if let Some(path) = cur_file_path(st) {
+        if let Some(idx) = comment_at_diff_index(st, &path, st.comment_line) {
+            st.comment_mode = false;
+            st.pending_idx = idx;
+            begin_edit_pending(st);
+            return;
+        }
+    }
+    begin_comment(st);
+}
+
+/// Index into `st.pending` of a comment anchored exactly on diff-line `idx`.
+fn comment_at_diff_index(st: &State, path: &str, idx: usize) -> Option<usize> {
+    let (old, new) = st.info_by_file.get(path)?.get(idx).copied()?;
+    st.pending.iter().position(|c| {
+        c.path == path && if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) }
+    })
+}
+
 pub fn enter_comment_mode(st: &mut State) {
     if st.active_pr.is_none() {
         st.status = "No active PR.".into();
@@ -353,7 +377,7 @@ pub fn enter_comment_mode(st: &mut State) {
     st.comment_line = same_hunk_next
         .or_else(|| first_change_index(st, &path))
         .unwrap_or(idxs[0]);
-    st.status = "Comment: j/k line · Shift+J/K range · Enter confirm · Esc cancel".into();
+    st.status = "Comment: j/k line · Shift+J/K range · Enter: comment/edit · Esc cancel".into();
 }
 
 pub fn move_comment(st: &mut State, direction: i64, extend: bool) {
@@ -554,6 +578,26 @@ pub fn confirm_edit(st: &mut State, tx: &Sender<Job>) {
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
     submit(st, tx, Job::EditPending { owner, name, number: pr.number, login, comment_id, body });
     st.status = format!("Updating comment on {path}:{line}…");
+}
+
+/// Delete the comment currently open in the Edit modal (Ctrl+D).
+pub fn delete_editing_comment(st: &mut State, tx: &Sender<Job>) {
+    let Overlay::Edit { comment_id, path, line, .. } = &st.overlay else { return };
+    let (comment_id, path, line) = (comment_id.clone(), path.clone(), *line);
+    st.overlay = Overlay::None;
+    if let Some(pos) = st.pending.iter().position(|c| c.comment_id == comment_id) {
+        st.pending.remove(pos);
+        if st.pending_idx >= st.pending.len() {
+            st.pending_idx = st.pending.len().saturating_sub(1);
+        }
+    }
+    if comment_id.is_empty() {
+        return;
+    }
+    let Some(pr) = st.active_pr.clone() else { return };
+    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    submit(st, tx, Job::DiscardPending { owner, name, number: pr.number, login, comment_id });
+    st.status = format!("Deleting comment on {path}:{line}…");
 }
 
 // ---- finish review ----

@@ -263,7 +263,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
         Focus::Edits => format!("Enter: commit+push · e: editor · d: revert · Alt+j/k/z: next file · gg/G · {common}"),
-        Focus::Diff => format!("j/k: block · c: comment · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
 
@@ -462,8 +462,12 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
                         continue;
                     }
                     let first = c.body.lines().next().unwrap_or("");
+                    let loc = match c.start_line {
+                        Some(s) => format!("{}-{}", s.min(c.line), s.max(c.line)),
+                        None => c.line.to_string(),
+                    };
                     rows.push((
-                        format!("{}{}: {first}", "  ".repeat(depth + 1), c.line),
+                        format!("{}{loc}: {first}", "  ".repeat(depth + 1)),
                         Style::default(),
                         Some(ci),
                     ));
@@ -640,12 +644,17 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
                 if !hit {
                     continue;
                 }
+                let range_tag = match c.start_line {
+                    Some(s) => format!("[{}-{}] ", s.min(c.line), s.max(c.line)),
+                    None => String::new(),
+                };
                 for (bi, bl) in c.body.lines().enumerate() {
                     if out.len() >= vh {
                         break;
                     }
                     let gutter = if bi == 0 { "▏💬 " } else { "▏   " };
-                    let text = format!("{gutter}{}", bl.replace('\t', "    "));
+                    let tag = if bi == 0 { range_tag.as_str() } else { "" };
+                    let text = format!("{gutter}{tag}{}", bl.replace('\t', "    "));
                     out.push(Line::from(Span::styled(pad(&text, iw), theme::comment_inline())));
                 }
             }
@@ -832,7 +841,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
         }
         Overlay::Edit { ta, path, line, .. } => {
             draw_modal_editor(f, area, ta, &format!("Edit comment on {path}:{line}"),
-                "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: cancel");
+                "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+D: delete · Esc: cancel");
         }
         Overlay::CommitMsg { ta } => {
             let n = st.edit_files.len();
@@ -944,8 +953,8 @@ mod tests {
         use crate::models::{Category, Pr};
         let mut st = State::default();
         st.prs = vec![
-            Pr { number: 3, title: "a".into(), head: "h".into(), author: "me".into(), node_id: String::new(), category: Category::Mine },
-            Pr { number: 5, title: "b".into(), head: "h".into(), author: "x".into(), node_id: String::new(), category: Category::Review },
+            Pr { number: 3, title: "a".into(), head: "h".into(), author: "me".into(), node_id: String::new(), category: Category::Mine, created_at: String::new(), updated_at: String::new() },
+            Pr { number: 5, title: "b".into(), head: "h".into(), author: "x".into(), node_id: String::new(), category: Category::Review, created_at: String::new(), updated_at: String::new() },
         ];
         let rows = pr_rows(&st);
         assert!(rows[0].0 && rows[0].1.starts_with("My PRs"));
