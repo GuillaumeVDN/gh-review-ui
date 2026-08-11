@@ -232,7 +232,15 @@ pub fn open_pr_worktree(repo_root: &str, owner: &str, name: &str, number: i64) -
     let path = worktree_path(owner, name, number);
     let path_str = path.display().to_string();
     if is_worktree(&path_str) {
-        sh(&["git", "-C", &path_str, "checkout", "-B", &branch, &sha])?;
+        // Don't reset a worktree that has uncommitted local edits — that would
+        // clobber them (and `checkout -B` aborts anyway). Keep it as-is; the user
+        // can commit/push or revert from the Pending-edits pane, then refresh.
+        let dirty = sh(&["git", "-C", &path_str, "status", "--porcelain"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !dirty {
+            sh(&["git", "-C", &path_str, "checkout", "-B", &branch, &sha])?;
+        }
     } else {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
