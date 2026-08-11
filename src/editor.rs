@@ -170,12 +170,18 @@ pub fn open_in_worktree_editor(st: &mut State, worktree: &str, abs_path: &str, l
         .arg("-c")
         .arg("set notitle")
         .arg(format!("+{line}"))
-        // Open the file explorer, then (once it has settled, since it may grab
-        // focus asynchronously) return focus to the file being edited.
+        // Once startup has settled (file loaded, its own cursor-restore autocmds
+        // done), open the file tree, return focus to the file, and re-apply the
+        // target line — otherwise a config's "restore last position" autocmd wins.
         .arg("-c")
-        .arg("NvimTreeOpen")
-        .arg("-c")
-        .arg("lua vim.defer_fn(function() pcall(vim.cmd, 'wincmd p') end, 120)")
+        .arg(format!(
+            "lua vim.defer_fn(function() \
+               pcall(vim.cmd,'NvimTreeOpen'); \
+               pcall(vim.cmd,'wincmd p'); \
+               pcall(vim.api.nvim_win_set_cursor,0,{{{line},0}}); \
+               pcall(vim.cmd,'normal! zz') \
+             end, 150)"
+        ))
         .arg(abs_path)
         .current_dir(worktree)
         .stdin(Stdio::null())
