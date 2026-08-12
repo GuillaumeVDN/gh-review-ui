@@ -9,7 +9,7 @@ use crate::models::{
     Category, FileEntry, Focus, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
 };
 use crate::navigation::{
-    cur_file_path, current_hunk_range, first_change_index, hunk_line_indices, line_target,
+    cur_file_path, current_hunk_range, first_change_index, hunk_comment_indices, line_target,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -361,7 +361,7 @@ pub fn enter_comment_mode(st: &mut State) {
         return;
     }
     let Some(path) = cur_file_path(st) else { return };
-    let idxs = hunk_line_indices(st, &path);
+    let idxs = hunk_comment_indices(st, &path);
     if idxs.is_empty() {
         st.status = "No commentable line in the current hunk.".into();
         return;
@@ -386,7 +386,7 @@ pub fn enter_comment_mode(st: &mut State) {
 
 pub fn move_comment(st: &mut State, direction: i64, extend: bool) {
     let Some(path) = cur_file_path(st) else { return };
-    let idxs = hunk_line_indices(st, &path);
+    let idxs = hunk_comment_indices(st, &path);
     if idxs.is_empty() {
         return;
     }

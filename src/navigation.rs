@@ -67,6 +67,27 @@ pub fn hunk_line_indices(st: &State, path: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Diff-line indices a comment can attach to in the current `@@` section
+/// (context lines included, not just the changed block) — so comments can land
+/// on the surrounding context.
+pub fn hunk_comment_indices(st: &State, path: &str) -> Vec<usize> {
+    let empty = Vec::new();
+    let lines = st.diff_by_file.get(path).unwrap_or(&empty);
+    let empty_info = Vec::new();
+    let info = st.info_by_file.get(path).unwrap_or(&empty_info);
+    let Some((s, e)) = current_hunk_range(st, path) else { return Vec::new() };
+    // Expand from the change block out to the enclosing @@ section boundaries.
+    let mut lo = s;
+    while lo > 0 && !lines[lo - 1].starts_with("@@") {
+        lo -= 1;
+    }
+    let mut hi = e;
+    while hi < lines.len() && !lines[hi].starts_with("@@") {
+        hi += 1;
+    }
+    (lo..hi).filter(|&i| info.get(i).map_or(false, |&t| t != (None, None))).collect()
+}
+
 /// Diff-line index of the first added/deleted line in the current hunk.
 pub fn first_change_index(st: &State, path: &str) -> Option<usize> {
     if let Some((s, e)) = current_hunk_range(st, path) {
