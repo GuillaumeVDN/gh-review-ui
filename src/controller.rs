@@ -206,6 +206,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             submit(st, tx, Job::LoadActive { owner, name, login, number: Some(number) });
         }
         Msg::ViewedOk { paths, viewed } => {
+            // Optimistic state already matches; just confirm and clear the record.
             for f in st.files.iter_mut() {
                 if paths.contains(&f.path) {
                     f.viewed = viewed;
@@ -214,6 +215,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             for p in &paths {
                 st.viewed_by_path.insert(p.clone(), viewed);
             }
+            st.viewed_inflight = None;
             st.busy.remove("viewed");
             st.status = format!("{} {} file{}", if viewed { "Marked" } else { "Unmarked" }, paths.len(), if paths.len() == 1 { "" } else { "s" });
         }
@@ -225,6 +227,19 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
             for p in &done {
                 st.viewed_by_path.insert(p.clone(), viewed);
+            }
+            // Revert any optimistically-marked path that didn't actually succeed.
+            if let Some((paths, target)) = st.viewed_inflight.take() {
+                for f in st.files.iter_mut() {
+                    if paths.contains(&f.path) && !done.contains(&f.path) {
+                        f.viewed = !target;
+                    }
+                }
+                for p in &paths {
+                    if !done.contains(p) {
+                        st.viewed_by_path.insert(p.clone(), !target);
+                    }
+                }
             }
             st.busy.remove("viewed");
             st.status = format!("{} {}, {} failed", if viewed { "Marked" } else { "Unmarked" }, done.len(), errs);
@@ -269,6 +284,19 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
+            // Roll back an optimistic viewed change that failed on the server.
+            if kind == "viewed" {
+                if let Some((paths, target)) = st.viewed_inflight.take() {
+                    for f in st.files.iter_mut() {
+                        if paths.contains(&f.path) {
+                            f.viewed = !target;
+                        }
+                    }
+                    for p in &paths {
+                        st.viewed_by_path.insert(p.clone(), !target);
+                    }
+                }
+            }
             st.status = format!("[{kind}] {msg}");
         }
     }
@@ -645,6 +673,10 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
         crate::models::TreeRow::File { index, .. } => {
             let path = st.files[index].path.clone();
             let new_v = !st.files[index].viewed;
+            // Optimistic: reflect it now so a following `z`/navigation sees it.
+            st.files[index].viewed = new_v;
+            st.viewed_by_path.insert(path.clone(), new_v);
+            st.viewed_inflight = Some((vec![path.clone()], new_v));
             st.status = format!("{} {path}…", if new_v { "Marking" } else { "Unmarking" });
             submit(st, tx, Job::MarkViewed { pr_id, path, viewed: new_v });
         }
@@ -661,6 +693,16 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
                 .map(|&i| st.files[i].path.clone())
                 .collect();
             if !paths.is_empty() {
+                // Optimistic update for the whole batch.
+                for f in st.files.iter_mut() {
+                    if paths.contains(&f.path) {
+                        f.viewed = new_v;
+                    }
+                }
+                for p in &paths {
+                    st.viewed_by_path.insert(p.clone(), new_v);
+                }
+                st.viewed_inflight = Some((paths.clone(), new_v));
                 st.status = format!("{} {} files in {path}/…", if new_v { "Marking" } else { "Unmarking" }, paths.len());
                 submit(st, tx, Job::MarkViewedBulk { pr_id, paths, viewed: new_v });
             }

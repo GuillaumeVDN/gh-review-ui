@@ -179,6 +179,9 @@ pub struct State {
 
     pub files: Vec<FileEntry>,
     pub viewed_by_path: HashMap<String, bool>,
+    /// In-flight optimistic viewed change: (paths, target value), so a failed
+    /// mark can be reverted.
+    pub viewed_inflight: Option<(Vec<String>, bool)>,
     pub collapsed_dirs: HashSet<String>,
     pub tree: Vec<TreeRow>,
     pub file_idx: usize,
