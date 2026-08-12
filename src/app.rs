@@ -52,11 +52,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     st.viewer = api::get_viewer_login();
     if !st.repo_owner.is_empty() {
         controller::submit(&mut st, &job_tx, Job::LoadPrs);
-        if let Some(last) = api::load_last_pr(&st.repo_owner, &st.repo_name) {
-            st.status = format!("Reopening #{last} from last session…");
-            let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
-            controller::submit(&mut st, &job_tx, Job::OpenPr { repo_root, owner, name, number: last });
-        }
     }
 
     let mut prev_pr = usize::MAX;
