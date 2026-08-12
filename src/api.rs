@@ -472,7 +472,10 @@ pub fn load_pending_comments(owner: &str, name: &str, number: i64, login: &str) 
     Ok(out)
 }
 
-pub fn add_pending_comment_api(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, c: &PendingComment) -> Result<()> {
+/// Add a pending review comment. Returns `false` when GitHub couldn't place it
+/// (the line isn't part of the diff): `addPullRequestReviewThread` then returns
+/// `thread: null` with **no** GraphQL error, so success can't be assumed.
+pub fn add_pending_comment_api(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, c: &PendingComment) -> Result<bool> {
     let review_id = ensure_pending_review(owner, name, number, login, pr_id)?;
     let mut decls = "$r:ID!, $path:String!, $line:Int!, $body:String!, $side:DiffSide!".to_string();
     let mut fields = "pullRequestReviewId:$r, path:$path, line:$line, body:$body, side:$side".to_string();
@@ -490,8 +493,9 @@ pub fn add_pending_comment_api(owner: &str, name: &str, number: i64, login: &str
         vars.push(("startSide", c.start_side.clone().into()));
     }
     let q = format!("mutation({decls}) {{ addPullRequestReviewThread(input:{{{fields}}}) {{ thread {{ id }} }} }}");
-    gh_graphql(&q, &vars)?;
-    Ok(())
+    let resp = gh_graphql(&q, &vars)?;
+    let placed = resp["data"]["addPullRequestReviewThread"]["thread"]["id"].as_str().is_some();
+    Ok(placed)
 }
 
 pub fn delete_pending_comment_api(comment_id: &str) -> Result<()> {

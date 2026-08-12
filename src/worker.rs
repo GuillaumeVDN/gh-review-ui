@@ -131,9 +131,17 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
         }
         Job::LoadPrDetails(n) => Msg::PrDetails { number: *n, data: api::load_pr_details(*n)? },
         Job::AddPending { owner, name, number, login, pr_id, comment } => {
-            api::add_pending_comment_api(owner, name, *number, login, pr_id, comment)?;
+            let placed = api::add_pending_comment_api(owner, name, *number, login, pr_id, comment)?;
             let pending = api::load_pending_comments(owner, name, *number, login)?;
-            Msg::PendingList { pending, status: "Comment added to pending review".into() }
+            let status = if placed {
+                "Comment added to pending review".into()
+            } else {
+                format!(
+                    "GitHub rejected the comment on {}:{} — that line isn't part of the diff",
+                    comment.path, comment.line
+                )
+            };
+            Msg::PendingList { pending, status }
         }
         Job::DiscardPending { owner, name, number, login, comment_id } => {
             if !comment_id.is_empty() {
