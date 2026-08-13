@@ -18,7 +18,7 @@ pub enum Job {
     LoadPrs { repo_root: String },
     LoadActive { owner: String, name: String, login: String, number: Option<i64>, local: bool },
     LoadCommitDiff { first: String, last: String },
-    OpenPr { repo_root: String, owner: String, name: String, number: i64 },
+    OpenPr { repo_root: String, owner: String, name: String, number: i64, head: String },
     MarkViewed { pr_id: String, path: String, viewed: bool },
     MarkViewedBulk { pr_id: String, paths: Vec<String>, viewed: bool },
     LoadPrDetails(i64),
@@ -132,8 +132,8 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
             let (diff, info) = api::load_diff_range(first, last)?;
             Msg::CommitDiff { diff, info }
         }
-        Job::OpenPr { repo_root, owner, name, number } => {
-            let path = api::open_pr_worktree(repo_root, owner, name, *number)?;
+        Job::OpenPr { repo_root, owner, name, number, head } => {
+            let path = api::open_pr_worktree(repo_root, owner, name, *number, head)?;
             Msg::PrOpened { number: *number, path }
         }
         Job::MarkViewed { pr_id, path, viewed } => {

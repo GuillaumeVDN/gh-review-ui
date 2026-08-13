@@ -67,7 +67,7 @@ pub fn begin_open_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
     st.local_mode = false;
     st.status = format!("Opening #{} in a worktree…", pr.number);
     let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
-    submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
+    submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number, head: pr.head.clone() });
 }
 
 /// Open the locally checked-out PR in place (main repo, no worktree).

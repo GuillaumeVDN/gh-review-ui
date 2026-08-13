@@ -255,8 +255,44 @@ fn is_worktree(path: &str) -> bool {
         && sh(&["git", "-C", path, "rev-parse", "--is-inside-work-tree"]).is_ok()
 }
 
+/// A worktree of this repository that already has `branch` checked out.
+///
+/// Another tool may be holding it — dashdoc-manager checks a card out by its
+/// branch, and reviewing the PR of a branch we are already working on should
+/// land in that same directory rather than a second copy of it.
+pub fn worktree_for_branch(repo_root: &str, branch: &str) -> Option<String> {
+    let out = sh(&["git", "-C", repo_root, "worktree", "list", "--porcelain"]).ok()?;
+    let mut current: Option<&str> = None;
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path);
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            if b.trim_start_matches("refs/heads/") == branch {
+                return current.map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
 /// Fetch the PR head and check it out in a dedicated worktree; returns its path.
-pub fn open_pr_worktree(repo_root: &str, owner: &str, name: &str, number: i64) -> Result<String> {
+///
+/// When another tool already has the PR's head branch checked out in a
+/// worktree of this repository, that directory is reused as-is: it is the same
+/// code, and re-checking it out somewhere else would mean two copies of a
+/// branch you are actively working on. Nothing is reset there — it is not ours.
+pub fn open_pr_worktree(
+    repo_root: &str,
+    owner: &str,
+    name: &str,
+    number: i64,
+    head: &str,
+) -> Result<String> {
+    if !head.is_empty() {
+        if let Some(existing) = worktree_for_branch(repo_root, head) {
+            return Ok(existing);
+        }
+    }
     let remote = base_remote(repo_root, owner, name);
     let refspec = format!("+refs/pull/{number}/head:refs/gh-review-ui/pr-{number}");
     let branch = format!("gh-review-ui/pr-{number}");
@@ -693,5 +729,68 @@ mod tests {
         let v = comment_to_json(&c);
         let back = comment_from_json(&v).unwrap();
         assert_eq!(back.start_line, None);
+    }
+}
+
+#[cfg(test)]
+mod worktree_sharing_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A repo with one extra worktree, standing in for one dashdoc-manager
+    /// created for the same branch.
+    fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("ghr-share-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "--initial-branch=dev"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "initial"]);
+
+        let wt = root.join("elsewhere/feat-x");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/x", wt.to_str().unwrap()]);
+        (root, repo)
+    }
+
+    #[test]
+    fn a_branch_checked_out_elsewhere_is_found() {
+        let (root, repo) = fixture("found");
+        let found = worktree_for_branch(repo.to_str().unwrap(), "feat/x");
+        assert_eq!(
+            found.map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(std::fs::canonicalize(root.join("elsewhere/feat-x")).unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_branch_nobody_has_checked_out_is_not_found() {
+        let (root, repo) = fixture("missing");
+        assert_eq!(worktree_for_branch(repo.to_str().unwrap(), "feat/nope"), None);
+        // The main checkout's own branch is still reported, since it is a
+        // worktree too.
+        assert!(worktree_for_branch(repo.to_str().unwrap(), "dev").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repo_that_is_not_one_yields_nothing_rather_than_failing() {
+        assert_eq!(worktree_for_branch("/nonexistent/xyz", "feat/x"), None);
     }
 }

@@ -229,7 +229,7 @@ fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
             }
         } else if !st.busy.contains("worktree") && !st.busy.contains("active") {
             let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
-            controller::submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
+            controller::submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number, head: pr.head.clone() });
         }
     }
     if st.focus == Focus::Prs && !st.prs.is_empty() {
