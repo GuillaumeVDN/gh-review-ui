@@ -554,10 +554,10 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (1usize, 0usize) // empty
     };
 
-    // Pending comments to show inline (PR diff only — not on the local diff).
-    let pending_here: Vec<&PendingComment> = match (&path, local) {
-        (Some(p), false) => st.pending.iter().filter(|c| &c.path == p).collect(),
-        _ => Vec::new(),
+    // Pending comments to show inline (matched to the shown diff via info_here).
+    let pending_here: Vec<&PendingComment> = match &path {
+        Some(p) => st.pending.iter().filter(|c| &c.path == p).collect(),
+        None => Vec::new(),
     };
     let info_here = path
         .as_ref()

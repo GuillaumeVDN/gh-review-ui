@@ -417,7 +417,7 @@ pub fn begin_comment_or_edit(st: &mut State) {
 
 /// Index into `st.pending` of a comment anchored exactly on diff-line `idx`.
 fn comment_at_diff_index(st: &State, path: &str, idx: usize) -> Option<usize> {
-    let (old, new) = st.info_by_file.get(path)?.get(idx).copied()?;
+    let (old, new) = crate::navigation::info_lines(st, path)?.get(idx).copied()?;
     st.pending.iter().position(|c| {
         c.path == path && if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) }
     })
@@ -428,7 +428,7 @@ pub fn enter_comment_mode(st: &mut State) {
         st.status = "No active PR.".into();
         return;
     }
-    let Some(path) = cur_file_path(st) else { return };
+    let Some(path) = diff_path(st) else { return };
     let idxs = hunk_comment_indices(st, &path);
     if idxs.is_empty() {
         st.status = "No commentable line in the current hunk.".into();
@@ -453,7 +453,7 @@ pub fn enter_comment_mode(st: &mut State) {
 }
 
 pub fn move_comment(st: &mut State, direction: i64, extend: bool) {
-    let Some(path) = cur_file_path(st) else { return };
+    let Some(path) = diff_path(st) else { return };
     let idxs = hunk_comment_indices(st, &path);
     if idxs.is_empty() {
         return;
@@ -474,7 +474,7 @@ pub fn move_comment(st: &mut State, direction: i64, extend: bool) {
 /// From the picker, open the comment editor overlay on the selected line/range.
 pub fn begin_comment(st: &mut State) {
     st.comment_mode = false;
-    let Some(path) = cur_file_path(st) else { return };
+    let Some(path) = diff_path(st) else { return };
     let Some((mut line, mut side)) = line_target(st, &path, st.comment_line) else {
         st.status = "No commentable line selected.".into();
         return;

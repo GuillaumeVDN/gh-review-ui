@@ -352,11 +352,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Up | KeyCode::Char('k') => nav::jump_hunk(st, -1),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
-            KeyCode::Char('c') => {
-                if st.local_diff_path.is_none() {
-                    controller::enter_comment_mode(st);
-                }
-            }
+            KeyCode::Char('c') => controller::enter_comment_mode(st),
             KeyCode::Char('a') => controller::begin_ask(st),
             KeyCode::Char('e') => editor::open_current_in_editor(st, false),
             KeyCode::Esc => {

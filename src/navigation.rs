@@ -4,7 +4,25 @@
 //! starts on a real changed line. Helpers still tolerate a header at the start
 //! (they skip `(None, None)` rows), so they work either way.
 
-use crate::models::{PendingComment, Range, State, TreeRow};
+use crate::models::{LineInfo, PendingComment, Range, State, TreeRow};
+
+/// The diff lines backing `path`'s currently-shown diff (local edits or PR).
+pub fn diff_lines<'a>(st: &'a State, path: &str) -> Option<&'a Vec<String>> {
+    if is_local_diff(st, path) {
+        st.edit_diff_by_file.get(path)
+    } else {
+        st.diff_by_file.get(path)
+    }
+}
+
+/// The per-line info backing `path`'s currently-shown diff (local edits or PR).
+pub fn info_lines<'a>(st: &'a State, path: &str) -> Option<&'a Vec<LineInfo>> {
+    if is_local_diff(st, path) {
+        st.edit_info_by_file.get(path)
+    } else {
+        st.info_by_file.get(path)
+    }
+}
 
 /// Pending-comment indices in the Pending pane's display (tree) order: grouped
 /// by file, files in the same order as the rendered tree.
@@ -62,7 +80,7 @@ pub fn current_hunk_range(st: &State, path: &str) -> Option<Range> {
 
 /// `(line_no, side)` a comment on diff-line `idx` attaches to.
 pub fn line_target(st: &State, path: &str, idx: usize) -> Option<(i64, String)> {
-    let info = st.info_by_file.get(path)?;
+    let info = info_lines(st, path)?;
     let (old, new) = *info.get(idx)?;
     match (old, new) {
         (None, Some(n)) => Some((n, "RIGHT".into())),   // added
@@ -78,7 +96,7 @@ pub fn hunk_line_indices(st: &State, path: &str) -> Vec<usize> {
         return Vec::new();
     };
     let empty = Vec::new();
-    let info = st.info_by_file.get(path).unwrap_or(&empty);
+    let info = info_lines(st, path).unwrap_or(&empty);
     (s..e)
         .filter(|&i| info.get(i).map_or(false, |&t| t != (None, None)))
         .collect()
@@ -89,9 +107,9 @@ pub fn hunk_line_indices(st: &State, path: &str) -> Vec<usize> {
 /// on the surrounding context.
 pub fn hunk_comment_indices(st: &State, path: &str) -> Vec<usize> {
     let empty = Vec::new();
-    let lines = st.diff_by_file.get(path).unwrap_or(&empty);
+    let lines = diff_lines(st, path).unwrap_or(&empty);
     let empty_info = Vec::new();
-    let info = st.info_by_file.get(path).unwrap_or(&empty_info);
+    let info = info_lines(st, path).unwrap_or(&empty_info);
     let Some((s, e)) = current_hunk_range(st, path) else { return Vec::new() };
     // Expand from the change block out to the enclosing @@ section boundaries.
     let mut lo = s;
@@ -108,7 +126,7 @@ pub fn hunk_comment_indices(st: &State, path: &str) -> Vec<usize> {
 /// Diff-line index of the first added/deleted line in the current hunk.
 pub fn first_change_index(st: &State, path: &str) -> Option<usize> {
     if let Some((s, e)) = current_hunk_range(st, path) {
-        if let Some(info) = st.info_by_file.get(path) {
+        if let Some(info) = info_lines(st, path) {
             for i in s..e {
                 if let Some(&(old, new)) = info.get(i) {
                     if old.is_some() != new.is_some() {
