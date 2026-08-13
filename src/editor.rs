@@ -78,32 +78,73 @@ pub fn open_pr_in_browser(owner: &str, name: &str, number: i64) {
         .spawn();
 }
 
-/// Hand a whole review (all pending comments) to a fresh local Claude window.
-/// Worktree PRs open it grouped beside the TUI; the locally checked-out PR opens
-/// it on workspace 4. (Reusing an already-running Claude would need a keystroke
-/// tool like wtype/ydotool, which isn't assumed here.)
+const REVIEW_TITLE: &str = "ghr-review-claude";
+
+fn has_cmd(cmd: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {cmd}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn window_exists(title: &str) -> bool {
+    Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v.as_array().map(|a| a.iter().any(|w| w["title"].as_str() == Some(title))))
+        .unwrap_or(false)
+}
+
+/// Hand a whole review (all pending comments) to a local Claude.
+///
+/// If a review-Claude window is already open, focus it and (via `wtype`) type a
+/// short instruction pointing at a file that holds the full prompt, then Enter —
+/// so a multi-line prompt doesn't submit itself line by line. Otherwise launch a
+/// fresh window seeded with the prompt (worktree PR: grouped beside the TUI;
+/// local PR: workspace 4).
 pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String> {
     let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Reuse a running review window if we can drive the keyboard.
+    if window_exists(REVIEW_TITLE) && has_cmd("wtype") {
+        let file = dir.join("review-latest.txt");
+        std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
+        let fp = file.display().to_string();
+        let instruction =
+            format!("Read {fp} and address all the review comments described in it.");
+        let script = format!(
+            "hyprctl dispatch focuswindow title:^{REVIEW_TITLE}$; sleep 0.2; \
+             wtype {q}; wtype -k Return",
+            q = shell_single_quote(&instruction),
+        );
+        spawn_bash(&script, "");
+        return Ok(());
+    }
+
+    // Otherwise open a fresh window seeded with the whole prompt.
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let file = dir.join(format!("review-{ts}.txt"));
     std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
     let fp = file.display().to_string();
     let script =
         format!("p=\"$(cat '{fp}')\"; rm -f '{fp}'; exec claude --dangerously-skip-permissions \"$p\"");
-    let title = "ghr-review-claude";
     if st.local_mode {
         // Place it on workspace 4 silently via a window rule matched on the title.
         let _ = Command::new("hyprctl")
-            .args(["keyword", "windowrulev2", &format!("workspace 4 silent, title:^{title}$")])
+            .args(["keyword", "windowrulev2", &format!("workspace 4 silent, title:^{REVIEW_TITLE}$")])
             .output();
     } else if !in_group() {
         let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
         st.entered_group = true;
     }
     Command::new("ghostty")
-        .arg(format!("--title={title}"))
+        .arg(format!("--title={REVIEW_TITLE}"))
         .arg("-e")
         .arg("bash")
         .arg("-lc")
@@ -115,6 +156,11 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String>
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Wrap `s` in single quotes for a bash command (handling embedded quotes).
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn spawn_bash(script: &str, cwd: &str) {
@@ -324,4 +370,23 @@ pub fn open_current_in_editor(st: &mut State, top: bool) {
         open_in_editor(&abs, line);
     }
     st.status = format!("Opening {path}:{line} in editor…");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        assert_eq!(shell_single_quote("abc"), "'abc'");
+        assert_eq!(shell_single_quote("a b"), "'a b'");
+        // An embedded single quote is closed, escaped, reopened.
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn worktree_id_from_path() {
+        assert_eq!(worktree_id("/x/worktrees/owner__repo/pr-35"), "owner__repo__pr-35");
+        assert_eq!(worktree_id("/x/worktrees/owner__repo/pr-35/"), "owner__repo__pr-35");
+    }
 }
