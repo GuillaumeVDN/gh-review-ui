@@ -673,7 +673,7 @@ fn checkout_local(st: &mut State, tx: &mpsc::Sender<Job>) {
 
 
 fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
-    let (rects, _, _) = ui::compute_layout(area, st.focus);
+    let (rects, _, _) = ui::compute_layout(area, st.focus, st.local_diff_path.is_some());
     let (col, row) = (m.column, m.row);
     let hit = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
     let pane = if hit(rects.prs) {

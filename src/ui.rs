@@ -25,7 +25,7 @@ pub struct PaneRects {
     pub body: Rect,
 }
 
-pub fn compute_layout(area: Rect, focus: Focus) -> (PaneRects, Rect, Rect) {
+pub fn compute_layout(area: Rect, focus: Focus, local_diff: bool) -> (PaneRects, Rect, Rect) {
     let root = Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     let (body, status, help) = (root[0], root[1], root[2]);
@@ -34,11 +34,12 @@ pub fn compute_layout(area: Rect, focus: Focus) -> (PaneRects, Rect, Rect) {
     let (left, right) = (cols[0], cols[1]);
     // The focused left pane (or Files while viewing the diff) expands to fill the
     // column; the others shrink to a compact height. Left-pane order: PRs,
-    // Commits, Files, Edits, Pending.
+    // Commits, Files, Edits, Pending. Viewing a *local* diff keeps [4] expanded.
     let expanded = match focus {
         Focus::Prs => 0,
         Focus::Commits => 1,
-        Focus::Files | Focus::Diff => 2,
+        Focus::Files => 2,
+        Focus::Diff => if local_diff { 3 } else { 2 },
         Focus::Edits => 3,
         Focus::Pending => 4,
     };
@@ -235,7 +236,7 @@ pub fn pr_rows(st: &State) -> Vec<(bool, String, usize)> {
 }
 
 pub fn render(f: &mut Frame, st: &mut State) {
-    let (rects, status_area, help_area) = compute_layout(f.area(), st.focus);
+    let (rects, status_area, help_area) = compute_layout(f.area(), st.focus, st.local_diff_path.is_some());
     render_prs(f, st, rects.prs);
     render_commits(f, st, rects.commits);
     render_files(f, st, rects.files);
