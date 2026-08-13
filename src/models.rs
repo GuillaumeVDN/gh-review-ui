@@ -131,8 +131,10 @@ impl Focus {
     }
 }
 
-/// The finish-review dialog's chosen event, in display order.
-pub const REVIEW_EVENTS: [(&str, &str); 3] = [
+/// The submit dialog's choices, in display order. `CLAUDE` hands the comments to
+/// a local Claude; the others post to the PR and submit the review with that event.
+pub const SUBMIT_CHOICES: [(&str, &str); 4] = [
+    ("CLAUDE", "Send to Claude"),
     ("COMMENT", "Comment"),
     ("REQUEST_CHANGES", "Request changes"),
     ("APPROVE", "Approve"),
@@ -159,6 +161,15 @@ pub enum Overlay {
     CommitMsg { ta: TextArea },
     /// Free-text question to launch a Claude session about the selected hunk.
     Ask { ta: TextArea },
+    /// A yes/no confirmation before a destructive action.
+    Confirm { prompt: String, kind: ConfirmKind },
+}
+
+/// The action a [`Overlay::Confirm`] performs when accepted.
+#[derive(Clone, Debug)]
+pub enum ConfirmKind {
+    /// Revert a local edit (discard uncommitted changes to a file).
+    RevertEdit { path: String, added: bool },
 }
 
 #[derive(Default)]
@@ -183,6 +194,9 @@ pub struct State {
     pub commit_offset: usize,
 
     pub files: Vec<FileEntry>,
+    /// The PR's own changed files (from GitHub); `files` is this plus any
+    /// edit-only local files merged in for display.
+    pub pr_files: Vec<FileEntry>,
     pub viewed_by_path: HashMap<String, bool>,
     /// In-flight optimistic viewed change: (paths, target value), so a failed
     /// mark can be reverted.
@@ -200,7 +214,13 @@ pub struct State {
     pub edit_offset: usize,
     pub edit_diff_by_file: HashMap<String, Vec<String>>,
     pub edit_info_by_file: HashMap<String, Vec<LineInfo>>,
+    pub edit_hunks_by_file: HashMap<String, Vec<Range>>,
     pub edit_diff_scroll: usize,
+    /// When set, the [0] pane shows this file's *local* diff (from [4]) with hunk
+    /// navigation instead of the PR review diff.
+    pub local_diff_path: Option<String>,
+    /// Path → local change kind, for coloring edited files in [3] and [4].
+    pub edit_kind_by_path: HashMap<String, EditKind>,
 
     /// First `g` of a pending `gg` (jump-to-top) chord, in the tree panes.
     pub pending_g: bool,

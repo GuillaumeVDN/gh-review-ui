@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
-use crate::models::{Focus, Overlay, PendingComment, State, TreeRow, REVIEW_EVENTS};
-use crate::navigation::{cur_file_path, current_hunk_range, hunk_for_comment};
+use crate::models::{Focus, Overlay, PendingComment, State, TreeRow, SUBMIT_CHOICES};
+use crate::navigation::{current_hunk_range, diff_path, hunk_for_comment, is_local_diff};
 use crate::textbuffer;
 use crate::theme;
 
@@ -263,7 +263,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
-        Focus::Edits => format!("Enter: commit+push · e: editor · d: revert · Alt+j/k/z: next file · gg/G · {common}"),
+        Focus::Edits => format!("Enter: hunks · c: commit · P: push · e: editor · d: revert · Alt+j/k/z: next · {common}"),
         Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
@@ -374,10 +374,20 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             TreeRow::File { depth, name, index } => {
+                let path = &st.files[*index].path;
                 let viewed = st.files[*index].viewed;
+                let edit = st.edit_kind_by_path.get(path).copied();
+                // Locally-edited files are colored (like [4]) to stand out from
+                // already-pushed changes; the change kind is shown as a sigil.
+                let base = match edit {
+                    Some(k) => theme::edit_kind_style(k),
+                    None if viewed => theme::dim(),
+                    None => Style::default(),
+                };
+                let sigil = edit.map(|k| format!(" {}", k.sigil())).unwrap_or_default();
                 (
-                    format!("{}[{}] {}", "  ".repeat(*depth), if viewed { "✔" } else { " " }, name),
-                    if viewed { theme::dim() } else { Style::default() },
+                    format!("{}[{}] {}{sigil}", "  ".repeat(*depth), if viewed { "✔" } else { " " }, name),
+                    base,
                 )
             }
         })
@@ -492,11 +502,13 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
 }
 
 fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
-    let path = cur_file_path(st);
-    let has_local = path.as_ref().map_or(false, |p| st.edit_diff_by_file.contains_key(p));
-    let title = match &path {
-        Some(p) => format!("[0] Diff — {p}{}", if has_local { "  · +local edits" } else { "" }),
-        None => "[0] Diff".to_string(),
+    let path = diff_path(st);
+    let local = path.as_ref().map_or(false, |p| is_local_diff(st, p));
+    let has_overlay = !local && path.as_ref().map_or(false, |p| st.edit_diff_by_file.contains_key(p));
+    let title = match (&path, local) {
+        (Some(p), true) => format!("[0] Local diff — {p}"),
+        (Some(p), false) => format!("[0] Diff — {p}{}", if has_overlay { "  · +local edits" } else { "" }),
+        (None, _) => "[0] Diff".to_string(),
     };
     let b = block(&title, st.focus == Focus::Diff, false);
     let inner = b.inner(area);
@@ -509,7 +521,8 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     }
 
     let empty = Vec::new();
-    let lines_vec = path.as_ref().and_then(|p| st.diff_by_file.get(p)).unwrap_or(&empty);
+    let src = if local { &st.edit_diff_by_file } else { &st.diff_by_file };
+    let lines_vec = path.as_ref().and_then(|p| src.get(p)).unwrap_or(&empty);
     let placeholder;
     let diff_lines: &[String] = if lines_vec.is_empty() && path.is_some() {
         placeholder = vec!["(no diff — binary, removed, or too large)".to_string()];
@@ -540,21 +553,27 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (1usize, 0usize) // empty
     };
 
-    // Pending comments to show inline, under the diff line they anchor to.
-    let pending_here: Vec<&PendingComment> = match &path {
-        Some(p) => st.pending.iter().filter(|c| &c.path == p).collect(),
-        None => Vec::new(),
+    // Pending comments to show inline (PR diff only — not on the local diff).
+    let pending_here: Vec<&PendingComment> = match (&path, local) {
+        (Some(p), false) => st.pending.iter().filter(|c| &c.path == p).collect(),
+        _ => Vec::new(),
     };
-    let info_here = path.as_ref().and_then(|p| st.info_by_file.get(p));
+    let info_here = path
+        .as_ref()
+        .and_then(|p| if local { st.edit_info_by_file.get(p) } else { st.info_by_file.get(p) });
 
-    // Local (uncommitted) worktree edits to overlay in orange, keyed by PR-head
-    // (= review new-side) line number.
-    let overlay = path.as_ref().and_then(|p| {
-        match (st.edit_diff_by_file.get(p), st.edit_info_by_file.get(p)) {
-            (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
-            _ => None,
-        }
-    });
+    // Local (uncommitted) worktree edits to overlay in orange on the PR diff. The
+    // local diff already *is* the edits, so no overlay there.
+    let overlay = if local {
+        None
+    } else {
+        path.as_ref().and_then(|p| {
+            match (st.edit_diff_by_file.get(p), st.edit_info_by_file.get(p)) {
+                (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
+                _ => None,
+            }
+        })
+    };
 
     // PR-deleted line contents: a locally re-added line matching one is a
     // *restore* (shown like context, leading space) rather than a new `+` line.
@@ -846,14 +865,27 @@ fn render_overlay(f: &mut Frame, st: &State) {
         }
         Overlay::CommitMsg { ta } => {
             let n = st.edit_files.len();
-            let branch = st.active_pr.as_ref().map_or("", |p| p.head.as_str());
             draw_modal_editor(f, area, ta,
-                &format!("Commit {n} file(s) → push to {branch}"),
-                "Enter: commit + push · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+                &format!("Commit {n} file(s) locally"),
+                "Enter: commit · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
         }
         Overlay::Ask { ta } => {
             draw_modal_editor(f, area, ta, "Ask Claude about this hunk",
                 "Enter: launch Claude · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+        }
+        Overlay::Confirm { prompt, .. } => {
+            let w = (prompt.chars().count() as u16 + 6).clamp(30, area.width.saturating_sub(4));
+            let rect = centered(area, w, 5);
+            let b = block("Confirm", true, false);
+            let inner = b.inner(rect);
+            f.render_widget(Clear, rect);
+            f.render_widget(b, rect);
+            f.render_widget(Paragraph::new(prompt.clone()), inner);
+            let help_y = inner.y + inner.height.saturating_sub(1);
+            f.render_widget(
+                Paragraph::new("y: confirm · any other key: cancel").style(theme::keys()),
+                Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
+            );
         }
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));
@@ -862,7 +894,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
             let inner = b.inner(rect);
             f.render_widget(Clear, rect);
             f.render_widget(b, rect);
-            let choices_h = REVIEW_EVENTS.len() as u16;
+            let choices_h = SUBMIT_CHOICES.len() as u16;
             let editor_h = inner.height.saturating_sub(choices_h + 2);
             // editor
             let mut ed = Vec::new();
@@ -875,7 +907,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
             f.render_widget(Paragraph::new(Line::styled("─".repeat(inner.width as usize), theme::dim())),
                 Rect { x: inner.x, y: div_y, width: inner.width, height: 1 });
             // choices
-            for (i, (_, label)) in REVIEW_EVENTS.iter().enumerate() {
+            for (i, (_, label)) in SUBMIT_CHOICES.iter().enumerate() {
                 let focused_choice = !*editing && i == *choice;
                 let style = if focused_choice { theme::selection() } else if !*editing { theme::focus() } else { theme::dim() };
                 let marker = if focused_choice { "▸ " } else { "  " };

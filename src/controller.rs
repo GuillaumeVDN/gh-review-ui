@@ -6,10 +6,12 @@ use crate::api;
 use crate::diff::compute_hunks;
 use crate::editor;
 use crate::models::{
-    Category, FileEntry, Focus, Overlay, PendingComment, Pr, State, TreeRow, REVIEW_EVENTS,
+    Category, ConfirmKind, FileEntry, Focus, Overlay, PendingComment, Pr, State, TreeRow,
+    SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    cur_file_path, current_hunk_range, first_change_index, hunk_comment_indices, line_target,
+    cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
+    is_local_diff, line_target,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -76,7 +78,7 @@ pub fn begin_open_local_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
     st.active_pr = Some(pr.clone());
     st.status = format!("Reviewing #{} locally…", pr.number);
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-    submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number) });
+    submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number), local: true });
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {
@@ -152,6 +154,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.active_pr = None;
                     st.active_worktree.clear();
                     st.files.clear();
+                    st.pr_files.clear();
                     st.viewed_by_path.clear();
                     st.commits.clear();
                     st.commit_selected.clear();
@@ -179,6 +182,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     pr.node_id = pr_id;
                     st.active_pr = Some(pr);
                     st.viewed_by_path = files.iter().map(|f| (f.path.clone(), f.viewed)).collect();
+                    st.pr_files = files.clone();
                     st.files = files;
                     st.commit_selected = commits.iter().map(|c| c.oid.clone()).collect();
                     st.commits = commits;
@@ -207,6 +211,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                 .iter()
                 .map(|p| FileEntry { path: p.clone(), viewed: *st.viewed_by_path.get(p).unwrap_or(&false) })
                 .collect();
+            st.pr_files = st.files.clone();
             set_diff(st, diff, info);
             st.file_idx = 0;
             st.file_offset = 0;
@@ -219,7 +224,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.status = format!("Worktree ready for #{number} — loading…");
             api::save_last_pr(&st.repo_owner, &st.repo_name, number);
             let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-            submit(st, tx, Job::LoadActive { owner, name, login, number: Some(number) });
+            submit(st, tx, Job::LoadActive { owner, name, login, number: Some(number), local: false });
         }
         Msg::ViewedOk { paths, viewed } => {
             // Optimistic state already matches; just confirm and clear the record.
@@ -280,6 +285,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         }
         Msg::Edits { files, diff, info } => {
             st.busy.remove("edits");
+            st.edit_hunks_by_file = diff.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+            st.edit_kind_by_path = files.iter().map(|e| (e.path.clone(), e.kind)).collect();
             st.edit_files = files;
             st.edit_diff_by_file = diff;
             st.edit_info_by_file = info;
@@ -288,6 +295,18 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             if st.edit_idx >= st.edit_tree.len() {
                 st.edit_idx = st.edit_tree.len().saturating_sub(1);
             }
+            // A file whose local diff is on screen may have just been committed away.
+            if let Some(p) = st.local_diff_path.clone() {
+                if !st.edit_diff_by_file.contains_key(&p) {
+                    st.local_diff_path = None;
+                    if st.focus == Focus::Diff {
+                        st.focus = Focus::Edits;
+                    }
+                }
+            }
+            // Merge edit-only files (new/deleted/renamed, not in the PR diff) into
+            // the Files tree so [3] shows them too (item 7).
+            merge_edit_files_into_tree(st);
         }
         Msg::EditsCommitted { status } => {
             st.busy.remove("editcommit");
@@ -297,6 +316,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         Msg::Done { kind, msg } => {
             st.busy.remove(&kind);
             st.status = msg;
+            if kind == "editpush" {
+                reload_edits(st, tx); // committed edits are gone from the worktree
+            }
         }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
@@ -322,7 +344,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
 
 /// Open the "ask Claude" modal for the currently selected hunk.
 pub fn begin_ask(st: &mut State) {
-    if cur_file_path(st).is_none() {
+    if diff_path(st).is_none() {
         st.status = "No file/hunk selected.".into();
         return;
     }
@@ -334,12 +356,14 @@ pub fn begin_ask(st: &mut State) {
 pub fn confirm_ask(st: &mut State) {
     let Overlay::Ask { ta } = &st.overlay else { return };
     let question = ta.text().trim().to_string();
-    let path = cur_file_path(st);
+    let path = diff_path(st);
 
-    // A few context lines of diff around the selected change block.
+    // A few context lines of diff around the selected change block (local diff if
+    // that's what's on screen, else the PR diff).
     let mut snippet = String::new();
     if let Some(p) = &path {
-        if let (Some(lines), Some((s, e))) = (st.diff_by_file.get(p), current_hunk_range(st, p)) {
+        let src = if is_local_diff(st, p) { &st.edit_diff_by_file } else { &st.diff_by_file };
+        if let (Some(lines), Some((s, e))) = (src.get(p), current_hunk_range(st, p)) {
             let lo = s.saturating_sub(6);
             let hi = (e + 6).min(lines.len());
             for l in &lines[lo..hi] {
@@ -576,6 +600,22 @@ pub fn confirm_comment(st: &mut State, tx: &Sender<Job>) {
     let end_idx = st.comment_start.map_or(st.comment_line, |s| s.max(st.comment_line));
     st.last_comment = Some((path.clone(), end_idx));
     let Some(pr) = st.active_pr.clone() else { return };
+    if st.local_mode {
+        // Store locally, never touch the PR.
+        let comment = PendingComment {
+            path: path.clone(),
+            body,
+            line,
+            side,
+            comment_id: local_comment_id(),
+            start_line,
+            start_side,
+        };
+        st.pending.push(comment);
+        save_local(st);
+        st.status = format!("Saved comment on {path}:{line} locally");
+        return;
+    }
     let comment = PendingComment {
         path: path.clone(),
         body,
@@ -589,6 +629,22 @@ pub fn confirm_comment(st: &mut State, tx: &Sender<Job>) {
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
     submit(st, tx, Job::AddPending { owner, name, number: pr.number, login, pr_id: pr.node_id, comment });
     st.status = format!("Adding comment on {path}:{line} to pending review…");
+}
+
+/// A unique id for a locally-stored comment.
+fn local_comment_id() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("local-{n}")
+}
+
+/// Persist the current pending comments to the local store (local PR mode).
+fn save_local(st: &State) {
+    if let Some(pr) = &st.active_pr {
+        api::save_local_comments(&st.repo_owner, &st.repo_name, pr.number, &st.pending);
+    }
 }
 
 // ---- edit pending ----
@@ -623,9 +679,36 @@ pub fn confirm_edit(st: &mut State, tx: &Sender<Job>) {
             c.body = body.clone();
         }
     }
+    if st.local_mode {
+        save_local(st);
+        st.status = format!("Updated comment on {path}:{line} locally");
+        return;
+    }
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
     submit(st, tx, Job::EditPending { owner, name, number: pr.number, login, comment_id, body });
     st.status = format!("Updating comment on {path}:{line}…");
+}
+
+/// Discard the selected pending comment (the `d` key in [5]).
+pub fn discard_selected_comment(st: &mut State, tx: &Sender<Job>) {
+    if st.pending_idx >= st.pending.len() || st.busy.contains("pending") || st.active_pr.is_none() {
+        return;
+    }
+    let removed = st.pending.remove(st.pending_idx);
+    st.pending_idx = st.pending_idx.min(st.pending.len().saturating_sub(1));
+    if st.local_mode {
+        save_local(st);
+        st.status = format!("Deleted comment on {}:{} locally", removed.path, removed.line);
+        return;
+    }
+    let pr = st.active_pr.clone().unwrap();
+    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    submit(
+        st,
+        tx,
+        Job::DiscardPending { owner, name, number: pr.number, login, comment_id: removed.comment_id },
+    );
+    st.status = format!("Discarding comment on {}:{}…", removed.path, removed.line);
 }
 
 /// Delete the comment currently open in the Edit modal (Ctrl+D).
@@ -638,6 +721,11 @@ pub fn delete_editing_comment(st: &mut State, tx: &Sender<Job>) {
         if st.pending_idx >= st.pending.len() {
             st.pending_idx = st.pending.len().saturating_sub(1);
         }
+    }
+    if st.local_mode {
+        save_local(st);
+        st.status = format!("Deleted comment on {path}:{line} locally");
+        return;
     }
     if comment_id.is_empty() {
         return;
@@ -662,11 +750,69 @@ pub fn confirm_review(st: &mut State, tx: &Sender<Job>) {
     let overlay = std::mem::replace(&mut st.overlay, Overlay::None);
     let Overlay::Review { ta, choice, .. } = overlay else { return };
     let Some(pr) = st.active_pr.clone() else { return };
-    let event = REVIEW_EVENTS[choice.min(REVIEW_EVENTS.len() - 1)].0.to_string();
+    let event = SUBMIT_CHOICES[choice.min(SUBMIT_CHOICES.len() - 1)].0.to_string();
     let body = ta.text();
+
+    if event == "CLAUDE" {
+        if st.pending.is_empty() && body.trim().is_empty() {
+            st.status = "No comments to send.".into();
+            return;
+        }
+        let prompt = build_review_prompt(st, &body);
+        match editor::send_review_to_claude(st, &prompt) {
+            Ok(()) => st.status = "Sent review comments to Claude…".into(),
+            Err(e) => st.status = format!("Failed to launch Claude: {e}"),
+        }
+        return;
+    }
+
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    if st.local_mode {
+        // Comments live locally — post them all to the PR, then submit the review.
+        let comments = st.pending.clone();
+        st.status = format!("Posting {} comment(s) and submitting review ({event})…", comments.len());
+        submit(st, tx, Job::PostLocalReview {
+            owner, name, number: pr.number, login, pr_id: pr.node_id, comments, event, body,
+        });
+        return;
+    }
     st.status = format!("Submitting review ({event})…");
     submit(st, tx, Job::SubmitReview { owner, name, number: pr.number, login, pr_id: pr.node_id, event, body });
+}
+
+/// Assemble a prompt handing all pending review comments (with diff context) to
+/// Claude to address in the checkout.
+fn build_review_prompt(st: &State, body: &str) -> String {
+    let (num, title) = st
+        .active_pr
+        .as_ref()
+        .map(|p| (p.number, p.title.clone()))
+        .unwrap_or((0, String::new()));
+    let mut s = format!(
+        "I'm reviewing GitHub PR #{num} ({title}). You're in the checkout for it. \
+         Please address these review comments by editing the code:\n\n"
+    );
+    if !body.trim().is_empty() {
+        s.push_str(&format!("Overall note: {}\n\n", body.trim()));
+    }
+    for c in &st.pending {
+        let loc = match c.start_line {
+            Some(sl) => format!("{}-{}", sl.min(c.line), sl.max(c.line)),
+            None => c.line.to_string(),
+        };
+        s.push_str(&format!("### {}:{loc}\n", c.path));
+        let (hunk, _) = crate::navigation::hunk_for_comment(st, c);
+        if !hunk.is_empty() {
+            s.push_str("```diff\n");
+            for l in &hunk {
+                s.push_str(l);
+                s.push('\n');
+            }
+            s.push_str("```\n");
+        }
+        s.push_str(&format!("Comment: {}\n\n", c.body));
+    }
+    s
 }
 
 // ---- files pane helpers ----
@@ -759,6 +905,37 @@ pub fn fold_viewed(st: &mut State) {
 
 // ---- pending edits (local worktree changes) ----
 
+/// Rebuild the Files list as the PR files plus edit-only local files (new /
+/// deleted / renamed) so [3] shows them too (item 7).
+fn merge_edit_files_into_tree(st: &mut State) {
+    let mut files = st.pr_files.clone();
+    for e in &st.edit_files {
+        if !st.pr_files.iter().any(|f| f.path == e.path) {
+            let viewed = *st.viewed_by_path.get(&e.path).unwrap_or(&false);
+            files.push(FileEntry { path: e.path.clone(), viewed });
+        }
+    }
+    st.files = files;
+    tree::rebuild(st);
+}
+
+/// Show the selected pending-edit file's local diff in [0] with hunk navigation.
+pub fn enter_local_diff(st: &mut State) {
+    let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
+        return;
+    };
+    let Some(entry) = st.edit_files.get(index) else { return };
+    let path = entry.path.clone();
+    if !st.edit_diff_by_file.contains_key(&path) {
+        return;
+    }
+    st.local_diff_path = Some(path);
+    st.focus = Focus::Diff;
+    st.diff_scroll = 0;
+    st.diff_hunk_idx = 0;
+    st.diff_reveal_pending = true;
+}
+
 /// Refresh the pending-edits list from the worktree (no-op without a worktree).
 pub fn reload_edits(st: &mut State, tx: &Sender<Job>) {
     if st.active_worktree.is_empty() || st.busy.contains("edits") {
@@ -768,25 +945,41 @@ pub fn reload_edits(st: &mut State, tx: &Sender<Job>) {
     submit(st, tx, Job::LoadEdits { wt });
 }
 
-/// Revert the selected file's local change.
-pub fn discard_edit(st: &mut State, tx: &Sender<Job>) {
-    if st.busy.contains("edits") {
+/// Ask to revert the selected file's local change (confirmation before the
+/// destructive discard).
+pub fn begin_discard_edit(st: &mut State) {
+    if st.busy.contains("edits") || st.active_worktree.is_empty() {
         return;
     }
     let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
         return;
     };
     let Some(entry) = st.edit_files.get(index).cloned() else { return };
-    if st.active_worktree.is_empty() {
-        return;
-    }
-    let wt = st.active_worktree.clone();
     let added = entry.kind == crate::models::EditKind::Added;
-    st.status = format!("Reverting local changes to {}…", entry.path);
-    submit(st, tx, Job::DiscardEdit { wt, path: entry.path, added });
+    let verb = if added { "Delete new file" } else { "Discard local changes to" };
+    st.overlay = Overlay::Confirm {
+        prompt: format!("{verb} {}?  (y/n)", entry.path),
+        kind: ConfirmKind::RevertEdit { path: entry.path, added },
+    };
 }
 
-/// Open the commit-message modal for the pending edits (if any).
+/// Perform the confirmed action from an [`Overlay::Confirm`].
+pub fn confirm_action(st: &mut State, tx: &Sender<Job>) {
+    let overlay = std::mem::replace(&mut st.overlay, Overlay::None);
+    let Overlay::Confirm { kind, .. } = overlay else { return };
+    match kind {
+        ConfirmKind::RevertEdit { path, added } => {
+            if st.active_worktree.is_empty() {
+                return;
+            }
+            let wt = st.active_worktree.clone();
+            st.status = format!("Reverting local changes to {path}…");
+            submit(st, tx, Job::DiscardEdit { wt, path, added });
+        }
+    }
+}
+
+/// Open the commit-message modal for the pending edits (`c` in [4]).
 pub fn begin_commit_edits(st: &mut State) {
     if st.active_worktree.is_empty() {
         st.status = "No worktree — nothing to commit.".into();
@@ -796,15 +989,10 @@ pub fn begin_commit_edits(st: &mut State) {
         st.status = "No local changes to commit.".into();
         return;
     }
-    let head = st.active_pr.as_ref().map_or("", |p| p.head.as_str());
-    if head.is_empty() {
-        st.status = "Unknown PR head branch — cannot commit/push.".into();
-        return;
-    }
     st.overlay = Overlay::CommitMsg { ta: TextArea::new("") };
 }
 
-/// Commit + push the pending edits with the entered message.
+/// Commit the pending edits with the entered message (no push).
 pub fn confirm_commit_edits(st: &mut State, tx: &Sender<Job>) {
     let Overlay::CommitMsg { ta } = &st.overlay else { return };
     let message = ta.text().trim().to_string();
@@ -812,25 +1000,109 @@ pub fn confirm_commit_edits(st: &mut State, tx: &Sender<Job>) {
         st.status = "Commit message is empty.".into();
         return;
     }
-    let Some(pr) = st.active_pr.clone() else { return };
-    if pr.head.is_empty() || st.active_worktree.is_empty() || st.edit_files.is_empty() {
+    if st.active_worktree.is_empty() || st.edit_files.is_empty() {
         return;
     }
     let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
     st.overlay = Overlay::None;
-    st.status = format!("Committing {} file(s) and pushing to {}…", paths.len(), pr.head);
+    st.status = format!("Committing {} file(s)…", paths.len());
+    submit(st, tx, Job::CommitEdits { wt: st.active_worktree.clone(), message, paths });
+}
+
+/// Push the committed edits to the PR branch (`P` in [4]); re-mark the pushed
+/// files as viewed if they were already viewed (so they don't reappear as new).
+pub fn push_edits(st: &mut State, tx: &Sender<Job>) {
+    if st.busy.contains("editpush") {
+        return;
+    }
+    let Some(pr) = st.active_pr.clone() else { return };
+    if pr.head.is_empty() {
+        st.status = "Unknown PR head branch — cannot push.".into();
+        return;
+    }
+    if st.active_worktree.is_empty() {
+        return;
+    }
+    let viewed: Vec<String> = st
+        .viewed_by_path
+        .iter()
+        .filter(|(_, v)| **v)
+        .map(|(p, _)| p.clone())
+        .collect();
+    st.status = format!("Pushing to {}…", pr.head);
     submit(
         st,
         tx,
-        Job::CommitEdits {
+        Job::PushEdits {
             wt: st.active_worktree.clone(),
             repo_root: st.repo_root.clone(),
             owner: st.repo_owner.clone(),
             name: st.repo_name.clone(),
             branch: pr.head,
-            message,
-            paths,
+            pr_id: pr.node_id,
+            viewed,
         },
     );
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Category, EditEntry, EditKind, FileEntry, PendingComment, Pr};
+
+    fn pr(number: i64) -> Pr {
+        Pr {
+            number,
+            title: "T".into(),
+            head: "h".into(),
+            author: "a".into(),
+            node_id: String::new(),
+            category: Category::CheckedOut,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_adds_edit_only_files_without_dups() {
+        let mut st = State::default();
+        st.pr_files = vec![
+            FileEntry { path: "a.rs".into(), viewed: true },
+            FileEntry { path: "b.rs".into(), viewed: false },
+        ];
+        st.edit_files = vec![
+            EditEntry { path: "b.rs".into(), kind: EditKind::Modified }, // already a PR file
+            EditEntry { path: "new.rs".into(), kind: EditKind::Added },  // edit-only
+        ];
+        merge_edit_files_into_tree(&mut st);
+        let paths: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.rs") && paths.contains(&"b.rs") && paths.contains(&"new.rs"));
+        assert_eq!(st.files.iter().filter(|f| f.path == "b.rs").count(), 1, "no duplicate");
+        // Existing PR files keep their viewed flag.
+        assert!(st.files.iter().find(|f| f.path == "a.rs").unwrap().viewed);
+    }
+
+    #[test]
+    fn review_prompt_lists_each_comment() {
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pending = vec![
+            PendingComment {
+                path: "x.rs".into(), body: "fix this".into(), line: 10,
+                side: "RIGHT".into(), comment_id: String::new(),
+                start_line: None, start_side: String::new(),
+            },
+            PendingComment {
+                path: "y.rs".into(), body: "and that".into(), line: 5,
+                side: "RIGHT".into(), comment_id: String::new(),
+                start_line: Some(3), start_side: "RIGHT".into(),
+            },
+        ];
+        let p = build_review_prompt(&st, "overall note");
+        assert!(p.contains("#7"));
+        assert!(p.contains("overall note"));
+        assert!(p.contains("x.rs:10") && p.contains("fix this"));
+        assert!(p.contains("y.rs:3-5") && p.contains("and that"));
+    }
+}

@@ -339,41 +339,48 @@ pub fn discard_edit(wt: &str, path: &str, added: bool) -> Result<()> {
     }
 }
 
-/// Stage exactly `paths`, commit with `message`, then push (non-force) to the
-/// PR head `branch` on `remote`. Returns `false` (no-op) when `paths` is empty.
-pub fn commit_edit_files(
-    wt: &str,
-    remote: &str,
-    branch: &str,
-    message: &str,
-    paths: &[String],
-) -> Result<bool> {
+/// Stage exactly `paths` and commit them (no push). Returns `false` (no-op) when
+/// `paths` is empty. Skips hooks — review fixups shouldn't be blocked by them.
+pub fn commit_edit_files(wt: &str, message: &str, paths: &[String]) -> Result<bool> {
     if paths.is_empty() {
         return Ok(false);
-    }
-    if branch.is_empty() {
-        return Err(anyhow!("unknown PR head branch — cannot push"));
-    }
-    // Refuse to push unless the PR head branch already exists on this remote, so
-    // a non-force push updates the PR and never creates a stray branch (e.g. for
-    // a fork PR whose head lives on another remote). Checked before committing.
-    let remote_ref = sh(&["git", "-C", wt, "ls-remote", "--heads", remote, branch]).unwrap_or_default();
-    if remote_ref.trim().is_empty() {
-        return Err(anyhow!(
-            "branch '{branch}' not found on '{remote}' (fork PR?) — nothing committed or pushed"
-        ));
     }
     let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
     for p in paths {
         add_args.push(p.as_str());
     }
     sh(&add_args)?;
-    // Skip pre-commit / commit-msg / pre-push hooks — review fixups shouldn't be
-    // blocked by the project's local hooks.
     sh(&["git", "-C", wt, "commit", "--no-verify", "-m", message])?;
+    Ok(true)
+}
+
+/// The remote branch's current tip sha (before a push), if it exists.
+pub fn remote_branch_sha(wt: &str, remote: &str, branch: &str) -> Option<String> {
+    let out = sh(&["git", "-C", wt, "ls-remote", "--heads", remote, branch]).ok()?;
+    out.split_whitespace().next().map(str::to_string)
+}
+
+/// Files changed between `old_sha` and HEAD (what a push adds to the branch).
+pub fn changed_files_since(wt: &str, old_sha: &str) -> Vec<String> {
+    sh(&["git", "-C", wt, "diff", "--name-only", &format!("{old_sha}..HEAD")])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Push (non-force, no hooks) the current branch to the PR head `branch` on
+/// `remote`. Refuses if that branch doesn't already exist on the remote, so it
+/// never creates a stray branch (e.g. a fork PR whose head lives elsewhere).
+pub fn push_edits(wt: &str, remote: &str, branch: &str) -> Result<String> {
+    if branch.is_empty() {
+        return Err(anyhow!("unknown PR head branch — cannot push"));
+    }
+    let remote_ref = sh(&["git", "-C", wt, "ls-remote", "--heads", remote, branch]).unwrap_or_default();
+    if remote_ref.trim().is_empty() {
+        return Err(anyhow!("branch '{branch}' not found on '{remote}' (fork PR?) — not pushed"));
+    }
     let refspec = format!("HEAD:refs/heads/{branch}");
     sh(&["git", "-C", wt, "push", "--no-verify", remote, &refspec])?;
-    Ok(true)
+    Ok(format!("Pushed to {branch}"))
 }
 
 /// Check out PR `number` into the local dev checkout `dir` (e.g. ~/Projects/<repo>),
@@ -562,6 +569,61 @@ pub fn submit_review_api(owner: &str, name: &str, number: i64, login: &str, pr_i
     Ok(())
 }
 
+// ---- local review comments (local PR mode) ----
+
+fn local_comments_path(owner: &str, name: &str, number: i64) -> PathBuf {
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    PathBuf::from(cache)
+        .join("gh-review-ui")
+        .join("comments")
+        .join(format!("{owner}__{name}__pr-{number}.json"))
+}
+
+/// Serialize a comment to the local-store JSON shape.
+pub fn comment_to_json(c: &PendingComment) -> Value {
+    json!({
+        "id": c.comment_id,
+        "path": c.path,
+        "line": c.line,
+        "side": c.side,
+        "start_line": c.start_line,
+        "start_side": c.start_side,
+        "body": c.body,
+    })
+}
+
+/// Parse one local-store JSON entry back to a comment (used by tests too).
+pub fn comment_from_json(v: &Value) -> Option<PendingComment> {
+    Some(PendingComment {
+        comment_id: v["id"].as_str().unwrap_or("").to_string(),
+        path: v["path"].as_str()?.to_string(),
+        line: v["line"].as_i64().unwrap_or(0),
+        side: v["side"].as_str().unwrap_or("RIGHT").to_string(),
+        start_line: v["start_line"].as_i64(),
+        start_side: v["start_side"].as_str().unwrap_or("").to_string(),
+        body: v["body"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+pub fn load_local_comments(owner: &str, name: &str, number: i64) -> Vec<PendingComment> {
+    let path = local_comments_path(owner, name, number);
+    let Ok(s) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else { return Vec::new() };
+    v.as_array()
+        .map(|arr| arr.iter().filter_map(comment_from_json).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_local_comments(owner: &str, name: &str, number: i64, comments: &[PendingComment]) {
+    let path = local_comments_path(owner, name, number);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let arr: Vec<Value> = comments.iter().map(comment_to_json).collect();
+    std::fs::write(&path, Value::Array(arr).to_string()).ok();
+}
+
 // ---- session persistence ----
 
 fn session_file() -> PathBuf {
@@ -588,4 +650,48 @@ pub fn save_last_pr(owner: &str, name: &str, number: i64) {
 pub fn load_last_pr(owner: &str, name: &str) -> Option<i64> {
     let data: Value = serde_json::from_str(&std::fs::read_to_string(session_file()).ok()?).ok()?;
     data.get(format!("{owner}/{name}")).and_then(|v| v.as_i64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::PendingComment;
+
+    #[test]
+    fn local_comment_json_round_trip() {
+        let c = PendingComment {
+            path: "src/a.rs".into(),
+            body: "line\nwith newline".into(),
+            line: 42,
+            side: "RIGHT".into(),
+            comment_id: "local-123".into(),
+            start_line: Some(40),
+            start_side: "RIGHT".into(),
+        };
+        let back = comment_from_json(&comment_to_json(&c)).unwrap();
+        assert_eq!(back.path, c.path);
+        assert_eq!(back.line, c.line);
+        assert_eq!(back.side, c.side);
+        assert_eq!(back.comment_id, c.comment_id);
+        assert_eq!(back.start_line, c.start_line);
+        assert_eq!(back.start_side, c.start_side);
+        assert_eq!(back.body, c.body);
+    }
+
+    #[test]
+    fn local_comment_json_defaults() {
+        // A single-line comment with no range.
+        let c = PendingComment {
+            path: "f".into(),
+            body: "b".into(),
+            line: 1,
+            side: "RIGHT".into(),
+            comment_id: "local-1".into(),
+            start_line: None,
+            start_side: String::new(),
+        };
+        let v = comment_to_json(&c);
+        let back = comment_from_json(&v).unwrap();
+        assert_eq!(back.start_line, None);
+    }
 }

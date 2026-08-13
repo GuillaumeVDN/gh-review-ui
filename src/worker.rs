@@ -16,7 +16,7 @@ type Info = HashMap<String, Vec<LineInfo>>;
 
 pub enum Job {
     LoadPrs { repo_root: String },
-    LoadActive { owner: String, name: String, login: String, number: Option<i64> },
+    LoadActive { owner: String, name: String, login: String, number: Option<i64>, local: bool },
     LoadCommitDiff { first: String, last: String },
     OpenPr { repo_root: String, owner: String, name: String, number: i64 },
     MarkViewed { pr_id: String, path: String, viewed: bool },
@@ -26,16 +26,27 @@ pub enum Job {
     DiscardPending { owner: String, name: String, number: i64, login: String, comment_id: String },
     EditPending { owner: String, name: String, number: i64, login: String, comment_id: String, body: String },
     SubmitReview { owner: String, name: String, number: i64, login: String, pr_id: String, event: String, body: String },
+    PostLocalReview {
+        owner: String,
+        name: String,
+        number: i64,
+        login: String,
+        pr_id: String,
+        comments: Vec<PendingComment>,
+        event: String,
+        body: String,
+    },
     LoadEdits { wt: String },
     DiscardEdit { wt: String, path: String, added: bool },
-    CommitEdits {
+    CommitEdits { wt: String, message: String, paths: Vec<String> },
+    PushEdits {
         wt: String,
         repo_root: String,
         owner: String,
         name: String,
         branch: String,
-        message: String,
-        paths: Vec<String>,
+        pr_id: String,
+        viewed: Vec<String>,
     },
     CheckoutLocal { dir: String, owner: String, name: String, number: i64 },
     Quit,
@@ -76,9 +87,10 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::MarkViewed { .. } | Job::MarkViewedBulk { .. } => "viewed",
         Job::LoadPrDetails(_) => "details",
         Job::AddPending { .. } | Job::DiscardPending { .. } | Job::EditPending { .. } => "pending",
-        Job::SubmitReview { .. } => "review",
+        Job::SubmitReview { .. } | Job::PostLocalReview { .. } => "review",
         Job::LoadEdits { .. } | Job::DiscardEdit { .. } => "edits",
         Job::CommitEdits { .. } => "editcommit",
+        Job::PushEdits { .. } => "editpush",
         Job::CheckoutLocal { .. } => "checkout",
         Job::Quit => "",
     }
@@ -87,7 +99,7 @@ pub fn job_tag(job: &Job) -> &'static str {
 fn run(job: &Job) -> anyhow::Result<Msg> {
     Ok(match job {
         Job::LoadPrs { repo_root } => Msg::Prs(api::load_prs(repo_root)?),
-        Job::LoadActive { owner, name, login, number } => match number {
+        Job::LoadActive { owner, name, login, number, local } => match number {
             None => Msg::Active {
                 number: None,
                 pr_id: String::new(),
@@ -105,7 +117,10 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
                 } else {
                     api::load_diff(*n)?
                 };
-                let pending = if login.is_empty() {
+                // Local mode: comments live in a local store, not on the PR.
+                let pending = if *local {
+                    api::load_local_comments(owner, name, *n)
+                } else if login.is_empty() {
                     vec![]
                 } else {
                     api::load_pending_comments(owner, name, *n, login).unwrap_or_default()
@@ -159,6 +174,14 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
             api::submit_review_api(owner, name, *number, login, pr_id, event, body)?;
             Msg::ReviewSubmitted(event.clone())
         }
+        Job::PostLocalReview { owner, name, number, login, pr_id, comments, event, body } => {
+            for c in comments {
+                let _ = api::add_pending_comment_api(owner, name, *number, login, pr_id, c);
+            }
+            api::submit_review_api(owner, name, *number, login, pr_id, event, body)?;
+            api::save_local_comments(owner, name, *number, &[]); // drafts consumed
+            Msg::ReviewSubmitted(event.clone())
+        }
         Job::LoadEdits { wt } => {
             let (files, diff, info) = api::load_edits(wt);
             Msg::Edits { files, diff, info }
@@ -168,16 +191,30 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
             let (files, diff, info) = api::load_edits(wt);
             Msg::Edits { files, diff, info }
         }
-        Job::CommitEdits { wt, repo_root, owner, name, branch, message, paths } => {
-            let remote = api::base_remote(repo_root, owner, name);
-            let pushed = api::commit_edit_files(wt, &remote, branch, message, paths)?;
+        Job::CommitEdits { wt, message, paths } => {
+            let committed = api::commit_edit_files(wt, message, paths)?;
             Msg::EditsCommitted {
-                status: if pushed {
-                    format!("Committed {} file(s) and pushed to {branch}", paths.len())
+                status: if committed {
+                    format!("Committed {} file(s)", paths.len())
                 } else {
                     "No local changes to commit".into()
                 },
             }
+        }
+        Job::PushEdits { wt, repo_root, owner, name, branch, pr_id, viewed } => {
+            let remote = api::base_remote(repo_root, owner, name);
+            // Old remote tip → the files this push changes (to re-mark as viewed).
+            let old = api::remote_branch_sha(wt, &remote, branch);
+            let mut msg = api::push_edits(wt, &remote, branch)?;
+            if let Some(old_sha) = old {
+                let changed = api::changed_files_since(wt, &old_sha);
+                let remark: Vec<String> = changed.into_iter().filter(|p| viewed.contains(p)).collect();
+                if !pr_id.is_empty() && !remark.is_empty() {
+                    let (done, _errs) = api::mark_viewed_bulk_api(pr_id, &remark, true);
+                    msg = format!("{msg} · re-marked {} viewed", done.len());
+                }
+            }
+            Msg::Done { kind: "editpush".into(), msg }
         }
         Job::CheckoutLocal { dir, owner, name, number } => {
             let msg = api::checkout_pr_local(dir, owner, name, *number)?;

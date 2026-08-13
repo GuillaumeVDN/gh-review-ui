@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::gh::sh;
 use crate::models::{State, TreeRow};
-use crate::navigation::{cur_file_path, current_hunk_editor_line};
+use crate::navigation::{current_hunk_editor_line, diff_path};
 
 fn cache_dir() -> PathBuf {
     let base = std::env::var("XDG_CACHE_HOME")
@@ -76,6 +76,45 @@ pub fn open_pr_in_browser(owner: &str, name: &str, number: i64) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Hand a whole review (all pending comments) to a fresh local Claude window.
+/// Worktree PRs open it grouped beside the TUI; the locally checked-out PR opens
+/// it on workspace 4. (Reusing an already-running Claude would need a keystroke
+/// tool like wtype/ydotool, which isn't assumed here.)
+pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String> {
+    let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let file = dir.join(format!("review-{ts}.txt"));
+    std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
+    let fp = file.display().to_string();
+    let script =
+        format!("p=\"$(cat '{fp}')\"; rm -f '{fp}'; exec claude --dangerously-skip-permissions \"$p\"");
+    let title = "ghr-review-claude";
+    if st.local_mode {
+        // Place it on workspace 4 silently via a window rule matched on the title.
+        let _ = Command::new("hyprctl")
+            .args(["keyword", "windowrulev2", &format!("workspace 4 silent, title:^{title}$")])
+            .output();
+    } else if !in_group() {
+        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+        st.entered_group = true;
+    }
+    Command::new("ghostty")
+        .arg(format!("--title={title}"))
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(script)
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn spawn_bash(script: &str, cwd: &str) {
@@ -271,7 +310,7 @@ pub fn open_current_edit_in_editor(st: &mut State) {
 /// repo / `~/Projects/<repo>`), reuse the shared `/tmp/nvim.sock` editor. When it
 /// resolves to the review worktree, use a dedicated per-worktree Neovim window.
 pub fn open_current_in_editor(st: &mut State, top: bool) {
-    let Some(path) = cur_file_path(st) else {
+    let Some(path) = diff_path(st) else {
         st.status = "No file selected.".into();
         return;
     };

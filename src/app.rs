@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::models::{Category, Focus, Overlay, State, TreeRow, REVIEW_EVENTS};
+use crate::models::{Category, Focus, Overlay, State, TreeRow, SUBMIT_CHOICES};
 use crate::navigation as nav;
 use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
@@ -171,7 +171,7 @@ fn overlay_ta(st: &mut State) -> Option<&mut TextArea> {
         | Overlay::Review { ta, .. }
         | Overlay::CommitMsg { ta }
         | Overlay::Ask { ta } => Some(ta),
-        Overlay::None => None,
+        Overlay::None | Overlay::Confirm { .. } => None,
     }
 }
 
@@ -225,7 +225,7 @@ fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
         if st.local_mode {
             if !st.busy.contains("active") {
                 let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-                controller::submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number) });
+                controller::submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number), local: true });
             }
         } else if !st.busy.contains("worktree") && !st.busy.contains("active") {
             let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
@@ -290,7 +290,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                     controller::begin_edit_pending(st);
                 }
             }
-            KeyCode::Char('d') => discard_pending(st, tx),
+            KeyCode::Char('d') => controller::discard_selected_comment(st, tx),
             _ => {}
         },
         Focus::Files => match k.code {
@@ -335,8 +335,10 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char('z') => jump_edit_file(st, 1),
             KeyCode::PageDown => st.edit_diff_scroll += page,
             KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
-            KeyCode::Enter => controller::begin_commit_edits(st),
-            KeyCode::Char('d') => controller::discard_edit(st, tx),
+            KeyCode::Enter => controller::enter_local_diff(st),
+            KeyCode::Char('c') => controller::begin_commit_edits(st),
+            KeyCode::Char('P') => controller::push_edits(st, tx),
+            KeyCode::Char('d') => controller::begin_discard_edit(st),
             KeyCode::Char('Z') => {
                 st.edit_collapsed.clear();
                 crate::tree::rebuild_edits(st);
@@ -350,10 +352,20 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Up | KeyCode::Char('k') => nav::jump_hunk(st, -1),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
-            KeyCode::Char('c') => controller::enter_comment_mode(st),
+            KeyCode::Char('c') => {
+                if st.local_diff_path.is_none() {
+                    controller::enter_comment_mode(st);
+                }
+            }
             KeyCode::Char('a') => controller::begin_ask(st),
             KeyCode::Char('e') => editor::open_current_in_editor(st, false),
-            KeyCode::Esc => st.focus = Focus::Files,
+            KeyCode::Esc => {
+                if st.local_diff_path.take().is_some() {
+                    st.focus = Focus::Edits; // came from [4]
+                } else {
+                    st.focus = Focus::Files;
+                }
+            }
             _ => {}
         },
     }
@@ -394,6 +406,14 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
         }
         return;
     }
+    // Yes/no confirmation.
+    if matches!(st.overlay, Overlay::Confirm { .. }) {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Enter => controller::confirm_action(st, tx),
+            _ => st.overlay = Overlay::None,
+        }
+        return;
+    }
     // Review — choices mode
     if matches!(&st.overlay, Overlay::Review { editing, .. } if !*editing) {
         if k.code == KeyCode::Enter {
@@ -410,7 +430,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *choice = (*choice + 1).min(REVIEW_EVENTS.len() - 1);
+                    *choice = (*choice + 1).min(SUBMIT_CHOICES.len() - 1);
                 }
                 _ => {}
             }
@@ -437,7 +457,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                             *editing = false;
                         }
                     }
-                    Overlay::None => {}
+                    Overlay::None | Overlay::Confirm { .. } => {}
                 }
             }
         }
@@ -533,6 +553,7 @@ fn set_file_idx(st: &mut State, idx: usize) {
     st.file_idx = idx.min(st.tree.len().saturating_sub(1));
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.local_diff_path = None; // back to the PR diff for the selected file
 }
 
 fn set_edit_idx(st: &mut State, idx: usize) {
@@ -547,6 +568,7 @@ fn jump_file(st: &mut State, direction: i64) {
             st.file_idx = i as usize;
             st.diff_scroll = 0;
             st.diff_hunk_idx = 0;
+            st.local_diff_path = None;
             return;
         }
         i += direction;
@@ -618,6 +640,7 @@ fn open_file_or_dir(st: &mut State) {
             st.diff_scroll = 0;
             st.diff_hunk_idx = 0;
             st.diff_reveal_pending = true;
+            st.local_diff_path = None;
         }
         Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
         None => {}
@@ -648,21 +671,6 @@ fn checkout_local(st: &mut State, tx: &mpsc::Sender<Job>) {
     controller::submit(st, tx, Job::CheckoutLocal { dir, owner, name, number });
 }
 
-fn discard_pending(st: &mut State, tx: &mpsc::Sender<Job>) {
-    if st.pending_idx >= st.pending.len() || st.busy.contains("pending") || st.active_pr.is_none() {
-        return;
-    }
-    let removed = st.pending.remove(st.pending_idx);
-    st.pending_idx = st.pending_idx.min(st.pending.len().saturating_sub(1));
-    let pr = st.active_pr.clone().unwrap();
-    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-    controller::submit(
-        st,
-        tx,
-        Job::DiscardPending { owner, name, number: pr.number, login, comment_id: removed.comment_id },
-    );
-    st.status = format!("Discarding comment on {}:{}…", removed.path, removed.line);
-}
 
 fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
     let (rects, _, _) = ui::compute_layout(area, st.focus);

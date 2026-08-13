@@ -34,8 +34,25 @@ pub fn cur_file_path(st: &State) -> Option<String> {
     }
 }
 
+/// Whether the [0] pane is currently showing `path`'s *local* diff (from [4])
+/// rather than the PR review diff.
+pub fn is_local_diff(st: &State, path: &str) -> bool {
+    st.local_diff_path.as_deref() == Some(path)
+        || (!st.diff_by_file.contains_key(path) && st.edit_diff_by_file.contains_key(path))
+}
+
+/// The path whose diff the [0] pane shows: the pinned local file, else the
+/// selected Files-pane file.
+pub fn diff_path(st: &State) -> Option<String> {
+    st.local_diff_path.clone().or_else(|| cur_file_path(st))
+}
+
 pub fn current_hunk_range(st: &State, path: &str) -> Option<Range> {
-    let hunks = st.hunks_by_file.get(path)?;
+    let hunks = if is_local_diff(st, path) {
+        st.edit_hunks_by_file.get(path)?
+    } else {
+        st.hunks_by_file.get(path)?
+    };
     if hunks.is_empty() {
         return None;
     }
@@ -111,8 +128,9 @@ pub fn scroll_diff(st: &mut State, delta: i64) {
 
 /// Move the hunk selection. Scrolling to keep it visible is a render concern.
 pub fn jump_hunk(st: &mut State, direction: i64) {
-    let Some(path) = cur_file_path(st) else { return };
-    let len = st.hunks_by_file.get(&path).map_or(0, |h| h.len());
+    let Some(path) = diff_path(st) else { return };
+    let hunks = if is_local_diff(st, &path) { &st.edit_hunks_by_file } else { &st.hunks_by_file };
+    let len = hunks.get(&path).map_or(0, |h| h.len());
     if len == 0 {
         return;
     }
@@ -123,8 +141,9 @@ pub fn jump_hunk(st: &mut State, direction: i64) {
 
 /// New-file line to open in the editor for the selected hunk.
 pub fn current_hunk_editor_line(st: &State, path: &str) -> i64 {
+    let info_map = if is_local_diff(st, path) { &st.edit_info_by_file } else { &st.info_by_file };
     if let Some((s, e)) = current_hunk_range(st, path) {
-        if let Some(info) = st.info_by_file.get(path) {
+        if let Some(info) = info_map.get(path) {
             for i in s..e {
                 if let Some(&(old, new)) = info.get(i) {
                     if let (None, Some(n)) = (old, new) {
@@ -200,6 +219,18 @@ mod tests {
         // manual @@-based ranges — helpers must still work via the (None,None) skip
         st.hunks_by_file.insert("f.py".into(), vec![(0, 4), (4, 7)]);
         st
+    }
+
+    #[test]
+    fn local_diff_detection() {
+        let mut st = State::default();
+        st.diff_by_file.insert("pr.rs".into(), vec![]);
+        st.edit_diff_by_file.insert("new.rs".into(), vec![]); // edit-only
+        st.edit_diff_by_file.insert("pr.rs".into(), vec![]); // also has local edits
+        assert!(!is_local_diff(&st, "pr.rs")); // a PR file, no pin → PR diff
+        assert!(is_local_diff(&st, "new.rs")); // not in PR diff → local
+        st.local_diff_path = Some("pr.rs".into());
+        assert!(is_local_diff(&st, "pr.rs")); // pinned from [4] → local
     }
 
     #[test]
