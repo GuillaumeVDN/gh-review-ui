@@ -36,9 +36,8 @@ fn set_diff(
     st.last_comment = None; // line indices don't survive a new diff
 }
 
-/// Check out a PR in a worktree: wipe the previous PR's panels (so they read
-/// "Loading…"), focus the Files pane, and kick off the open.
-pub fn begin_open_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
+/// Wipe the previous PR's panels so they read "Loading…", and focus Files.
+fn reset_review_panels(st: &mut State) {
     st.files.clear();
     st.tree.clear();
     st.file_idx = 0;
@@ -58,9 +57,26 @@ pub fn begin_open_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
     st.edit_offset = 0;
     set_diff(st, Default::default(), Default::default());
     st.focus = Focus::Files;
+}
+
+/// Check out a PR in a worktree, focus Files, and kick off the open.
+pub fn begin_open_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
+    reset_review_panels(st);
+    st.local_mode = false;
     st.status = format!("Opening #{} in a worktree…", pr.number);
     let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
     submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
+}
+
+/// Open the locally checked-out PR in place (main repo, no worktree).
+pub fn begin_open_local_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
+    reset_review_panels(st);
+    st.local_mode = true;
+    st.active_worktree = st.repo_root.clone();
+    st.active_pr = Some(pr.clone());
+    st.status = format!("Reviewing #{} locally…", pr.number);
+    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number) });
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {

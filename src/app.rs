@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::models::{Focus, Overlay, State, TreeRow, REVIEW_EVENTS};
+use crate::models::{Category, Focus, Overlay, State, TreeRow, REVIEW_EVENTS};
 use crate::navigation as nav;
 use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
@@ -51,7 +51,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     st.repo_root = api::get_repo_root();
     st.viewer = api::get_viewer_login();
     if !st.repo_owner.is_empty() {
-        controller::submit(&mut st, &job_tx, Job::LoadPrs);
+        let repo_root = st.repo_root.clone();
+        controller::submit(&mut st, &job_tx, Job::LoadPrs { repo_root });
     }
 
     let mut prev_pr = usize::MAX;
@@ -129,6 +130,20 @@ fn poll_worktree_editors(st: &mut State) {
     }
 }
 
+/// Close the per-worktree Neovim windows we launched and leave the group (the
+/// TUI is still focused here). Used when switching PRs so dead editors don't
+/// pile up in the group.
+fn close_worktree_editors(st: &mut State) {
+    if st.entered_group {
+        editor::ungroup_active();
+        st.entered_group = false;
+    }
+    for sock in st.worktree_editors.keys() {
+        editor::close_worktree_editor(sock);
+    }
+    st.worktree_editors.clear();
+}
+
 /// On exit: close the Neovim windows we launched, and (on a clean quit, while the
 /// TUI window is still focused) leave the Hyprland group.
 fn cleanup_editors(st: &mut State, graceful: bool) {
@@ -203,10 +218,16 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
 
 fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
     if !st.busy.contains("prs") {
-        controller::submit(st, tx, Job::LoadPrs);
+        let repo_root = st.repo_root.clone();
+        controller::submit(st, tx, Job::LoadPrs { repo_root });
     }
     if let Some(pr) = st.active_pr.clone() {
-        if !st.busy.contains("worktree") && !st.busy.contains("active") {
+        if st.local_mode {
+            if !st.busy.contains("active") {
+                let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+                controller::submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number) });
+            }
+        } else if !st.busy.contains("worktree") && !st.busy.contains("active") {
             let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
             controller::submit(st, tx, Job::OpenPr { repo_root, owner, name, number: pr.number });
         }
@@ -234,7 +255,13 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Enter => {
                 if !st.prs.is_empty() && !st.busy.contains("worktree") && !st.busy.contains("active") {
                     let pr = st.prs[st.pr_idx].clone();
-                    controller::begin_open_pr(st, tx, pr);
+                    // Switching PRs closes any worktree editor left in the group.
+                    close_worktree_editors(st);
+                    if pr.category == Category::CheckedOut {
+                        controller::begin_open_local_pr(st, tx, pr);
+                    } else {
+                        controller::begin_open_pr(st, tx, pr);
+                    }
                 }
             }
             KeyCode::Char('C') => checkout_local(st, tx),

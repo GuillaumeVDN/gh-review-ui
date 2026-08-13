@@ -221,6 +221,7 @@ pub fn pr_rows(st: &State) -> Vec<(bool, String, usize)> {
     for (i, pr) in st.prs.iter().enumerate() {
         if last != Some(pr.category) {
             let (label, cat) = match pr.category {
+                Category::CheckedOut => ("Checked out PR", Category::CheckedOut),
                 Category::Mine => ("My PRs", Category::Mine),
                 Category::Review => ("Requested review", Category::Review),
             };

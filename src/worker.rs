@@ -15,7 +15,7 @@ type Diff = HashMap<String, Vec<String>>;
 type Info = HashMap<String, Vec<LineInfo>>;
 
 pub enum Job {
-    LoadPrs,
+    LoadPrs { repo_root: String },
     LoadActive { owner: String, name: String, login: String, number: Option<i64> },
     LoadCommitDiff { first: String, last: String },
     OpenPr { repo_root: String, owner: String, name: String, number: i64 },
@@ -69,7 +69,7 @@ pub enum Msg {
 /// The "busy" tag a job kind drives, for spinner display.
 pub fn job_tag(job: &Job) -> &'static str {
     match job {
-        Job::LoadPrs => "prs",
+        Job::LoadPrs { .. } => "prs",
         Job::LoadActive { .. } => "active",
         Job::LoadCommitDiff { .. } => "commitdiff",
         Job::OpenPr { .. } => "worktree",
@@ -86,7 +86,7 @@ pub fn job_tag(job: &Job) -> &'static str {
 
 fn run(job: &Job) -> anyhow::Result<Msg> {
     Ok(match job {
-        Job::LoadPrs => Msg::Prs(api::load_prs()?),
+        Job::LoadPrs { repo_root } => Msg::Prs(api::load_prs(repo_root)?),
         Job::LoadActive { owner, name, login, number } => match number {
             None => Msg::Active {
                 number: None,

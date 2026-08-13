@@ -257,7 +257,11 @@ pub fn open_current_edit_in_editor(st: &mut State) {
     }
     let wt = st.active_worktree.trim_end_matches('/').to_string();
     let abs = format!("{}/{}", wt, entry.path);
-    open_in_worktree_editor(st, &wt, &abs, 1);
+    if st.local_mode {
+        open_in_editor(&abs, 1); // main repo → the user's usual nvim
+    } else {
+        open_in_worktree_editor(st, &wt, &abs, 1);
+    }
     st.status = format!("Opening {} in editor…", entry.path);
 }
 
@@ -275,7 +279,7 @@ pub fn open_current_in_editor(st: &mut State, top: bool) {
     let root = editor_root(st).trim_end_matches('/').to_string();
     let abs = format!("{root}/{path}");
     let wt = st.active_worktree.trim_end_matches('/').to_string();
-    if !wt.is_empty() && root == wt {
+    if !st.local_mode && !wt.is_empty() && root == wt {
         open_in_worktree_editor(st, &wt, &abs, line);
     } else {
         open_in_editor(&abs, line);

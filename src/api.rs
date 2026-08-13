@@ -41,7 +41,32 @@ pub fn get_repo_root() -> String {
 
 // ---- PRs / files / diff / commits ----
 
-pub fn load_prs() -> Result<Vec<Pr>> {
+/// The open PR whose head branch is currently checked out in `repo_root`, if any.
+fn detect_checked_out_pr(repo_root: &str) -> Option<Pr> {
+    let branch = sh(&["git", "-C", repo_root, "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    let data = gh_json(&[
+        "pr", "list", "--head", branch, "--state", "open", "--limit", "1", "--json",
+        "number,title,headRefName,author,id,createdAt,updatedAt",
+    ])
+    .ok()?;
+    let p = data.as_array()?.first()?;
+    Some(Pr {
+        number: p["number"].as_i64()?,
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        head: p["headRefName"].as_str().unwrap_or("").to_string(),
+        author: p["author"]["login"].as_str().unwrap_or("?").to_string(),
+        node_id: p["id"].as_str().unwrap_or("").to_string(),
+        category: Category::CheckedOut,
+        created_at: p["createdAt"].as_str().unwrap_or("").to_string(),
+        updated_at: p["updatedAt"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+pub fn load_prs(repo_root: &str) -> Result<Vec<Pr>> {
     let searches = [
         ("is:open author:@me", Category::Mine),
         ("is:open review-requested:@me", Category::Review),
@@ -79,14 +104,24 @@ pub fn load_prs() -> Result<Vec<Pr>> {
         }
     }
     let mut prs: Vec<Pr> = order.into_iter().filter_map(|n| seen.remove(&n)).collect();
-    // "review" group first (others' PRs), then "mine". Within review: oldest
-    // review request first (by PR creation date, ascending). Within mine: most
-    // recently updated first (descending).
-    let rank = |p: &Pr| if p.category == Category::Review { 0 } else { 1 };
+    // The checked-out PR sits in its own top group (deduped from the others).
+    if let Some(co) = detect_checked_out_pr(repo_root) {
+        prs.retain(|p| p.number != co.number);
+        prs.push(co);
+    }
+    // Groups: checked-out, then "review" (others' PRs), then "mine". Within
+    // review: oldest review request first (creation asc). Within mine: most
+    // recently updated first (desc).
+    let rank = |p: &Pr| match p.category {
+        Category::CheckedOut => 0,
+        Category::Review => 1,
+        Category::Mine => 2,
+    };
     prs.sort_by(|a, b| {
         rank(a).cmp(&rank(b)).then_with(|| match a.category {
             Category::Review => a.created_at.cmp(&b.created_at),
             Category::Mine => b.updated_at.cmp(&a.updated_at),
+            Category::CheckedOut => std::cmp::Ordering::Equal,
         })
     });
     Ok(prs)
@@ -273,7 +308,13 @@ pub fn worktree_diff(wt: &str) -> String {
     // Force standard a/ b/ prefixes; a user's diff.mnemonicPrefix / diff.noprefix
     // would otherwise emit i/ w/ (or none), which the parser can't key on.
     let raw = sh(&["git", "-C", wt, "diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap_or_default();
-    let _ = sh(&["git", "-C", wt, "reset", "-q"]);
+    // Clear only the intent-to-add marks we added (scoped, so a user's own staged
+    // changes in the main repo aren't disturbed in local mode).
+    if !files.is_empty() {
+        let mut args: Vec<&str> = vec!["git", "-C", wt, "reset", "-q", "--"];
+        args.extend_from_slice(&files);
+        let _ = sh(&args);
+    }
     raw
 }
 

@@ -12,8 +12,10 @@ pub type Range = (usize, usize);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
-    Mine,
+    /// The PR currently checked out in the local repo (reviewed in-place).
+    CheckedOut,
     Review,
+    Mine,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +173,9 @@ pub struct State {
     pub pr_offset: usize,
     pub active_pr: Option<Pr>,
     pub active_worktree: String,
+    /// The active PR is the locally checked-out one: reviewed in the main repo
+    /// (no worktree), comments stored locally, editor is the main nvim.
+    pub local_mode: bool,
 
     pub commits: Vec<Commit>,
     pub commit_selected: HashSet<String>,
