@@ -45,28 +45,6 @@ pub fn ask_claude(prompt: &str, cwd: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Fire-and-forget: open `abs_path` in the running nvim server at `line`.
-/// Wired for an Omarchy/Hyprland + Neovim setup (nvim on `/tmp/nvim.sock`).
-///
-/// Uses a single `:edit +{line} {file}` command so the buffer switch and the
-/// line jump happen atomically — two separate `--remote`/`--remote-send` calls
-/// race, sometimes jumping in the previous buffer (wrong file).
-pub fn open_in_editor(abs_path: &str, line: i64) {
-    let ex_path = abs_path.replace(' ', "\\ "); // escape spaces for the ex command
-    let script = format!(
-        "nvim --server /tmp/nvim.sock --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" \
-         && (hyprctl dispatch focuswindow class:org.omarchy.nvim | grep -q ok \
-             || hyprctl dispatch focuswindow title:^n$)"
-    );
-    let _ = Command::new("/usr/bin/bash")
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
 /// Open a PR in the default web browser (fire-and-forget).
 pub fn open_pr_in_browser(owner: &str, name: &str, number: i64) {
     let repo = format!("{owner}/{name}");
@@ -172,9 +150,10 @@ fn spawn_bash(script: &str, cwd: &str) {
     let _ = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
-/// A stable per-worktree id (…/worktrees/owner__repo/pr-N → owner__repo__pr-N).
-fn worktree_id(worktree: &str) -> String {
-    let comps: Vec<&str> = worktree.trim_end_matches('/').rsplit('/').take(2).collect();
+/// A stable per-checkout id (…/worktrees/owner__repo/pr-N → owner__repo__pr-N,
+/// …/Projects/gh-review-ui → Projects__gh-review-ui).
+fn worktree_id(root: &str) -> String {
+    let comps: Vec<&str> = root.trim_end_matches('/').rsplit('/').take(2).collect();
     let raw = format!("{}__{}", comps.get(1).unwrap_or(&""), comps.first().unwrap_or(&""));
     raw.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect()
 }
@@ -221,12 +200,12 @@ pub fn ungroup_active() {
     }
 }
 
-/// Open `abs_path` at `line` in a per-worktree Neovim, launched in its own
+/// Open `abs_path` at `line` in a per-checkout Neovim, launched in its own
 /// Ghostty window (grouped as a tab beside the TUI) the first time. Subsequent
-/// opens reuse that Neovim over its dedicated socket. Rooted at the worktree so
-/// project-wide search/replace works.
-pub fn open_in_worktree_editor(st: &mut State, worktree: &str, abs_path: &str, line: i64) {
-    let id = worktree_id(worktree);
+/// opens reuse that Neovim over its dedicated socket. Rooted at `root` (a review
+/// worktree or the main repo) so project-wide search/replace works.
+pub fn open_in_dedicated_editor(st: &mut State, root: &str, abs_path: &str, line: i64) {
+    let id = worktree_id(root);
     let sock = format!("/tmp/nvim-ghr-{id}.sock");
     let title = format!("ghr:{id}");
     st.worktree_editors.entry(sock.clone()).or_insert(false);
@@ -237,10 +216,10 @@ pub fn open_in_worktree_editor(st: &mut State, worktree: &str, abs_path: &str, l
             "nvim --server {sock} --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" ; \
              hyprctl dispatch focuswindow title:{title}"
         );
-        spawn_bash(&script, worktree);
+        spawn_bash(&script, root);
         return;
     }
-    // First open for this worktree: make sure the TUI window forms a group so the
+    // First open for this checkout: make sure the TUI window forms a group so the
     // new terminal opens as a tab beside it, then launch Ghostty + Neovim.
     if !in_group() {
         let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
@@ -268,7 +247,7 @@ pub fn open_in_worktree_editor(st: &mut State, worktree: &str, abs_path: &str, l
              end, 150)"
         ))
         .arg(abs_path)
-        .current_dir(worktree)
+        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -342,19 +321,15 @@ pub fn open_current_edit_in_editor(st: &mut State) {
     }
     let wt = st.active_worktree.trim_end_matches('/').to_string();
     let abs = format!("{}/{}", wt, entry.path);
-    if st.local_mode {
-        open_in_editor(&abs, 1); // main repo → the user's usual nvim
-    } else {
-        open_in_worktree_editor(st, &wt, &abs, 1);
-    }
+    open_in_dedicated_editor(st, &wt, &abs, 1);
     st.status = format!("Opening {} in editor…", entry.path);
 }
 
 /// Open the selected file — at the top, or at the current hunk's line.
 ///
-/// When the file resolves to a local checkout already on the PR head (the launch
-/// repo / `~/Projects/<repo>`), reuse the shared `/tmp/nvim.sock` editor. When it
-/// resolves to the review worktree, use a dedicated per-worktree Neovim window.
+/// Always in a dedicated Neovim window grouped beside the TUI, whether the file
+/// resolves to the review worktree or to a local checkout already on the PR head
+/// (the launch repo / `~/Projects/<repo>`).
 pub fn open_current_in_editor(st: &mut State, top: bool) {
     let Some(path) = diff_path(st) else {
         st.status = "No file selected.".into();
@@ -363,12 +338,7 @@ pub fn open_current_in_editor(st: &mut State, top: bool) {
     let line = if top { 1 } else { current_hunk_editor_line(st, &path) };
     let root = editor_root(st).trim_end_matches('/').to_string();
     let abs = format!("{root}/{path}");
-    let wt = st.active_worktree.trim_end_matches('/').to_string();
-    if !st.local_mode && !wt.is_empty() && root == wt {
-        open_in_worktree_editor(st, &wt, &abs, line);
-    } else {
-        open_in_editor(&abs, line);
-    }
+    open_in_dedicated_editor(st, &root, &abs, line);
     st.status = format!("Opening {path}:{line} in editor…");
 }
 
