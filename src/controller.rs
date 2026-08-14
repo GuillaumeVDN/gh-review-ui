@@ -1136,8 +1136,35 @@ pub fn push_edits(st: &mut State, tx: &Sender<Job>) {
 /// The request can arrive before the edit list has loaded, so it is held and
 /// retried rather than dropped. A file that is not in the list — because it has
 /// no uncommitted changes — clears the request instead of retrying forever.
+/// Open the PR of the branch checked out here, for a request that needs one.
+///
+/// A `--file` or `--commit` request is about a PR by definition, but we start
+/// on the PR list with nothing open — so the request would sit there waiting
+/// for the user to press Enter on a PR that is already the top of the list.
+///
+/// Returns whether one is now opening, so the caller waits rather than
+/// deciding the request cannot be served.
+fn opening_checked_out_pr(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) -> bool {
+    if st.active_pr.is_some() {
+        return false;
+    }
+    if st.busy.contains("active") || st.busy.contains("worktree") {
+        return true; // already on its way
+    }
+    let Some(pr) = st.prs.iter().find(|p| p.category == Category::CheckedOut).cloned() else {
+        // The list may simply not have arrived yet.
+        return st.busy.contains("prs");
+    };
+    // In place, not in a worktree: this checkout is already on that branch.
+    begin_open_local_pr(st, tx, pr);
+    true
+}
+
 pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) {
     let Some(wanted) = st.pending_open_file.clone() else { return };
+    if st.active_pr.is_none() && opening_checked_out_pr(st, tx) {
+        return;
+    }
 
     // Nothing to match against yet: ask for the edits and wait.
     if st.edit_files.is_empty() {
@@ -1170,6 +1197,16 @@ pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) 
 /// caller's Enter do nothing at all.
 pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
     let Some(wanted) = st.pending_open_commit.clone() else { return };
+    if st.active_pr.is_none() {
+        if opening_checked_out_pr(st, tx) {
+            return;
+        }
+        // No PR for this branch, so there is no commit list to select in.
+        // Saying so beats waiting for one that is never coming.
+        st.pending_open_commit = None;
+        st.status = format!("no open PR for this branch, so {wanted} has nothing to open in");
+        return;
+    }
     if st.commits.is_empty() {
         return;
     }
@@ -1225,6 +1262,56 @@ mod tests {
         }
     }
 
+    /// A request arrives with nothing open, since we start on the PR list.
+    /// Without this it waits for the user to press Enter on a PR that is
+    /// already the top of the list.
+    #[test]
+    fn a_request_opens_the_pr_of_the_branch_checked_out_here() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        let mut other = pr(3);
+        other.category = Category::Review;
+        let checked_out = pr(7); // the helper's default category
+        st.prs = vec![other, checked_out];
+        st.pending_open_commit = Some("abc".into());
+
+        try_open_pending_commit(&mut st, &tx);
+        assert_eq!(st.active_pr.as_ref().map(|p| p.number), Some(7), "the checked-out one");
+        assert!(st.local_mode, "in place: this checkout is already on that branch");
+        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "the request waits for it");
+        assert!(rx.try_iter().count() > 0, "and the load was submitted");
+    }
+
+    /// A branch with no PR has no commit list to select in; waiting for one
+    /// that is never coming looks like the request was lost.
+    #[test]
+    fn a_request_on_a_branch_with_no_pr_says_so() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        let mut other = pr(3);
+        other.category = Category::Review; // someone else's, not checked out here
+        st.prs = vec![other];
+        st.pending_open_commit = Some("abc".into());
+
+        try_open_pending_commit(&mut st, &tx);
+        assert!(st.pending_open_commit.is_none());
+        assert!(st.status.contains("no open PR"), "{}", st.status);
+    }
+
+    /// The list arrives asynchronously, so "no checked-out PR yet" is not the
+    /// same answer as "none exists".
+    #[test]
+    fn a_request_waits_while_the_pr_list_is_still_loading() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.busy.insert("prs".to_string());
+        st.pending_open_commit = Some("abc".into());
+
+        try_open_pending_commit(&mut st, &tx);
+        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"));
+        assert!(st.active_pr.is_none());
+    }
+
     /// The manager holds abbreviated hashes; we hold full oids.
     #[test]
     fn a_requested_commit_is_matched_on_its_short_hash() {
@@ -1242,12 +1329,13 @@ mod tests {
         assert!(st.pending_open_commit.is_none(), "the request is spent");
     }
 
-    /// The request can arrive before a PR is open; dropping it then would make
-    /// the caller's Enter do nothing at all.
+    /// The request can arrive before the PR has loaded; dropping it then would
+    /// make the caller's Enter do nothing at all.
     #[test]
     fn a_commit_request_waits_for_a_pr_to_load() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut st = State::default();
+        st.active_pr = Some(pr(7)); // opening; its commits have not arrived
         st.pending_open_commit = Some("abc".into());
         try_open_pending_commit(&mut st, &tx);
         assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "still waiting");
