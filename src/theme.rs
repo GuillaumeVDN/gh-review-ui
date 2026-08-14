@@ -116,6 +116,12 @@ pub fn border_dim() -> Style {
 pub fn status() -> Style {
     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
 }
+/// A hook run that failed: the border is the signal, since a run that passes
+/// takes its window away with it.
+pub fn hook_failed() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
 pub fn keys() -> Style {
     // Bottom action bar, lazygit-style: blue.
     Style::default().fg(Color::Blue)

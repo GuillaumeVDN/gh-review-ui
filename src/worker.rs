@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::api;
-use crate::models::{Commit, FileEntry, LineInfo, PendingComment, Pr};
+use crate::models::{Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr};
 
 type Diff = HashMap<String, Vec<String>>;
 type Info = HashMap<String, Vec<LineInfo>>;
@@ -40,7 +40,7 @@ pub enum Job {
     DiscardEdit { wt: String, path: String, added: bool },
     /// Stage/unstage whole `paths`, or a single hunk when `patch` is set.
     Stage { wt: String, paths: Vec<String>, patch: Option<String>, unstage: bool },
-    CommitEdits { wt: String, message: String, paths: Vec<String> },
+    CommitEdits { wt: String, message: String, paths: Vec<String>, kind: CommitKind },
     PushEdits {
         wt: String,
         repo_root: String,
@@ -48,6 +48,7 @@ pub enum Job {
         name: String,
         branch: String,
         pr_id: String,
+        force: bool,
         viewed: Vec<String>,
     },
     CheckoutLocal { dir: String, owner: String, name: String, number: i64 },
@@ -73,7 +74,11 @@ pub enum Msg {
     PendingList { pending: Vec<PendingComment>, status: String },
     ReviewSubmitted(String),
     Edits(api::Edits),
-    EditsCommitted { status: String },
+    EditsCommitted { status: String, amended: bool },
+    /// One line of a running commit's hook output.
+    HookLine(String),
+    /// The hooks rejected the commit; nothing was committed.
+    HooksFailed { status: String },
     /// Generic "job done" notice: clears `kind` from busy and shows `msg`.
     Done { kind: String, msg: String },
     Error { kind: String, msg: String },
@@ -98,7 +103,7 @@ pub fn job_tag(job: &Job) -> &'static str {
     }
 }
 
-fn run(job: &Job) -> anyhow::Result<Msg> {
+fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
     Ok(match job {
         Job::LoadPrs { repo_root } => Msg::Prs(api::load_prs(repo_root)?),
         Job::LoadActive { owner, name, login, number, local } => match number {
@@ -196,21 +201,35 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
             }
             Msg::Edits(api::load_edits(wt))
         }
-        Job::CommitEdits { wt, message, paths } => {
-            let committed = api::commit_edit_files(wt, message, paths)?;
-            Msg::EditsCommitted {
-                status: if committed > 0 {
-                    format!("Committed {committed} file(s)")
-                } else {
-                    "No local changes to commit".into()
-                },
+        Job::CommitEdits { wt, message, paths, kind } => {
+            // Streamed rather than returned: hook output is worth reading while
+            // it happens, and a slow hook with a blank window looks like a hang.
+            let out = tx.clone();
+            let mut on_line = |line: String| {
+                let _ = out.send(Msg::HookLine(line));
+            };
+            let done = api::commit_edit_files(wt, message, paths, *kind, &mut on_line)?;
+            if !done.ok {
+                Msg::HooksFailed { status: format!("{} rejected by the hooks", kind.verb()) }
+            } else if done.files > 0 || *kind == CommitKind::Amend {
+                let status = match (kind, done.files) {
+                    (CommitKind::Amend, 0) => "Reworded HEAD".to_string(),
+                    (CommitKind::Amend, n) => format!("Amended HEAD with {n} file(s)"),
+                    (_, n) => format!("Committed {n} file(s)"),
+                };
+                Msg::EditsCommitted { status, amended: *kind == CommitKind::Amend }
+            } else {
+                Msg::EditsCommitted {
+                    status: "No local changes to commit".into(),
+                    amended: false,
+                }
             }
         }
-        Job::PushEdits { wt, repo_root, owner, name, branch, pr_id, viewed } => {
+        Job::PushEdits { wt, repo_root, owner, name, branch, pr_id, viewed, force } => {
             let remote = api::base_remote(repo_root, owner, name);
             // Old remote tip → the files this push changes (to re-mark as viewed).
             let old = api::remote_branch_sha(wt, &remote, branch);
-            let mut msg = api::push_edits(wt, &remote, branch)?;
+            let mut msg = api::push_edits(wt, &remote, branch, *force)?;
             if let Some(old_sha) = old {
                 let changed = api::changed_files_since(wt, &old_sha);
                 let remark: Vec<String> = changed.into_iter().filter(|p| viewed.contains(p)).collect();
@@ -235,7 +254,7 @@ pub fn worker_loop(rx: Receiver<Job>, tx: Sender<Msg>) {
             return;
         }
         let tag = job_tag(&job).to_string();
-        match run(&job) {
+        match run(&job, &tx) {
             Ok(msg) => {
                 let _ = tx.send(msg);
             }

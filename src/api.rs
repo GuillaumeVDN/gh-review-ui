@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::diff::parse_diff;
 use crate::gh::{gh_graphql, gh_json, sh, sh_cwd, Var};
-use crate::models::{Category, Commit, FileEntry, LineInfo, Pr, PendingComment};
+use crate::models::{Category, Commit, CommitKind, FileEntry, LineInfo, Pr, PendingComment};
 
 /// Lines of context around each hunk (git's default is 3).
 pub const DIFF_CONTEXT: usize = 8;
@@ -452,30 +453,118 @@ pub fn discard_edit(wt: &str, path: &str, added: bool) -> Result<()> {
     }
 }
 
+/// Run a command, handing each output line to `on_line` as it arrives.
+///
+/// stdout and stderr are interleaved in arrival order rather than concatenated
+/// after the fact: hooks write to both, and the line that explains a failure
+/// has to appear next to the step it belongs to.
+///
+/// Nothing here can prompt: a hook that wanted an editor or a password would
+/// otherwise block the worker thread with nobody able to answer it.
+pub fn sh_stream(args: &[&str], on_line: &mut dyn FnMut(String)) -> Result<bool> {
+    use std::io::{BufRead, BufReader};
+    let mut child = Command::new(args[0])
+        .args(&args[1..])
+        .env("GIT_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut pumps = Vec::new();
+    for pipe in [child.stdout.take().map(Readable::Out), child.stderr.take().map(Readable::Err)] {
+        let Some(pipe) = pipe else { continue };
+        let tx = tx.clone();
+        pumps.push(std::thread::spawn(move || {
+            let reader: Box<dyn std::io::Read + Send> = match pipe {
+                Readable::Out(o) => Box::new(o),
+                Readable::Err(e) => Box::new(e),
+            };
+            for line in BufReader::new(reader).split(b'\n').map_while(Result::ok) {
+                let text = String::from_utf8_lossy(&line);
+                // A progress line rewrites itself with \r; what a terminal
+                // would show is whatever came after the last one.
+                let shown = text.rsplit('\r').next().unwrap_or("").trim_end();
+                if tx.send(shown.to_string()).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(tx); // the loop below ends when both pumps have dropped theirs
+
+    for line in rx {
+        on_line(line);
+    }
+    for p in pumps {
+        let _ = p.join();
+    }
+    Ok(child.wait()?.success())
+}
+
+enum Readable {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+/// The commit message of `wt`'s HEAD, for pre-filling an amend.
+pub fn head_message(wt: &str) -> String {
+    sh(&["git", "-C", wt, "log", "-1", "--pretty=%B"]).unwrap_or_default().trim_end().to_string()
+}
+
+/// What a commit attempt did.
+pub struct Committed {
+    pub files: usize,
+    /// False when the hooks rejected it, in which case nothing was committed.
+    pub ok: bool,
+}
+
 /// Commit the pending edits (no push), returning how many files went in.
 ///
 /// Anything already staged is taken as the selection (lazygit-style: what you
 /// staged is what you commit); with an empty index, `paths` is staged first so
-/// the plain "commit all my edits" flow is unchanged. Skips hooks — review
-/// fixups shouldn't be blocked by them.
-pub fn commit_edit_files(wt: &str, message: &str, paths: &[String]) -> Result<usize> {
+/// the plain "commit all my edits" flow is unchanged.
+///
+/// The hooks run unless the caller asked for `NoVerify`, and their output is
+/// streamed out line by line — a commit that is going to be rejected should say
+/// why while it happens, not after.
+pub fn commit_edit_files(
+    wt: &str,
+    message: &str,
+    paths: &[String],
+    kind: CommitKind,
+    on_line: &mut dyn FnMut(String),
+) -> Result<Committed> {
     let staged_names = || sh(&["git", "-C", wt, "diff", "--cached", "--name-only"]).unwrap_or_default();
     if staged_names().trim().is_empty() {
-        if paths.is_empty() {
-            return Ok(0);
+        // An amend with nothing to stage is a reword, which is worth doing.
+        if paths.is_empty() && kind != CommitKind::Amend {
+            return Ok(Committed { files: 0, ok: true });
         }
-        let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
-        for p in paths {
-            add_args.push(p.as_str());
+        if !paths.is_empty() {
+            let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
+            for p in paths {
+                add_args.push(p.as_str());
+            }
+            sh(&add_args)?;
         }
-        sh(&add_args)?;
     }
     let n = staged_names().lines().filter(|l| !l.is_empty()).count();
-    if n == 0 {
-        return Ok(0);
+    // An amend with nothing staged is a reword, which is a thing to allow.
+    if n == 0 && kind != CommitKind::Amend {
+        return Ok(Committed { files: 0, ok: true });
     }
-    sh(&["git", "-C", wt, "commit", "--no-verify", "-m", message])?;
-    Ok(n)
+    let mut args = vec!["git", "-C", wt, "commit", "-m", message];
+    if kind == CommitKind::Amend {
+        args.push("--amend");
+    }
+    if !kind.runs_hooks() {
+        args.push("--no-verify");
+    }
+    let ok = sh_stream(&args, on_line)?;
+    Ok(Committed { files: n, ok })
 }
 
 /// The remote branch's current tip sha (before a push), if it exists.
@@ -494,7 +583,11 @@ pub fn changed_files_since(wt: &str, old_sha: &str) -> Vec<String> {
 /// Push (non-force, no hooks) the current branch to the PR head `branch` on
 /// `remote`. Refuses if that branch doesn't already exist on the remote, so it
 /// never creates a stray branch (e.g. a fork PR whose head lives elsewhere).
-pub fn push_edits(wt: &str, remote: &str, branch: &str) -> Result<String> {
+///
+/// `force` is a lease-force, used after an amend: rewriting HEAD makes an
+/// ordinary push a non-fast-forward, and the lease still refuses if the remote
+/// moved to something we have not seen.
+pub fn push_edits(wt: &str, remote: &str, branch: &str, force: bool) -> Result<String> {
     if branch.is_empty() {
         return Err(anyhow!("unknown PR head branch — cannot push"));
     }
@@ -503,8 +596,14 @@ pub fn push_edits(wt: &str, remote: &str, branch: &str) -> Result<String> {
         return Err(anyhow!("branch '{branch}' not found on '{remote}' (fork PR?) — not pushed"));
     }
     let refspec = format!("HEAD:refs/heads/{branch}");
-    sh(&["git", "-C", wt, "push", "--no-verify", remote, &refspec])?;
-    Ok(format!("Pushed to {branch}"))
+    let mut args = vec!["git", "-C", wt, "push", "--no-verify"];
+    if force {
+        args.push("--force-with-lease");
+    }
+    args.push(remote);
+    args.push(&refspec);
+    sh(&args)?;
+    Ok(format!("Pushed to {branch}{}", if force { " (forced after an amend)" } else { "" }))
 }
 
 /// Check out PR `number` into the local dev checkout `dir` (e.g. ~/Projects/<repo>),

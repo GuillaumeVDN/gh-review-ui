@@ -9,7 +9,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
-use crate::models::{Focus, Overlay, PendingComment, StageState, State, TreeRow, SUBMIT_CHOICES};
+use crate::models::{
+    CommitKind, Focus, Overlay, PendingComment, StageState, State, TreeRow, SUBMIT_CHOICES,
+};
 use crate::navigation::{
     current_hunk_range, diff_path, hunk_for_comment, is_local_diff, is_split, source_maps,
     stage_state,
@@ -283,7 +285,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
-        Focus::Edits => format!("Enter: hunks · Space: stage · z/Z: fold/unfold · c: commit · P: push · e: editor · d: revert · {common}"),
+        Focus::Edits => format!("Enter: hunks · Space: stage · z/Z: fold/unfold · c: commit · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · Space: stage hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
         }
@@ -1023,6 +1025,42 @@ fn draw_modal_editor(f: &mut Frame, area: Rect, ta: &textbuffer::TextArea, title
     draw_editor(f, ta, inner, help);
 }
 
+/// A commit's hooks while they run, and what they said if they refused.
+///
+/// Tall and wide: hook output is the kind of thing you scroll back through, and
+/// a five-line window turns a stack trace into a puzzle. Red when it failed —
+/// that is the whole signal, since a passing run closes itself.
+fn render_hooks(f: &mut Frame, area: Rect, title: &str, lines: &[String], failed: bool, scroll: usize) {
+    let rect = centered(area, 100.min(area.width.saturating_sub(4)), 26.min(area.height.saturating_sub(2)));
+    let bs = if failed { theme::hook_failed() } else { theme::border_focused() };
+    let label = format!(" {title}{} ", if failed { "" } else { " ⏳" });
+    let b = Block::default()
+        .borders(Borders::ALL)
+        .border_style(bs)
+        .title(Span::styled(label, bs));
+    let inner = b.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(b, rect);
+
+    let body_h = inner.height.saturating_sub(1) as usize;
+    // Follows the tail while it runs; a failure stops so the error stays put.
+    let start = if failed { scroll.min(lines.len().saturating_sub(1)) } else { lines.len().saturating_sub(body_h) };
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(start)
+        .take(body_h)
+        .map(|l| Line::from(Span::raw(l.clone())))
+        .collect();
+    f.render_widget(Paragraph::new(shown), Rect { height: body_h as u16, ..inner });
+
+    let help = if failed { "j/k: scroll · Esc: close" } else { "running… · Esc: hide (they carry on)" };
+    let help_y = inner.y + inner.height.saturating_sub(1);
+    f.render_widget(
+        Paragraph::new(help).style(theme::keys()),
+        Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
+    );
+}
+
 fn render_overlay(f: &mut Frame, st: &State) {
     let area = f.area();
     match &st.overlay {
@@ -1039,11 +1077,18 @@ fn render_overlay(f: &mut Frame, st: &State) {
             draw_modal_editor(f, area, ta, &format!("Edit comment on {path}:{line}"),
                 "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+D: delete · Esc: cancel");
         }
-        Overlay::CommitMsg { ta } => {
+        Overlay::CommitMsg { ta, kind } => {
             let n = st.edit_files.len();
-            draw_modal_editor(f, area, ta,
-                &format!("Commit {n} file(s) locally"),
+            let what = match kind {
+                CommitKind::Amend => format!("Amend HEAD with {n} file(s)"),
+                CommitKind::NoVerify => format!("Commit {n} file(s) locally · no hooks"),
+                CommitKind::New => format!("Commit {n} file(s) locally"),
+            };
+            draw_modal_editor(f, area, ta, &what,
                 "Enter: commit · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+        }
+        Overlay::Hooks { title, lines, failed, scroll } => {
+            render_hooks(f, area, title, lines, *failed, *scroll);
         }
         Overlay::Ask { ta } => {
             draw_modal_editor(f, area, ta, "Ask Claude about this hunk",

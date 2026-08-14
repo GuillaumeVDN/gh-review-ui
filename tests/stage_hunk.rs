@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use ghreview::api;
+use ghreview::models::CommitKind;
 use ghreview::diff::{build_hunk_patch, compute_hunks, parse_diff};
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -82,6 +83,68 @@ fn stages_part_of_an_untracked_file() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
+/// The hooks run for a plain commit and are skipped for `w`; a temporary repo
+/// has none either way, so this pins the outcome shape rather than the hooks.
+#[test]
+fn an_amend_folds_the_work_into_head_instead_of_adding_a_commit() {
+    let wt = repo("amend");
+    let before = git(Path::new(&wt), &["rev-list", "--count", "HEAD"]);
+    api::commit_edit_files(&wt, "first", &["f.txt".to_string()], CommitKind::NoVerify, &mut |_| {})
+        .unwrap();
+    let after_commit = git(Path::new(&wt), &["rev-list", "--count", "HEAD"]);
+    assert_ne!(before.trim(), after_commit.trim(), "a commit was added");
+
+    std::fs::write(Path::new(&wt).join("f.txt"), "amended\n").unwrap();
+    let done = api::commit_edit_files(
+        &wt,
+        "first, said better",
+        &["f.txt".to_string()],
+        CommitKind::Amend,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(done.ok);
+    let after_amend = git(Path::new(&wt), &["rev-list", "--count", "HEAD"]);
+    assert_eq!(after_commit.trim(), after_amend.trim(), "no second commit");
+    assert_eq!(api::head_message(&wt), "first, said better");
+
+    // With nothing left to stage an amend is a reword, which must still happen.
+    let done =
+        api::commit_edit_files(&wt, "reworded", &[], CommitKind::Amend, &mut |_| {}).unwrap();
+    assert!(done.ok);
+    assert_eq!(done.files, 0);
+    assert_eq!(api::head_message(&wt), "reworded");
+    assert_eq!(
+        git(Path::new(&wt), &["rev-list", "--count", "HEAD"]).trim(),
+        after_amend.trim(),
+        "still no second commit"
+    );
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// Hook output is worth reading while it happens; a window that fills only at
+/// the end is the thing this replaces.
+#[test]
+fn command_output_arrives_line_by_line() {
+    let wt = repo("stream");
+    let mut lines = Vec::new();
+    let ok = api::sh_stream(
+        &["git", "-C", &wt, "log", "--oneline", "--format=%s"],
+        &mut |l| lines.push(l),
+    )
+    .unwrap();
+    assert!(ok);
+    assert!(lines.iter().any(|l| l == "init"), "{lines:?}");
+
+    // A failure is reported as such rather than as an error, since the output
+    // explaining it has already been handed over.
+    let mut err = Vec::new();
+    let ok = api::sh_stream(&["git", "-C", &wt, "cat-file", "-e", "deadbeef"], &mut |l| err.push(l))
+        .unwrap();
+    assert!(!ok, "the command failed");
+    std::fs::remove_dir_all(&wt).ok();
+}
+
 #[test]
 fn commit_takes_the_index_when_something_is_staged() {
     let wt = repo("commit-staged");
@@ -91,8 +154,16 @@ fn commit_takes_the_index_when_something_is_staged() {
     let patch = build_hunk_patch(lines, blocks[1], false).unwrap();
     api::apply_index_patch(&wt, &patch, false).unwrap();
 
-    let n = api::commit_edit_files(&wt, "partial", &["f.txt".to_string()]).unwrap();
-    assert_eq!(n, 1);
+    let done = api::commit_edit_files(
+        &wt,
+        "partial",
+        &["f.txt".to_string()],
+        CommitKind::NoVerify,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(done.files, 1);
+    assert!(done.ok);
     // Only the staged half went in; the rest is still a local edit.
     let (files, _) = parse_diff(&git(Path::new(&wt), &["show", "HEAD", "-p", "-U0"]));
     assert!(files["f.txt"].iter().any(|l| l == "+D"));

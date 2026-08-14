@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::models::{Category, Focus, Overlay, State, TreeRow, SUBMIT_CHOICES};
+use crate::models::{Category, CommitKind, Focus, Overlay, State, TreeRow, SUBMIT_CHOICES};
 use crate::navigation as nav;
 use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
@@ -208,9 +208,9 @@ fn overlay_ta(st: &mut State) -> Option<&mut TextArea> {
         Overlay::Comment { ta, .. }
         | Overlay::Edit { ta, .. }
         | Overlay::Review { ta, .. }
-        | Overlay::CommitMsg { ta }
+        | Overlay::CommitMsg { ta, .. }
         | Overlay::Ask { ta } => Some(ta),
-        Overlay::None | Overlay::Confirm { .. } => None,
+        Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } => None,
     }
 }
 
@@ -376,7 +376,9 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
             KeyCode::Enter => controller::enter_local_diff(st),
             KeyCode::Char(' ') => controller::toggle_stage(st, tx),
-            KeyCode::Char('c') => controller::begin_commit_edits(st),
+            KeyCode::Char('c') => controller::begin_commit_edits(st, CommitKind::New),
+            KeyCode::Char('w') => controller::begin_commit_edits(st, CommitKind::NoVerify),
+            KeyCode::Char('A') => controller::begin_commit_edits(st, CommitKind::Amend),
             KeyCode::Char('P') => controller::push_edits(st, tx),
             KeyCode::Char('d') => controller::begin_discard_edit(st),
             KeyCode::Char('Z') => {
@@ -435,6 +437,31 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     let ctrl = m.contains(KeyModifiers::CONTROL);
     let alt = m.contains(KeyModifiers::ALT);
 
+    // Hook output: nothing to type into. While they run, Esc puts the window
+    // away without cancelling them — a hook that hangs must not take the
+    // keyboard with it — and everything else is ignored.
+    if let Overlay::Hooks { failed, lines, scroll, .. } = &mut st.overlay {
+        if !*failed {
+            if k.code == KeyCode::Esc {
+                st.overlay = Overlay::None;
+                st.status = "Hooks still running — the result lands in the status bar.".into();
+            }
+            return;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => st.overlay = Overlay::None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                *scroll = (*scroll + 1).min(lines.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown => *scroll = (*scroll + 10).min(lines.len().saturating_sub(1)),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::Char('g') => *scroll = 0,
+            KeyCode::Char('G') => *scroll = lines.len().saturating_sub(1),
+            _ => {}
+        }
+        return;
+    }
     if k.code == KeyCode::Esc {
         // Closing a new-comment editor returns to the line picker (keeping the
         // draft + selection); other overlays just close.
@@ -496,7 +523,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                             *editing = false;
                         }
                     }
-                    Overlay::None | Overlay::Confirm { .. } => {}
+                    Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } => {}
                 }
             }
         }

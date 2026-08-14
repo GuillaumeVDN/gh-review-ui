@@ -182,11 +182,41 @@ pub enum Overlay {
     /// Finish-review: description editor (top) + event choice (bottom).
     Review { ta: TextArea, editing: bool, choice: usize },
     /// Commit message for the pending worktree edits (commit + push).
-    CommitMsg { ta: TextArea },
+    CommitMsg { ta: TextArea, kind: CommitKind },
+    /// A commit's hooks, running: their output as it arrives.
+    ///
+    /// Closes itself when they pass — there is nothing to read in a green run.
+    /// A failure keeps it open, in red, holding the output that explains why.
+    Hooks { title: String, lines: Vec<String>, failed: bool, scroll: usize },
     /// Free-text question to launch a Claude session about the selected hunk.
     Ask { ta: TextArea },
     /// A yes/no confirmation before a destructive action.
     Confirm { prompt: String, kind: ConfirmKind },
+}
+
+/// What a commit message overlay will produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommitKind {
+    /// A new commit, running the repo's hooks.
+    New,
+    /// A new commit with the hooks skipped.
+    NoVerify,
+    /// Fold the staged work into HEAD, running the hooks.
+    Amend,
+}
+
+impl CommitKind {
+    pub fn runs_hooks(self) -> bool {
+        !matches!(self, CommitKind::NoVerify)
+    }
+
+    /// The word for what is about to happen, for titles and statuses.
+    pub fn verb(self) -> &'static str {
+        match self {
+            CommitKind::Amend => "Amend",
+            _ => "Commit",
+        }
+    }
 }
 
 /// The action a [`Overlay::Confirm`] performs when accepted.
@@ -194,6 +224,9 @@ pub enum Overlay {
 pub enum ConfirmKind {
     /// Revert a local edit (discard uncommitted changes to a file).
     RevertEdit { path: String, added: bool },
+    /// Push a branch whose history was rewritten, which the remote will only
+    /// take as a force.
+    ForcePush,
 }
 
 #[derive(Default)]
@@ -273,6 +306,9 @@ pub struct State {
     pub pending_open_file: Option<String>,
     /// A commit another tool asked us to review, held until a PR is loaded.
     pub pending_open_commit: Option<String>,
+    /// Set by an amend: the branch's history was rewritten, so the next push
+    /// has to be a lease-force or the remote refuses it as non-fast-forward.
+    pub amended: bool,
     pub entered_group: bool,
 
     pub diff_by_file: DiffMap,

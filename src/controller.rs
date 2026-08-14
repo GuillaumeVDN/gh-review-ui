@@ -6,8 +6,8 @@ use crate::api;
 use crate::diff::compute_hunks;
 use crate::editor;
 use crate::models::{
-    Category, ConfirmKind, FileEntry, Focus, Overlay, PendingComment, Pr, StageState, State,
-    TreeRow, SUBMIT_CHOICES,
+    Category, CommitKind, ConfirmKind, FileEntry, Focus, Overlay, PendingComment, Pr, StageState,
+    State, TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
     cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
@@ -60,6 +60,9 @@ fn reset_review_panels(st: &mut State) {
     st.edit_idx = 0;
     st.edit_offset = 0;
     st.staged_side = false;
+    // Whose history we rewrote is a fact about the branch we are leaving: kept,
+    // it would force-push the next one.
+    st.amended = false;
     st.alt_diff_view = (0, 0);
     set_diff(st, Default::default(), Default::default());
     st.focus = Focus::Files;
@@ -320,8 +323,31 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             // the Files tree so [3] shows them too (item 7).
             merge_edit_files_into_tree(st);
         }
-        Msg::EditsCommitted { status } => {
+        Msg::HookLine(line) => {
+            if let Overlay::Hooks { lines, .. } = &mut st.overlay {
+                lines.push(line);
+            }
+        }
+        Msg::HooksFailed { status } => {
             st.busy.remove("editcommit");
+            // The window stays, in red, holding what the hooks said: closing it
+            // on failure would take the explanation with it.
+            if let Overlay::Hooks { failed, title, scroll, lines } = &mut st.overlay {
+                *failed = true;
+                *title = status.clone();
+                // Land on the tail, which is where the reason usually is.
+                *scroll = lines.len().saturating_sub(1);
+            }
+            st.status = status;
+        }
+        Msg::EditsCommitted { status, amended } => {
+            st.busy.remove("editcommit");
+            // Rewriting HEAD is what makes the next push need a lease-force.
+            st.amended |= amended;
+            // Nothing to read in a green run.
+            if matches!(st.overlay, Overlay::Hooks { .. }) {
+                st.overlay = Overlay::None;
+            }
             st.status = status;
             reload_edits(st, tx); // now clean
         }
@@ -329,11 +355,21 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove(&kind);
             st.status = msg;
             if kind == "editpush" {
+                // The remote now has the rewritten history.
+                st.amended = false;
                 reload_edits(st, tx); // committed edits are gone from the worktree
             }
         }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
+            // git itself failed rather than the hooks; the window still holds
+            // the output, so it stays and turns red like any other refusal.
+            if kind == "editcommit" {
+                if let Overlay::Hooks { failed, title, .. } = &mut st.overlay {
+                    *failed = true;
+                    *title = msg.clone();
+                }
+            }
             // Roll back an optimistic viewed change that failed on the server.
             if kind == "viewed" {
                 if let Some((paths, target)) = st.viewed_inflight.take() {
@@ -1095,37 +1131,57 @@ pub fn confirm_action(st: &mut State, tx: &Sender<Job>) {
             st.status = format!("Reverting local changes to {path}…");
             submit(st, tx, Job::DiscardEdit { wt, path, added });
         }
+        ConfirmKind::ForcePush => submit_push(st, tx, true),
     }
 }
 
 /// Open the commit-message modal for the pending edits (`c` in [4]).
-pub fn begin_commit_edits(st: &mut State) {
+pub fn begin_commit_edits(st: &mut State, kind: CommitKind) {
     if st.active_worktree.is_empty() {
         st.status = "No worktree — nothing to commit.".into();
         return;
     }
-    if st.edit_files.is_empty() {
+    // An amend can reword a commit with nothing staged; the others cannot.
+    if st.edit_files.is_empty() && kind != CommitKind::Amend {
         st.status = "No local changes to commit.".into();
         return;
     }
-    st.overlay = Overlay::CommitMsg { ta: TextArea::new("") };
+    // An amend starts from the message it is replacing: it is usually the same
+    // commit, said better, and retyping it invites losing what was there.
+    let seed = if kind == CommitKind::Amend {
+        crate::api::head_message(&st.active_worktree)
+    } else {
+        String::new()
+    };
+    st.overlay = Overlay::CommitMsg { ta: TextArea::new(&seed), kind };
 }
 
 /// Commit the pending edits with the entered message (no push).
 pub fn confirm_commit_edits(st: &mut State, tx: &Sender<Job>) {
-    let Overlay::CommitMsg { ta } = &st.overlay else { return };
-    let message = ta.text().trim().to_string();
+    let Overlay::CommitMsg { ta, kind } = &st.overlay else { return };
+    let (message, kind) = (ta.text().trim().to_string(), *kind);
     if message.is_empty() {
         st.status = "Commit message is empty.".into();
         return;
     }
-    if st.active_worktree.is_empty() || st.edit_files.is_empty() {
+    if st.active_worktree.is_empty() || (st.edit_files.is_empty() && kind != CommitKind::Amend) {
         return;
     }
     let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
-    st.overlay = Overlay::None;
-    st.status = format!("Committing {} file(s)…", paths.len());
-    submit(st, tx, Job::CommitEdits { wt: st.active_worktree.clone(), message, paths });
+    // The hooks get a window of their own, so their output has somewhere to go
+    // while it is still arriving. A skipped-hooks commit has nothing to show.
+    st.overlay = if kind.runs_hooks() {
+        Overlay::Hooks {
+            title: format!("{} · running hooks", kind.verb()),
+            lines: Vec::new(),
+            failed: false,
+            scroll: 0,
+        }
+    } else {
+        Overlay::None
+    };
+    st.status = format!("{}ting {} file(s)…", kind.verb(), paths.len());
+    submit(st, tx, Job::CommitEdits { wt: st.active_worktree.clone(), message, paths, kind });
 }
 
 /// Push the committed edits to the PR branch (`P` in [4]); re-mark the pushed
@@ -1140,6 +1196,30 @@ pub fn push_edits(st: &mut State, tx: &Sender<Job>) {
         return;
     }
     if st.active_worktree.is_empty() {
+        return;
+    }
+    // An amend rewrote what the remote already has, so this push can only land
+    // as a force. That is not something to do on the user's behalf without
+    // saying so, even with a lease: whoever else pulled that branch keeps the
+    // old commits.
+    if st.amended {
+        st.overlay = Overlay::Confirm {
+            prompt: format!(
+                "HEAD was amended — force-with-lease push to {}? (it rewrites the branch)",
+                pr.head
+            ),
+            kind: ConfirmKind::ForcePush,
+        };
+        return;
+    }
+    submit_push(st, tx, false);
+}
+
+/// Send the push, forced or not. Split out so the confirmation path and the
+/// ordinary one cannot drift apart in what they send.
+fn submit_push(st: &mut State, tx: &Sender<Job>, force: bool) {
+    let Some(pr) = st.active_pr.clone() else { return };
+    if pr.head.is_empty() || st.active_worktree.is_empty() {
         return;
     }
     let viewed: Vec<String> = st
@@ -1160,6 +1240,7 @@ pub fn push_edits(st: &mut State, tx: &Sender<Job>) {
             branch: pr.head,
             pr_id: pr.node_id,
             viewed,
+            force,
         },
     );
 }
@@ -1294,6 +1375,55 @@ mod tests {
             author: "a".into(),
             date: String::new(),
         }
+    }
+
+    /// Rewriting history is not something to do to a shared branch on the
+    /// user's behalf, lease or no lease.
+    #[test]
+    fn pushing_an_amended_branch_asks_first() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+        st.amended = true;
+
+        push_edits(&mut st, &tx);
+        assert!(
+            matches!(st.overlay, Overlay::Confirm { kind: ConfirmKind::ForcePush, .. }),
+            "it asked instead of pushing"
+        );
+        assert_eq!(rx.try_iter().count(), 0, "and nothing was sent");
+
+        confirm_action(&mut st, &tx);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(
+            jobs.iter().any(|j| matches!(j, Job::PushEdits { force: true, .. })),
+            "confirming sends the forced push"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_push_does_not_ask() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+
+        push_edits(&mut st, &tx);
+        assert!(matches!(st.overlay, Overlay::None));
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(jobs.iter().any(|j| matches!(j, Job::PushEdits { force: false, .. })));
+    }
+
+    /// The flag belongs to the branch we amended; carried over, it would force
+    /// the next PR's push.
+    #[test]
+    fn switching_prs_forgets_that_we_amended() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.amended = true;
+        begin_open_local_pr(&mut st, &tx, pr(9));
+        assert!(!st.amended);
     }
 
     /// A request arrives with nothing open, since we start on the PR list.
