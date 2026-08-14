@@ -1392,6 +1392,27 @@ pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) 
     }
 }
 
+/// Land on the Pending-edits pane, opening this checkout's PR on the way.
+///
+/// Asked for by a tool that has a card open on this worktree: what it wants
+/// shown is the local changes, and the PR is the context they belong to.
+pub fn try_open_pending_edits(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) {
+    if !st.pending_open_edits {
+        return;
+    }
+    if st.active_pr.is_none() && opening_checked_out_pr(st, tx) {
+        return;
+    }
+    // Opening a PR resets the panels and takes the focus with it, so the move
+    // waits for that to finish. A branch with no PR at all still gets the pane:
+    // the edits come from the checkout, not from GitHub.
+    if st.busy.contains("active") || st.busy.contains("worktree") {
+        return;
+    }
+    st.pending_open_edits = false;
+    st.focus = Focus::Edits;
+}
+
 /// Select the commit another tool asked for, once the PR holding it is loaded.
 ///
 /// Held rather than dropped while `commits` is empty: the request can arrive
@@ -1567,6 +1588,44 @@ mod tests {
         st.amended = true;
         begin_open_local_pr(&mut st, &tx, pr(9));
         assert!(!st.amended);
+    }
+
+    /// `r` in the manager asks for this: the PR of the checkout, on its local
+    /// changes, rather than the PR list two keypresses away.
+    #[test]
+    fn asking_for_the_edits_opens_the_checked_out_pr_first() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.prs = vec![pr(7)]; // the helper's default category is CheckedOut
+        st.pending_open_edits = true;
+
+        try_open_pending_edits(&mut st, &tx);
+        assert_eq!(st.active_pr.as_ref().map(|p| p.number), Some(7));
+        assert!(st.pending_open_edits, "the pane waits for the PR to land");
+        assert_ne!(st.focus, Focus::Edits, "opening a PR takes the focus itself");
+        assert!(rx.try_iter().count() > 0);
+
+        // Once it has loaded, the focus moves.
+        st.busy.remove("active");
+        try_open_pending_edits(&mut st, &tx);
+        assert_eq!(st.focus, Focus::Edits);
+        assert!(!st.pending_open_edits);
+    }
+
+    /// A branch with no PR still has local changes, and that pane is about the
+    /// checkout rather than about GitHub.
+    #[test]
+    fn the_edits_pane_opens_even_with_no_pr_for_the_branch() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        let mut other = pr(3);
+        other.category = Category::Review;
+        st.prs = vec![other];
+        st.pending_open_edits = true;
+
+        try_open_pending_edits(&mut st, &tx);
+        assert_eq!(st.focus, Focus::Edits);
+        assert!(st.active_pr.is_none());
     }
 
     /// A request arrives with nothing open, since we start on the PR list.

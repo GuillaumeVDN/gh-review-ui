@@ -86,6 +86,11 @@ pub fn send_open(root: &str, file: &str) -> bool {
     send_line(root, &format!("open {file}"))
 }
 
+/// Ask a running instance to show this checkout's local changes.
+pub fn send_edits(root: &str) -> bool {
+    send_line(root, "edits")
+}
+
 /// Ask a running instance to bring itself forward.
 ///
 /// It raises its own window by pid, which works whatever its title is — the
@@ -125,6 +130,8 @@ pub enum Request {
     Commit(String),
     /// Bring our window forward.
     Focus,
+    /// Open this checkout's PR and land on the Pending-edits pane.
+    Edits,
     /// Quit as if the user had pressed `q`.
     ///
     /// Killing our window instead would skip the cleanup, leaving the Neovim
@@ -142,6 +149,9 @@ pub fn parse_request(line: &str) -> Option<Request> {
     }
     if line == "focus" {
         return Some(Request::Focus);
+    }
+    if line == "edits" {
+        return Some(Request::Edits);
     }
     if let Some(rest) = line.strip_prefix("commit ") {
         if rest.is_empty() {
@@ -252,6 +262,7 @@ mod tests {
         );
         assert_eq!(parse_request("commit "), None);
         assert_eq!(parse_request("focus"), Some(Request::Focus));
+        assert_eq!(parse_request("edits"), Some(Request::Edits));
         assert_eq!(parse_request("quit"), Some(Request::Quit));
         assert_eq!(parse_request("  quit \n"), Some(Request::Quit));
         assert_eq!(parse_request(""), None);

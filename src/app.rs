@@ -20,7 +20,7 @@ use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
 use crate::{api, controller, editor, ui, worker};
 
-pub fn run(open_file: Option<String>, open_commit: Option<String>) -> Result<()> {
+pub fn run(open_file: Option<String>, open_commit: Option<String>, open_edits: bool) -> Result<()> {
     let mut terminal = ratatui::init();
     // Best-effort: distinct Shift/Ctrl+Enter, Alt+Backspace on supporting terminals.
     let _ = execute!(
@@ -29,7 +29,7 @@ pub fn run(open_file: Option<String>, open_commit: Option<String>) -> Result<()>
         EnableMouseCapture,
         EnableFocusChange,
     );
-    let result = event_loop(&mut terminal, open_file, open_commit);
+    let result = event_loop(&mut terminal, open_file, open_commit, open_edits);
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
@@ -39,6 +39,7 @@ fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     open_file: Option<String>,
     open_commit: Option<String>,
+    open_edits: bool,
 ) -> Result<()> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
@@ -63,6 +64,7 @@ fn event_loop(
         st.pending_open_file = Some(crate::ipc::relative_to(&st.repo_root, &file));
     }
     st.pending_open_commit = open_commit;
+    st.pending_open_edits = open_edits;
     if !st.repo_owner.is_empty() {
         let repo_root = st.repo_root.clone();
         controller::submit(&mut st, &job_tx, Job::LoadPrs { repo_root });
@@ -88,6 +90,10 @@ fn event_loop(
                     editor::focus_self();
                 }
                 crate::ipc::Request::Focus => editor::focus_self(),
+                crate::ipc::Request::Edits => {
+                    st.pending_open_edits = true;
+                    editor::focus_self();
+                }
                 // Treated as a clean quit, which is what runs the cleanup that
                 // closes the windows this session opened.
                 crate::ipc::Request::Quit => st.should_quit = true,
@@ -95,6 +101,7 @@ fn event_loop(
         }
         controller::try_open_pending_file(&mut st, &job_tx);
         controller::try_open_pending_commit(&mut st, &job_tx);
+        controller::try_open_pending_edits(&mut st, &job_tx);
         if st.focus == Focus::Prs {
             if st.pr_idx != prev_pr || prev_focus != Some(Focus::Prs) {
                 st.details_scroll = 0;

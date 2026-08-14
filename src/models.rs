@@ -311,6 +311,8 @@ pub struct State {
     pub pending_open_file: Option<String>,
     /// A commit another tool asked us to review, held until a PR is loaded.
     pub pending_open_commit: Option<String>,
+    /// Someone asked for the Pending-edits pane on this checkout's PR.
+    pub pending_open_edits: bool,
     /// Set by an amend: the branch's history was rewritten, so the next push
     /// has to be a lease-force or the remote refuses it as non-fast-forward.
     pub amended: bool,
