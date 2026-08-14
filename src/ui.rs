@@ -881,7 +881,9 @@ fn render_pr_details(f: &mut Frame, st: &mut State, area: Rect) {
 }
 
 fn render_commit_detail(f: &mut Frame, st: &State, area: Rect) {
-    let b = block("Commit", st.focus == Focus::Commits, false);
+    // Not focused: the focus is on the list this previews, and two lit borders
+    // read as two places the keys apply.
+    let b = block("Commit", false, false);
     let inner = b.inner(area);
     f.render_widget(b, area);
     if st.commits.is_empty() {
@@ -901,7 +903,7 @@ fn render_commit_detail(f: &mut Frame, st: &State, area: Rect) {
 }
 
 fn render_pending_detail(f: &mut Frame, st: &State, area: Rect) {
-    let b = block("Pending comment", st.focus == Focus::Pending, false);
+    let b = block("Pending comment", false, false);
     let inner = b.inner(area);
     f.render_widget(b, area);
     let iw = inner.width as usize;
@@ -934,16 +936,21 @@ fn render_pending_detail(f: &mut Frame, st: &State, area: Rect) {
 
 /// The right pane while the Pending-edits pane is focused: the local diff of the
 /// selected changed file (exactly what will be committed).
+///
+/// Named and framed as `[0]`, like every other thing that pane can show: it
+/// carried `[4] Pending edits` and the focus border, so two panes claimed the
+/// same number and the same focus at once. It is the same content hunk mode
+/// shows, so it wears the same name.
 fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let path = match st.edit_tree.get(st.edit_idx) {
         Some(TreeRow::File { index, .. }) => st.edit_files.get(*index).map(|e| e.path.clone()),
         _ => None,
     };
     let title = match &path {
-        Some(p) => format!("[4] Pending edits — {p}"),
-        None => "[4] Pending edits".to_string(),
+        Some(p) => format!("[0] Local diff — {p}"),
+        None => "[0] Local diff".to_string(),
     };
-    let b = block(&title, st.focus == Focus::Edits, false);
+    let b = block(&title, false, false);
     let inner = b.inner(area);
     f.render_widget(b, area);
     let (vh, iw) = (inner.height as usize, inner.width as usize);
