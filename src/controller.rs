@@ -1423,7 +1423,12 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
         }
         None => {
             st.pending_open_commit = None;
-            st.status = format!("commit {wanted} is not in this PR");
+            // Not in the PR's commits — which only lists what is pushed. A
+            // commit made locally is still one we can diff, since that diff
+            // comes from this checkout rather than from GitHub.
+            st.status = format!("{wanted} is not pushed yet — showing it from the checkout");
+            st.focus = Focus::Diff;
+            submit(st, tx, Job::LoadCommitDiff { first: wanted.clone(), last: wanted });
         }
     }
 }
@@ -1643,11 +1648,12 @@ mod tests {
         assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "still waiting");
     }
 
-    /// A commit from another branch must say so rather than sitting there
-    /// looking like it is still loading.
+    /// The commit list is what GitHub knows, which is what has been pushed. A
+    /// commit made locally is still one this checkout can diff, so it is shown
+    /// rather than refused.
     #[test]
-    fn a_commit_that_is_not_in_the_pr_is_reported() {
-        let (tx, _rx) = std::sync::mpsc::channel();
+    fn a_commit_the_pr_does_not_list_is_read_from_the_checkout() {
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut st = State::default();
         st.active_pr = Some(pr(1));
         st.commits = vec![commit("aaaaaaaaaaaa")];
@@ -1655,7 +1661,13 @@ mod tests {
 
         try_open_pending_commit(&mut st, &tx);
         assert!(st.pending_open_commit.is_none(), "not retried forever");
-        assert!(st.status.contains("not in this PR"), "{}", st.status);
+        assert!(st.status.contains("not pushed yet"), "{}", st.status);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(
+            jobs.iter().any(|j| matches!(j, Job::LoadCommitDiff { first, last }
+                if first == "ffffff" && last == "ffffff")),
+            "the diff was asked for from the checkout"
+        );
     }
 
     #[test]

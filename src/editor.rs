@@ -210,11 +210,54 @@ pub fn close_worktree_editor(sock: &str) {
 ///
 /// Another tool handing us a file expects to see the result, and it is the one
 /// that had focus when it asked.
+/// Bring our own window forward.
+///
+/// Hyprland knows the *terminal's* pid, not ours: a TUI is a child of the
+/// window, so `pid:<our own>` matches nothing at all. The window is found by
+/// walking up to whichever ancestor owns one.
 pub fn focus_self() {
+    let Some(address) = own_window_address() else { return };
     let _ = Command::new("hyprctl")
-        .args(["dispatch", "focuswindow", &format!("pid:{}", std::process::id())])
+        .args(["dispatch", "focuswindow", &format!("address:{address}")])
         .output();
 }
+
+/// The Hyprland address of the window we are running inside, if any.
+fn own_window_address() -> Option<String> {
+    // A terminal, a shell, a multiplexer: a handful of hops is plenty, and the
+    // bound stops a broken /proc from spinning.
+    let mut ancestors = Vec::new();
+    let mut pid = std::process::id();
+    for _ in 0..12 {
+        ancestors.push(pid);
+        match parent_pid(pid) {
+            Some(p) if p > 1 => pid = p,
+            _ => break,
+        }
+    }
+    let out = Command::new("hyprctl").args(["clients", "-j"]).output().ok()?;
+    let clients: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    clients
+        .as_array()?
+        .iter()
+        .find(|c| c["pid"].as_u64().is_some_and(|p| ancestors.contains(&(p as u32))))
+        .and_then(|c| c["address"].as_str().map(str::to_string))
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    parse_ppid(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The parent pid out of a `/proc/<pid>/stat` line.
+///
+/// Read after the last `)`: the second field is the executable name, which can
+/// itself contain spaces and parentheses, so counting fields from the left
+/// gets the wrong one for a process named `(foo bar)`.
+fn parse_ppid(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 
 /// Close the Claude window this checkout spawned, if it is still around.
 pub fn close_review_claude() {
@@ -377,6 +420,21 @@ pub fn open_current_in_editor(st: &mut State, top: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process name can contain spaces and parentheses, so the fields cannot
+    /// be counted from the left.
+    #[test]
+    fn the_parent_pid_survives_an_awkward_process_name() {
+        assert_eq!(parse_ppid("42 (bash) S 7 42 42 0 -1 4194304"), Some(7));
+        assert_eq!(parse_ppid("42 (my prog (v2)) S 1234 42 42"), Some(1234));
+        assert_eq!(parse_ppid("nonsense"), None);
+    }
+
+    /// Our own parent exists, whatever it is.
+    #[test]
+    fn we_can_walk_up_from_ourselves() {
+        assert!(parent_pid(std::process::id()).is_some_and(|p| p > 0));
+    }
 
     #[test]
     fn shell_quote_wraps_and_escapes() {
