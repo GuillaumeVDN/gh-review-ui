@@ -1163,6 +1163,32 @@ pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) 
     }
 }
 
+/// Select the commit another tool asked for, once the PR holding it is loaded.
+///
+/// Held rather than dropped while `commits` is empty: the request can arrive
+/// before (or instead of) a PR being opened, and dropping it would make the
+/// caller's Enter do nothing at all.
+pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
+    let Some(wanted) = st.pending_open_commit.clone() else { return };
+    if st.commits.is_empty() {
+        return;
+    }
+    // The caller has an abbreviated hash; we hold full oids.
+    match st.commits.iter().position(|c| c.oid.starts_with(&wanted)) {
+        Some(i) => {
+            st.pending_open_commit = None;
+            st.focus = Focus::Commits;
+            st.commit_idx = i;
+            st.commit_selected = std::iter::once(st.commits[i].oid.clone()).collect();
+            apply_commit_selection(st, tx);
+        }
+        None => {
+            st.pending_open_commit = None;
+            st.status = format!("commit {wanted} is not in this PR");
+        }
+    }
+}
+
 /// The row in the edit tree showing `path`.
 pub fn find_edit_row(st: &State, path: &str) -> Option<usize> {
     st.edit_tree.iter().position(|row| match row {
@@ -1187,6 +1213,59 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn commit(oid: &str) -> crate::models::Commit {
+        crate::models::Commit {
+            oid: oid.into(),
+            headline: "H".into(),
+            body: String::new(),
+            author: "a".into(),
+            date: String::new(),
+        }
+    }
+
+    /// The manager holds abbreviated hashes; we hold full oids.
+    #[test]
+    fn a_requested_commit_is_matched_on_its_short_hash() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(1));
+        st.commits = vec![commit("aaaaaaaaaaaa"), commit("bbbbbbbbbbbb")];
+        st.pending_open_commit = Some("bbbbbbb".into());
+
+        try_open_pending_commit(&mut st, &tx);
+        assert_eq!(st.commit_idx, 1);
+        assert_eq!(st.focus, Focus::Commits);
+        assert!(st.commit_selected.contains("bbbbbbbbbbbb"));
+        assert!(st.commit_selected.len() == 1, "only the one asked for");
+        assert!(st.pending_open_commit.is_none(), "the request is spent");
+    }
+
+    /// The request can arrive before a PR is open; dropping it then would make
+    /// the caller's Enter do nothing at all.
+    #[test]
+    fn a_commit_request_waits_for_a_pr_to_load() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.pending_open_commit = Some("abc".into());
+        try_open_pending_commit(&mut st, &tx);
+        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "still waiting");
+    }
+
+    /// A commit from another branch must say so rather than sitting there
+    /// looking like it is still loading.
+    #[test]
+    fn a_commit_that_is_not_in_the_pr_is_reported() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(1));
+        st.commits = vec![commit("aaaaaaaaaaaa")];
+        st.pending_open_commit = Some("ffffff".into());
+
+        try_open_pending_commit(&mut st, &tx);
+        assert!(st.pending_open_commit.is_none(), "not retried forever");
+        assert!(st.status.contains("not in this PR"), "{}", st.status);
     }
 
     #[test]

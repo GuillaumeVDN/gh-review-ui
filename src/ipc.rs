@@ -37,6 +37,46 @@ pub fn socket_path(root: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/ghr-ipc-{}.sock", checkout_id(root)))
 }
 
+/// The socket dashdoc-manager listens on for a checkout.
+///
+/// It exists exactly while a card is open on that worktree, so its presence
+/// answers "is there already a Claude working here?".
+pub fn manager_socket_path(root: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/ddm-ipc-{}.sock", checkout_id(root)))
+}
+
+/// Whether a dashdoc-manager has a card open on `root`.
+pub fn manager_listening(root: &str) -> bool {
+    let path = manager_socket_path(root);
+    match UnixStream::connect(&path) {
+        Ok(_) => true,
+        Err(_) => {
+            // Left by a crashed run; clearing it stops every later send from
+            // trying to talk to nothing.
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            false
+        }
+    }
+}
+
+/// Hand a prompt to the manager's chat, by the path of a file holding it.
+///
+/// A path rather than the text: the protocol is line-based and a review's
+/// comments are many lines long.
+pub fn send_prompt(root: &str, file: &str) -> bool {
+    send_line_to(&manager_socket_path(root), &format!("prompt {file}"))
+}
+
+/// Ask a running instance to show the commit `sha`.
+///
+/// The commit pane already reviews a range of the PR's commits, so showing one
+/// is a matter of telling it which.
+pub fn send_commit(root: &str, sha: &str) -> bool {
+    send_line(root, &format!("commit {sha}"))
+}
+
 /// Ask a running instance to show `file`.
 ///
 /// Returns false when nobody is listening, which is the caller's cue to start
@@ -52,14 +92,17 @@ pub fn send_quit(root: &str) -> bool {
 }
 
 fn send_line(root: &str, line: &str) -> bool {
-    let path = socket_path(root);
+    send_line_to(&socket_path(root), line)
+}
+
+fn send_line_to(path: &Path, line: &str) -> bool {
     if !path.exists() {
         return false;
     }
-    match UnixStream::connect(&path) {
+    match UnixStream::connect(path) {
         Ok(mut stream) => stream.write_all(format!("{line}\n").as_bytes()).is_ok(),
         Err(_) => {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
             false
         }
     }
@@ -69,6 +112,8 @@ fn send_line(root: &str, line: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Open(String),
+    /// Select this commit and review it.
+    Commit(String),
     /// Quit as if the user had pressed `q`.
     ///
     /// Killing our window instead would skip the cleanup, leaving the Neovim
@@ -83,6 +128,12 @@ pub fn parse_request(line: &str) -> Option<Request> {
     let line = line.trim();
     if line == "quit" {
         return Some(Request::Quit);
+    }
+    if let Some(rest) = line.strip_prefix("commit ") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(Request::Commit(rest.to_string()));
     }
     let rest = line.strip_prefix("open ")?;
     if rest.is_empty() {
@@ -181,6 +232,11 @@ mod tests {
             None,
             "an empty path is not a request"
         );
+        assert_eq!(
+            parse_request("commit abc1234"),
+            Some(Request::Commit("abc1234".into()))
+        );
+        assert_eq!(parse_request("commit "), None);
         assert_eq!(parse_request("quit"), Some(Request::Quit));
         assert_eq!(parse_request("  quit \n"), Some(Request::Quit));
         assert_eq!(parse_request(""), None);
@@ -233,6 +289,17 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("delivered");
         assert_eq!(got, Request::Quit);
+    }
+
+    /// The manager's socket is a different file from ours: the two tools
+    /// listen for different things on the same checkout.
+    #[test]
+    fn the_managers_socket_is_not_ours() {
+        assert_ne!(socket_path("/x/wt"), manager_socket_path("/x/wt"));
+        assert!(manager_socket_path("/x/wt")
+            .to_string_lossy()
+            .starts_with("/tmp/ddm-ipc-"));
+        assert!(!manager_listening("/nonexistent/checkout-xyz"));
     }
 
     /// A socket left by a crashed instance must not wedge every later start.

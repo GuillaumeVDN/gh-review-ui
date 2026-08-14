@@ -271,6 +271,8 @@ pub struct State {
     /// A file another tool asked us to show, held until the edit list has
     /// loaded and we can actually select it.
     pub pending_open_file: Option<String>,
+    /// A commit another tool asked us to review, held until a PR is loaded.
+    pub pending_open_commit: Option<String>,
     pub entered_group: bool,
 
     pub diff_by_file: DiffMap,

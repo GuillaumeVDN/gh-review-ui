@@ -79,15 +79,29 @@ fn window_exists(title: &str) -> bool {
 
 /// Hand a whole review (all pending comments) to a local Claude.
 ///
-/// If a review-Claude window is already open, focus it and (via `wtype`) type a
-/// short instruction pointing at a file that holds the full prompt, then Enter —
-/// so a multi-line prompt doesn't submit itself line by line. Otherwise launch a
-/// fresh window seeded with the prompt (worktree PR: grouped beside the TUI;
-/// local PR: workspace 4).
+/// In order: a dashdoc-manager with this card open already has a Claude in its
+/// chat pane, so the prompt goes there; then a review-Claude window of our own,
+/// focused and driven through `wtype`; then a fresh window seeded with the
+/// prompt (worktree PR: grouped beside the TUI; local PR: workspace 4).
 pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String> {
     let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // A card open on this checkout means an agent is already working in it.
+    // A second window would be a second agent on the same worktree, which is
+    // how two of them end up editing the same file.
+    let manager = [st.active_worktree.as_str(), st.repo_root.as_str()]
+        .into_iter()
+        .find(|root| !root.is_empty() && crate::ipc::manager_listening(root));
+    if let Some(root) = manager {
+        let file = dir.join("review-latest.txt");
+        std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
+        if crate::ipc::send_prompt(root, &file.display().to_string()) {
+            st.status = "sent to the manager's chat".into();
+            return Ok(());
+        }
+    }
 
     // Reuse a running review window if we can drive the keyboard.
     if window_exists(REVIEW_TITLE) && has_cmd("wtype") {

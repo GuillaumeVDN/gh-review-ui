@@ -7,21 +7,24 @@ gh-review-ui — review GitHub PRs in the terminal
 
   gh-review-ui                  review the PRs of the repo you are in
   gh-review-ui --file <path>    open a worktree file in the Pending-edits pane
+  gh-review-ui --commit <sha>   review one commit of the open PR
 
-`--file` hands the path to an instance already running on this checkout when
+Both hand the argument to an instance already running on this checkout when
 there is one, so a second window is not opened for it.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let open_file = match args.first().map(String::as_str) {
+    let (mut open_file, mut open_commit) = (None, None);
+    match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Some("--file") => match args.get(1) {
-            Some(f) => Some(f.clone()),
+        Some(flag @ ("--file" | "--commit")) => match args.get(1) {
+            Some(v) if flag == "--file" => open_file = Some(v.clone()),
+            Some(v) => open_commit = Some(v.clone()),
             None => {
-                eprintln!("usage: gh-review-ui --file <path>");
+                eprintln!("usage: gh-review-ui {flag} <value>");
                 return ExitCode::FAILURE;
             }
         },
@@ -29,16 +32,21 @@ fn main() -> ExitCode {
             eprintln!("unknown argument {other:?}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
-        None => None,
-    };
+        None => {}
+    }
 
     // Hand off to a running instance before doing anything expensive: it has
     // the repo loaded already, and a window per file is what this avoids.
-    if let Some(file) = &open_file {
+    if open_file.is_some() || open_commit.is_some() {
         let root = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if ghreview::ipc::send_open(&root, file) {
+        let sent = match (&open_file, &open_commit) {
+            (Some(file), _) => ghreview::ipc::send_open(&root, file),
+            (_, Some(sha)) => ghreview::ipc::send_commit(&root, sha),
+            _ => false,
+        };
+        if sent {
             return ExitCode::SUCCESS;
         }
     }
@@ -48,7 +56,7 @@ fn main() -> ExitCode {
         eprintln!("gh is not authenticated. Run `gh auth login` first.");
         return ExitCode::FAILURE;
     }
-    match ghreview::app::run(open_file) {
+    match ghreview::app::run(open_file, open_commit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
