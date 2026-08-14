@@ -913,6 +913,16 @@ pub fn toggle_collapse(st: &mut State, path: &str) {
     tree::rebuild(st);
 }
 
+/// The same, on the Pending-edits tree, which keeps its own folded set.
+pub fn toggle_collapse_edit(st: &mut State, path: &str) {
+    if st.edit_collapsed.contains(path) {
+        st.edit_collapsed.remove(path);
+    } else {
+        st.edit_collapsed.insert(path.to_string());
+    }
+    tree::rebuild_edits(st);
+}
+
 pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
     if st.file_idx >= st.tree.len() || st.active_pr.is_none() || st.busy.contains("viewed") {
         return;
@@ -1152,8 +1162,17 @@ pub fn switch_stage_side(st: &mut State, staged: bool) {
 }
 
 /// Show the selected pending-edit file's local diff in [0] with hunk navigation.
+/// Enter in the Pending-edits pane: a file opens its diff, a folder folds.
+///
+/// The same key does both here as in the Files pane, since the two panes are
+/// the same shape of tree and a folder is not something to open.
 pub fn enter_local_diff(st: &mut State) {
-    let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
+    let row = st.edit_tree.get(st.edit_idx).cloned();
+    if let Some(TreeRow::Dir { path, .. }) = row {
+        toggle_collapse_edit(st, &path);
+        return;
+    }
+    let Some(TreeRow::File { index, .. }) = row else {
         return;
     };
     let Some(entry) = st.edit_files.get(index) else { return };
@@ -1478,6 +1497,33 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    /// Enter on a folder folds it, the way it does in the Files pane. A folder
+    /// is not something to open.
+    #[test]
+    fn enter_on_a_folder_of_the_edits_tree_folds_it() {
+        let mut st = State::default();
+        st.edit_files = ["src/a.rs", "src/b.rs"]
+            .iter()
+            .map(|p| EditEntry { path: p.to_string(), kind: EditKind::Modified })
+            .collect();
+        crate::tree::rebuild_edits(&mut st);
+        st.edit_idx = st
+            .edit_tree
+            .iter()
+            .position(|r| matches!(r, TreeRow::Dir { .. }))
+            .expect("a folder row");
+        let before = st.edit_tree.len();
+
+        enter_local_diff(&mut st);
+        assert!(st.edit_collapsed.contains("src"), "it folded");
+        assert!(st.edit_tree.len() < before, "and its files went with it");
+        assert_ne!(st.focus, Focus::Diff, "a folder opens no diff");
+
+        enter_local_diff(&mut st);
+        assert!(!st.edit_collapsed.contains("src"), "and unfolds again");
+        assert_eq!(st.edit_tree.len(), before);
     }
 
     fn comment(path: &str, line: i64) -> PendingComment {
