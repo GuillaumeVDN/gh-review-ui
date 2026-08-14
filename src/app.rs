@@ -87,6 +87,7 @@ fn event_loop(
                     st.pending_open_commit = Some(sha);
                     editor::focus_self();
                 }
+                crate::ipc::Request::Focus => editor::focus_self(),
                 // Treated as a clean quit, which is what runs the cleanup that
                 // closes the windows this session opened.
                 crate::ipc::Request::Quit => st.should_quit = true,
