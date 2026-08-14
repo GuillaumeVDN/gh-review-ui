@@ -1131,6 +1131,46 @@ pub fn push_edits(st: &mut State, tx: &Sender<Job>) {
 }
 
 
+/// Select the file another tool asked us to show, once we can.
+///
+/// The request can arrive before the edit list has loaded, so it is held and
+/// retried rather than dropped. A file that is not in the list — because it has
+/// no uncommitted changes — clears the request instead of retrying forever.
+pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) {
+    let Some(wanted) = st.pending_open_file.clone() else { return };
+
+    // Nothing to match against yet: ask for the edits and wait.
+    if st.edit_files.is_empty() {
+        if !st.busy.contains("edits") {
+            reload_edits(st, tx);
+        }
+        return;
+    }
+
+    st.focus = Focus::Edits;
+    match find_edit_row(st, &wanted) {
+        Some(idx) => {
+            st.pending_open_file = None;
+            st.edit_idx = idx;
+            st.edit_diff_scroll = 0;
+            enter_local_diff(st);
+            st.status = format!("opened {wanted}");
+        }
+        None => {
+            st.pending_open_file = None;
+            st.status = format!("{wanted} has no uncommitted changes");
+        }
+    }
+}
+
+/// The row in the edit tree showing `path`.
+pub fn find_edit_row(st: &State, path: &str) -> Option<usize> {
+    st.edit_tree.iter().position(|row| match row {
+        TreeRow::File { index, .. } => st.edit_files.get(*index).is_some_and(|e| e.path == path),
+        TreeRow::Dir { .. } => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,5 +1229,50 @@ mod tests {
         assert!(p.contains("overall note"));
         assert!(p.contains("x.rs:10") && p.contains("fix this"));
         assert!(p.contains("y.rs:3-5") && p.contains("and that"));
+    }
+
+    /// The socket hands us a path; finding its row is what turns that into a
+    /// selection, and a directory row must never be taken for a file.
+    #[test]
+    fn a_pending_file_is_found_by_its_path() {
+        let mut st = State::default();
+        st.edit_files = vec![
+            EditEntry { path: "src/a.rs".into(), kind: EditKind::Modified },
+            EditEntry { path: "src/b.rs".into(), kind: EditKind::Added },
+        ];
+        st.edit_tree = vec![
+            TreeRow::Dir { depth: 0, name: "src".into(), path: "src".into(), collapsed: false },
+            TreeRow::File { depth: 1, name: "a.rs".into(), index: 0 },
+            TreeRow::File { depth: 1, name: "b.rs".into(), index: 1 },
+        ];
+        assert_eq!(find_edit_row(&st, "src/a.rs"), Some(1));
+        assert_eq!(find_edit_row(&st, "src/b.rs"), Some(2));
+        assert_eq!(find_edit_row(&st, "src"), None, "a directory is not a file");
+        assert_eq!(find_edit_row(&st, "src/missing.rs"), None);
+    }
+
+    /// A file with no uncommitted changes clears the request rather than
+    /// retrying every frame forever.
+    #[test]
+    fn a_file_that_is_not_modified_clears_the_request() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.edit_files = vec![EditEntry { path: "src/a.rs".into(), kind: EditKind::Modified }];
+        st.edit_tree = vec![TreeRow::File { depth: 0, name: "a.rs".into(), index: 0 }];
+        st.pending_open_file = Some("src/untouched.rs".into());
+
+        try_open_pending_file(&mut st, &tx);
+        assert!(st.pending_open_file.is_none(), "it gave up rather than looping");
+        assert!(st.status.contains("no uncommitted changes"), "{}", st.status);
+    }
+
+    /// Arriving before the list has loaded must hold the request, not drop it.
+    #[test]
+    fn a_request_that_arrives_early_is_held() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.pending_open_file = Some("src/a.rs".into());
+        try_open_pending_file(&mut st, &tx);
+        assert_eq!(st.pending_open_file.as_deref(), Some("src/a.rs"), "still waiting");
     }
 }

@@ -268,6 +268,9 @@ pub struct State {
     /// once), and whether we created the Hyprland window group ourselves — both
     /// used to tear things down on exit / when the editor is closed.
     pub worktree_editors: HashMap<String, bool>,
+    /// A file another tool asked us to show, held until the edit list has
+    /// loaded and we can actually select it.
+    pub pending_open_file: Option<String>,
     pub entered_group: bool,
 
     pub diff_by_file: DiffMap,

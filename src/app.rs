@@ -20,7 +20,7 @@ use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
 use crate::{api, controller, editor, ui, worker};
 
-pub fn run() -> Result<()> {
+pub fn run(open_file: Option<String>) -> Result<()> {
     let mut terminal = ratatui::init();
     // Best-effort: distinct Shift/Ctrl+Enter, Alt+Backspace on supporting terminals.
     let _ = execute!(
@@ -29,13 +29,13 @@ pub fn run() -> Result<()> {
         EnableMouseCapture,
         EnableFocusChange,
     );
-    let result = event_loop(&mut terminal);
+    let result = event_loop(&mut terminal, open_file);
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, open_file: Option<String>) -> Result<()> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     thread::spawn(move || worker::worker_loop(job_rx, msg_tx));
@@ -50,6 +50,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     }
     st.repo_root = api::get_repo_root();
     st.viewer = api::get_viewer_login();
+
+    // Listen for another tool asking us to show a file. Held for the whole run:
+    // dropping it removes the socket.
+    let (ipc_tx, ipc_rx) = mpsc::channel::<crate::ipc::Request>();
+    let _ipc = crate::ipc::listen(&st.repo_root, ipc_tx);
+    if let Some(file) = open_file {
+        st.pending_open_file = Some(crate::ipc::relative_to(&st.repo_root, &file));
+    }
     if !st.repo_owner.is_empty() {
         let repo_root = st.repo_root.clone();
         controller::submit(&mut st, &job_tx, Job::LoadPrs { repo_root });
@@ -62,6 +70,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         while let Ok(msg) = msg_rx.try_recv() {
             controller::apply_msg(&mut st, msg, &job_tx);
         }
+        while let Ok(crate::ipc::Request::Open(file)) = ipc_rx.try_recv() {
+            st.pending_open_file = Some(crate::ipc::relative_to(&st.repo_root, &file));
+            // The request came from another window, so bring ours forward.
+            editor::focus_self();
+        }
+        controller::try_open_pending_file(&mut st, &job_tx);
         if st.focus == Focus::Prs {
             if st.pr_idx != prev_pr || prev_focus != Some(Focus::Prs) {
                 st.details_scroll = 0;
@@ -147,14 +161,20 @@ fn close_worktree_editors(st: &mut State) {
 /// On exit: close the Neovim windows we launched, and (on a clean quit, while the
 /// TUI window is still focused) leave the Hyprland group.
 fn cleanup_editors(st: &mut State, graceful: bool) {
-    if graceful && st.entered_group {
-        editor::ungroup_active();
-        st.entered_group = false;
-    }
     for sock in st.worktree_editors.keys() {
         editor::close_worktree_editor(sock);
     }
     st.worktree_editors.clear();
+    // The Claude window is ours too; leaving it behind strands an agent nobody
+    // is watching.
+    editor::close_review_claude();
+
+    // Last, and only on a clean quit: ungrouping needs our window to still be
+    // focused, and a group we did not create is not ours to dissolve.
+    if graceful && st.entered_group {
+        editor::ungroup_active();
+        st.entered_group = false;
+    }
 }
 
 fn size_rect(terminal: &ratatui::DefaultTerminal) -> Rect {

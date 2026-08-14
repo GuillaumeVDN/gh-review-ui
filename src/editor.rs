@@ -193,6 +193,25 @@ pub fn close_worktree_editor(sock: &str) {
     spawn_bash(&script, "");
 }
 
+/// Bring our own window forward.
+///
+/// Another tool handing us a file expects to see the result, and it is the one
+/// that had focus when it asked.
+pub fn focus_self() {
+    let _ = Command::new("hyprctl")
+        .args(["dispatch", "focuswindow", &format!("pid:{}", std::process::id())])
+        .output();
+}
+
+/// Close the Claude window this checkout spawned, if it is still around.
+pub fn close_review_claude() {
+    if window_exists(REVIEW_TITLE) {
+        let _ = Command::new("hyprctl")
+            .args(["dispatch", "closewindow", &format!("title:^{REVIEW_TITLE}$")])
+            .output();
+    }
+}
+
 /// Dissolve the current Hyprland group if the active window is grouped.
 pub fn ungroup_active() {
     if in_group() {

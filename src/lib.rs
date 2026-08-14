@@ -18,6 +18,7 @@ pub mod controller;
 pub mod diff;
 pub mod editor;
 pub mod gh;
+pub mod ipc;
 pub mod markdown;
 pub mod models;
 pub mod navigation;
