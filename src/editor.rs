@@ -83,7 +83,7 @@ fn window_exists(title: &str) -> bool {
 /// chat pane, so the prompt goes there; then a review-Claude window of our own,
 /// focused and driven through `wtype`; then a fresh window seeded with the
 /// prompt (worktree PR: grouped beside the TUI; local PR: workspace 4).
-pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String> {
+pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<&'static str, String> {
     let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -98,8 +98,7 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String>
         let file = dir.join("review-latest.txt");
         std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
         if crate::ipc::send_prompt(root, &file.display().to_string()) {
-            st.status = "sent to the manager's chat".into();
-            return Ok(());
+            return Ok("the manager's chat");
         }
     }
 
@@ -116,7 +115,7 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String>
             q = shell_single_quote(&instruction),
         );
         spawn_bash(&script, "");
-        return Ok(());
+        return Ok("the review's Claude window");
     }
 
     // Otherwise open a fresh window seeded with the whole prompt.
@@ -146,7 +145,7 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<(), String>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ())
+        .map(|_| "a new Claude window")
         .map_err(|e| e.to_string())
 }
 

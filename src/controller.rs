@@ -759,6 +759,38 @@ pub fn discard_selected_comment(st: &mut State, tx: &Sender<Job>) {
     st.status = format!("Discarding comment on {}:{}…", removed.path, removed.line);
 }
 
+/// Drop every pending comment, once they have been handed somewhere else.
+///
+/// Local ones are a file we own, so emptying it is the whole job. GitHub-side
+/// drafts are not: clearing only the list here would bring all of them back on
+/// the next load, so each is discarded through the same call `d` uses.
+fn clear_pending_comments(st: &mut State, tx: &Sender<Job>) {
+    let comments = std::mem::take(&mut st.pending);
+    st.pending_idx = 0;
+    if st.local_mode {
+        save_local(st);
+        return;
+    }
+    let Some(pr) = st.active_pr.clone() else { return };
+    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    for c in comments {
+        if c.comment_id.is_empty() {
+            continue;
+        }
+        submit(
+            st,
+            tx,
+            Job::DiscardPending {
+                owner: owner.clone(),
+                name: name.clone(),
+                number: pr.number,
+                login: login.clone(),
+                comment_id: c.comment_id,
+            },
+        );
+    }
+}
+
 /// Delete the comment currently open in the Edit modal (Ctrl+D).
 pub fn delete_editing_comment(st: &mut State, tx: &Sender<Job>) {
     let Overlay::Edit { comment_id, path, line, .. } = &st.overlay else { return };
@@ -808,7 +840,14 @@ pub fn confirm_review(st: &mut State, tx: &Sender<Job>) {
         }
         let prompt = build_review_prompt(st, &body);
         match editor::send_review_to_claude(st, &prompt) {
-            Ok(()) => st.status = "Sent review comments to Claude…".into(),
+            Ok(where_) => {
+                let n = st.pending.len();
+                // They are Claude's job now. Left pending they come back on
+                // every reload, and — worse — ride along on the next review
+                // that is actually submitted.
+                clear_pending_comments(st, tx);
+                st.status = format!("Sent {n} comment(s) to {where_} · drafts cleared");
+            }
             Err(e) => st.status = format!("Failed to launch Claude: {e}"),
         }
         return;
@@ -1415,6 +1454,18 @@ mod tests {
         }
     }
 
+    fn comment(path: &str, line: i64) -> PendingComment {
+        PendingComment {
+            path: path.into(),
+            body: "b".into(),
+            line,
+            side: "RIGHT".into(),
+            comment_id: format!("id-{path}-{line}"),
+            start_line: None,
+            start_side: String::new(),
+        }
+    }
+
     fn commit(oid: &str) -> crate::models::Commit {
         crate::models::Commit {
             oid: oid.into(),
@@ -1423,6 +1474,45 @@ mod tests {
             author: "a".into(),
             date: String::new(),
         }
+    }
+
+    /// Handed to Claude, the drafts have done their job — left pending they
+    /// come back on every reload and ride along on the next real submission.
+    #[test]
+    fn local_drafts_are_cleared_once_they_are_claudes_job() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.local_mode = true;
+        st.repo_owner = "o".into();
+        st.repo_name = "n".into();
+        st.pending = vec![comment("a.rs", 1), comment("b.rs", 2)];
+        st.pending_idx = 1;
+
+        clear_pending_comments(&mut st, &tx);
+        assert!(st.pending.is_empty());
+        assert_eq!(st.pending_idx, 0);
+        assert_eq!(rx.try_iter().count(), 0, "a local store needs no API call");
+    }
+
+    /// A GitHub-side draft is not ours to just forget: clearing the list alone
+    /// would bring every one of them back on the next load.
+    #[test]
+    fn github_drafts_are_discarded_one_by_one() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.local_mode = false;
+        st.pending = vec![comment("a.rs", 1), comment("b.rs", 2)];
+
+        clear_pending_comments(&mut st, &tx);
+        assert!(st.pending.is_empty());
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert_eq!(
+            jobs.iter().filter(|j| matches!(j, Job::DiscardPending { .. })).count(),
+            2,
+            "one per draft"
+        );
     }
 
     /// Rewriting history is not something to do to a shared branch on the
