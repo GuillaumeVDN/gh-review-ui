@@ -915,6 +915,40 @@ pub fn fold_viewed(st: &mut State) {
     );
 }
 
+/// `z` in the Pending-edits pane: fold what is done and go to what is not.
+///
+/// The same gesture as `z` in the Files pane, reading "fully staged" as that
+/// pane reads "viewed" — both say there is nothing left to do in that file.
+pub fn fold_staged(st: &mut State) {
+    // Captured before folding collapses rows away, so the anchor is the file,
+    // not the row it happened to sit on.
+    let (dir, file_anchor) = match st.edit_tree.get(st.edit_idx) {
+        Some(TreeRow::Dir { path, .. }) => (Some(path.clone()), None),
+        Some(TreeRow::File { index, .. }) => (None, Some(*index)),
+        None => (None, None),
+    };
+    let folded = tree::fold_staged_dirs(st);
+    let jumped = if let Some(path) = dir {
+        // On a folder: dive to the first unstaged file inside it, and only if
+        // it has none (fully staged → just folded) carry on past it.
+        tree::first_unstaged_in_dir(st, &path).or_else(|| {
+            let anchor = tree::edit_files_under_dir(st, &path).into_iter().next();
+            tree::next_unstaged_index(st, anchor)
+        })
+    } else {
+        tree::next_unstaged_index(st, file_anchor)
+    };
+    if let Some(ti) = jumped {
+        st.edit_idx = ti;
+        st.edit_diff_scroll = 0;
+    }
+    st.status = format!(
+        "Folded {folded} staged folder{}{}",
+        if folded == 1 { "" } else { "s" },
+        if jumped.is_some() { " · jumped to next unstaged file" } else { " · nothing left unstaged" }
+    );
+}
+
 // ---- pending edits (local worktree changes) ----
 
 /// Rebuild the Files list as the PR files plus edit-only local files (new /

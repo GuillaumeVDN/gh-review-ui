@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::models::{FileEntry, State, TreeRow};
+use crate::models::{FileEntry, StageState, State, TreeRow};
 
 enum Node {
     Dir(HashMap<String, Node>),
@@ -123,6 +123,65 @@ pub fn fold_viewed_dirs(st: &mut State) -> usize {
     folded
 }
 
+/// Collapse every folder of the Pending-edits tree whose files are all staged.
+///
+/// The `[4]` pane's fold, with "fully staged" standing in for "viewed" — it is
+/// the same statement about a file: there is nothing left to do here.
+pub fn fold_staged_dirs(st: &mut State) -> usize {
+    let mut dirs: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &st.edit_files {
+        let parts: Vec<&str> = e.path.split('/').collect();
+        for d in 1..parts.len() {
+            dirs.entry(parts[..d].join("/")).or_default().push(e.path.clone());
+        }
+    }
+    // Decided before collapsing: `stage_state` borrows the state we are about
+    // to write to.
+    let to_fold: Vec<String> = dirs
+        .into_iter()
+        .filter(|(path, paths)| {
+            !paths.is_empty()
+                && !st.edit_collapsed.contains(path)
+                && paths
+                    .iter()
+                    .all(|p| crate::navigation::stage_state(st, p) == StageState::Staged)
+        })
+        .map(|(path, _)| path)
+        .collect();
+    let folded = to_fold.len();
+    for path in to_fold {
+        st.edit_collapsed.insert(path);
+    }
+    rebuild_edits(st);
+    folded
+}
+
+/// Tree index of the first unstaged file within `dir_path`'s subtree, if any.
+pub fn first_unstaged_in_dir(st: &State, dir_path: &str) -> Option<usize> {
+    let prefix = format!("{dir_path}/");
+    st.edit_tree.iter().position(|row| match row {
+        TreeRow::File { index, .. } => st
+            .edit_files
+            .get(*index)
+            .is_some_and(|e| {
+                e.path.starts_with(&prefix)
+                    && crate::navigation::stage_state(st, &e.path) != StageState::Staged
+            }),
+        _ => false,
+    })
+}
+
+/// Indices into `st.edit_files` of the files under `dir_path`.
+pub fn edit_files_under_dir(st: &State, dir_path: &str) -> Vec<usize> {
+    let prefix = format!("{dir_path}/");
+    st.edit_files
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.path.starts_with(&prefix))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Tree index of the first unviewed file, if any.
 pub fn first_unviewed_index(st: &State) -> Option<usize> {
     st.tree.iter().position(|row| match row {
@@ -148,10 +207,37 @@ pub fn first_unviewed_in_dir(st: &State, dir_path: &str) -> Option<usize> {
 /// back to the closest one *before* it. With no anchor, returns the first unviewed
 /// file. The anchor itself is never returned.
 pub fn next_unviewed_index(st: &State, anchor: Option<usize>) -> Option<usize> {
+    let paths: Vec<String> = st.files.iter().map(|f| f.path.clone()).collect();
+    let done: Vec<bool> = st.files.iter().map(|f| f.viewed).collect();
+    next_pending_index(&st.tree, &paths, &done, anchor)
+}
+
+/// The same walk over the Pending-edits tree, where "done" is a fully staged
+/// file rather than a viewed one.
+pub fn next_unstaged_index(st: &State, anchor: Option<usize>) -> Option<usize> {
+    let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
+    let done: Vec<bool> = paths
+        .iter()
+        .map(|p| crate::navigation::stage_state(st, p) == StageState::Staged)
+        .collect();
+    next_pending_index(&st.edit_tree, &paths, &done, anchor)
+}
+
+/// Shared by both panes: the next row still to do, given which are done.
+///
+/// `tree` is the rows as currently displayed (so a collapsed row is not a
+/// destination), `paths` and `done` are indexed by the file index the rows
+/// carry, and `anchor` is where the cursor sat.
+fn next_pending_index(
+    tree: &[TreeRow],
+    paths: &[String],
+    done: &[bool],
+    anchor: Option<usize>,
+) -> Option<usize> {
     // Stable display order over file indices, independent of the current collapse
     // state, so a folded-away anchor still has a well-defined position.
-    let mut rank = vec![0usize; st.files.len()];
-    for (r, row) in build_tree(&st.files, &HashSet::new()).iter().enumerate() {
+    let mut rank = vec![0usize; paths.len()];
+    for (r, row) in build_tree_from_paths(paths, &HashSet::new()).iter().enumerate() {
         if let TreeRow::File { index, .. } = row {
             rank[*index] = r;
         }
@@ -160,9 +246,9 @@ pub fn next_unviewed_index(st: &State, anchor: Option<usize>) -> Option<usize> {
 
     let mut after: Option<(usize, usize)> = None; // (rank, tree_pos): smallest rank after anchor
     let mut before: Option<(usize, usize)> = None; // (rank, tree_pos): largest rank before anchor
-    for (ti, row) in st.tree.iter().enumerate() {
+    for (ti, row) in tree.iter().enumerate() {
         let TreeRow::File { index, .. } = row else { continue };
-        if st.files[*index].viewed {
+        if done[*index] {
             continue;
         }
         let r = rank[*index];
@@ -197,6 +283,82 @@ mod tests {
             .iter()
             .map(|(p, v)| FileEntry { path: p.to_string(), viewed: *v })
             .collect()
+    }
+
+    /// The `[4]` pane folds by "fully staged" where `[3]` folds by "viewed".
+    /// A folder with anything left to stage must stay open.
+    #[test]
+    fn only_wholly_staged_folders_fold() {
+        let mut st = State::default();
+        st.edit_files = ["src/a.rs", "src/b.rs", "docs/x.md"]
+            .iter()
+            .map(|p| crate::models::EditEntry {
+                path: p.to_string(),
+                kind: crate::models::EditKind::Modified,
+            })
+            .collect();
+        // Staged means: present in the staged diff and absent from the unstaged one.
+        for p in ["src/a.rs", "docs/x.md"] {
+            st.staged_diff_by_file.insert(p.to_string(), Vec::new());
+        }
+        st.unstaged_diff_by_file.insert("src/b.rs".to_string(), Vec::new());
+        rebuild_edits(&mut st);
+
+        assert_eq!(fold_staged_dirs(&mut st), 1);
+        assert!(st.edit_collapsed.contains("docs"), "everything in it is staged");
+        assert!(!st.edit_collapsed.contains("src"), "b.rs is still unstaged");
+
+        // Folding again finds nothing new rather than counting the same one twice.
+        assert_eq!(fold_staged_dirs(&mut st), 0);
+    }
+
+    /// A partially staged file is not done, so its folder stays open.
+    #[test]
+    fn a_partly_staged_file_does_not_count_as_done() {
+        let mut st = State::default();
+        st.edit_files = vec![crate::models::EditEntry {
+            path: "src/a.rs".into(),
+            kind: crate::models::EditKind::Modified,
+        }];
+        st.staged_diff_by_file.insert("src/a.rs".to_string(), Vec::new());
+        st.unstaged_diff_by_file.insert("src/a.rs".to_string(), Vec::new());
+        rebuild_edits(&mut st);
+
+        assert_eq!(fold_staged_dirs(&mut st), 0);
+        assert!(next_unstaged_index(&st, None).is_some(), "it is still to do");
+    }
+
+    #[test]
+    fn the_next_unstaged_file_is_the_one_after_the_cursor() {
+        let mut st = State::default();
+        st.edit_files = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|p| crate::models::EditEntry {
+                path: p.to_string(),
+                kind: crate::models::EditKind::Modified,
+            })
+            .collect();
+        st.staged_diff_by_file.insert("b.rs".to_string(), Vec::new());
+        rebuild_edits(&mut st);
+
+        // From a.rs: b.rs is done, so c.rs is next.
+        let ti = next_unstaged_index(&st, Some(0)).expect("something left");
+        assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 2, .. }));
+        // From c.rs there is nothing after, so it falls back to a.rs before it.
+        let ti = next_unstaged_index(&st, Some(2)).expect("something left");
+        assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 0, .. }));
+    }
+
+    #[test]
+    fn nothing_is_left_when_every_file_is_staged() {
+        let mut st = State::default();
+        st.edit_files = vec![crate::models::EditEntry {
+            path: "a.rs".into(),
+            kind: crate::models::EditKind::Modified,
+        }];
+        st.staged_diff_by_file.insert("a.rs".to_string(), Vec::new());
+        rebuild_edits(&mut st);
+        assert!(next_unstaged_index(&st, None).is_none());
     }
 
     #[test]

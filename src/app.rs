@@ -371,7 +371,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('G') => set_edit_idx(st, st.edit_tree.len().saturating_sub(1)),
-            KeyCode::Char('z') => jump_edit_file(st, 1),
+            KeyCode::Char('z') => controller::fold_staged(st),
             KeyCode::PageDown => st.edit_diff_scroll += page,
             KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
             KeyCode::Enter => controller::enter_local_diff(st),
