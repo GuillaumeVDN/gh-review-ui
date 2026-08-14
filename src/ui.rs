@@ -287,7 +287,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
         Focus::Edits => format!("Enter: hunks · Space: stage · z/Z: fold/unfold · c: commit · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
-            format!("j/k: block · Space: stage hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
+            format!("j/k: block · Space: stage hunk · d: revert hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
         }
         Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }

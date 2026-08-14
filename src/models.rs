@@ -227,6 +227,11 @@ pub enum ConfirmKind {
     /// Push a branch whose history was rewritten, which the remote will only
     /// take as a force.
     ForcePush,
+    /// Throw away one hunk of a local diff.
+    ///
+    /// The patch is built when the question is asked rather than when it is
+    /// answered, so what gets reverted is what was on screen.
+    RevertHunk { path: String, patch: String, staged: bool },
 }
 
 #[derive(Default)]

@@ -41,6 +41,8 @@ pub enum Job {
     /// Stage/unstage whole `paths`, or a single hunk when `patch` is set.
     Stage { wt: String, paths: Vec<String>, patch: Option<String>, unstage: bool },
     CommitEdits { wt: String, message: String, paths: Vec<String>, kind: CommitKind },
+    /// Undo one hunk of a local diff.
+    RevertHunk { wt: String, patch: String, staged: bool },
     PushEdits {
         wt: String,
         repo_root: String,
@@ -96,6 +98,7 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::AddPending { .. } | Job::DiscardPending { .. } | Job::EditPending { .. } => "pending",
         Job::SubmitReview { .. } | Job::PostLocalReview { .. } => "review",
         Job::LoadEdits { .. } | Job::DiscardEdit { .. } | Job::Stage { .. } => "edits",
+        Job::RevertHunk { .. } => "edits",
         Job::CommitEdits { .. } => "editcommit",
         Job::PushEdits { .. } => "editpush",
         Job::CheckoutLocal { .. } => "checkout",
@@ -192,6 +195,15 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
         Job::LoadEdits { wt } => Msg::Edits(api::load_edits(wt)),
         Job::DiscardEdit { wt, path, added } => {
             api::discard_edit(wt, path, *added)?;
+            Msg::Edits(api::load_edits(wt))
+        }
+        Job::RevertHunk { wt, patch, staged } => {
+            // A staged hunk has to leave the index *and* the working tree, or
+            // reverting it would only unstage it and the change would still be
+            // on disk. An unstaged one exists only on disk.
+            let target =
+                if *staged { api::PatchTarget::Both } else { api::PatchTarget::Worktree };
+            api::apply_patch(wt, patch, true, target)?;
             Msg::Edits(api::load_edits(wt))
         }
         Job::Stage { wt, paths, patch, unstage } => {

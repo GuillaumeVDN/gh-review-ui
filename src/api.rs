@@ -411,12 +411,34 @@ pub fn stage_paths(wt: &str, paths: &[String], unstage: bool) -> Result<()> {
     sh(&args).map(|_| ())
 }
 
+/// Where a synthesised hunk patch lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PatchTarget {
+    /// Staging and unstaging: the index alone moves.
+    Index,
+    /// Reverting an unstaged hunk: it exists only in the working tree.
+    Worktree,
+    /// Reverting a staged hunk: it has to leave both, or unstaging is all that
+    /// happens and the change is still on disk.
+    Both,
+}
+
 /// Apply `patch` to the index only (`git apply --cached`), forward to stage a
-/// hunk or reversed to unstage it. `--recount` lets git fix the hunk header
-/// counts of the patch we synthesise.
+/// hunk or reversed to unstage it.
 pub fn apply_index_patch(wt: &str, patch: &str, reverse: bool) -> Result<()> {
+    apply_patch(wt, patch, reverse, PatchTarget::Index)
+}
+
+/// Apply `patch` to `target`. `--recount` lets git fix the hunk header counts
+/// of the patch we synthesise.
+pub fn apply_patch(wt: &str, patch: &str, reverse: bool, target: PatchTarget) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["-C", wt, "apply", "--cached", "--recount", "--whitespace=nowarn"]);
+    cmd.args(["-C", wt, "apply", "--recount", "--whitespace=nowarn"]);
+    match target {
+        PatchTarget::Index => cmd.arg("--cached"),
+        PatchTarget::Both => cmd.arg("--index"),
+        PatchTarget::Worktree => &mut cmd,
+    };
     if reverse {
         cmd.arg("--reverse");
     }

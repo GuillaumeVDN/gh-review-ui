@@ -172,6 +172,48 @@ fn commit_takes_the_index_when_something_is_staged() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
+/// `d` on an unstaged hunk: that block goes back to what HEAD has, and the
+/// other one — the whole point of doing it by hunk — stays.
+#[test]
+fn reverting_an_unstaged_hunk_leaves_the_other_alone() {
+    let wt = repo("revert-unstaged");
+    let edits = api::load_edits(&wt);
+    let lines = &edits.unstaged.0["f.txt"];
+    let blocks = compute_hunks(lines);
+    // Built against the post-image (the working tree), which is what it is
+    // being undone from; a forwards patch would not apply while b → B is there.
+    let patch = build_hunk_patch(lines, blocks[1], true).unwrap();
+
+    api::apply_patch(&wt, &patch, true, api::PatchTarget::Worktree).unwrap();
+
+    let text = std::fs::read_to_string(Path::new(&wt).join("f.txt")).unwrap();
+    assert_eq!(text, "a\nB\nc\nd\ne\n", "d → D undone, b → B kept");
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// `d` on a *staged* hunk has to take it out of the index and the working tree
+/// both: leaving the file alone would only unstage the change, which is the
+/// one thing `d` must not quietly do.
+#[test]
+fn reverting_a_staged_hunk_takes_it_off_disk_as_well() {
+    let wt = repo("revert-staged");
+    git(Path::new(&wt), &["add", "f.txt"]); // both blocks staged
+    let edits = api::load_edits(&wt);
+    let lines = &edits.staged.0["f.txt"];
+    let blocks = compute_hunks(lines);
+    let patch = build_hunk_patch(lines, blocks[1], true).unwrap();
+
+    api::apply_patch(&wt, &patch, true, api::PatchTarget::Both).unwrap();
+
+    let text = std::fs::read_to_string(Path::new(&wt).join("f.txt")).unwrap();
+    assert_eq!(text, "a\nB\nc\nd\ne\n", "gone from the working tree too");
+    // The other block is still staged: reverting one hunk is not unstaging.
+    let staged = git(Path::new(&wt), &["diff", "--cached", "-U0", "--", "f.txt"]);
+    assert!(staged.contains("+B"), "{staged}");
+    assert!(!staged.contains("+D"), "{staged}");
+    std::fs::remove_dir_all(&wt).ok();
+}
+
 #[test]
 fn discard_reverts_the_index_too() {
     let wt = repo("discard");

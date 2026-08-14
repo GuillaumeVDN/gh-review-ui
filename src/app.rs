@@ -395,6 +395,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Left | KeyCode::Char('h') => controller::switch_stage_side(st, false),
             KeyCode::Right | KeyCode::Char('l') => controller::switch_stage_side(st, true),
             KeyCode::Char(' ') => controller::toggle_stage_hunk(st, tx),
+            KeyCode::Char('d') => controller::begin_discard_hunk(st),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Char('c') => controller::enter_comment_mode(st),

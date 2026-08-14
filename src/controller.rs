@@ -1057,6 +1057,46 @@ pub fn toggle_stage_hunk(st: &mut State, tx: &Sender<Job>) {
     submit(st, tx, Job::Stage { wt, paths: vec![path], patch: Some(patch), unstage });
 }
 
+/// `d` on a hunk of a local diff: ask, then throw that hunk away.
+///
+/// It asks for the same reason `d` in `[4]` does — the work is not recoverable
+/// — and the patch is built now rather than on the answer, so what disappears
+/// is what was on screen when the question was asked.
+///
+/// Reverting from the staged column of a *partly* staged file is the one case
+/// git refuses: the change has to leave the index and the working tree
+/// together, and there the two do not agree. It says so rather than half-doing
+/// it; reverting from the unstaged column always works.
+pub fn begin_discard_hunk(st: &mut State) {
+    if st.active_worktree.is_empty() || st.busy.contains("edits") {
+        return;
+    }
+    let Some(path) = diff_path(st) else { return };
+    if !is_local_diff(st, &path) {
+        st.status = "Reverting a hunk only applies to the local diff (Enter from [4]).".into();
+        return;
+    }
+    let staged = match stage_state(st, &path) {
+        StageState::Staged => true,
+        StageState::Partial => st.staged_side,
+        StageState::Unstaged => false,
+    };
+    let Some(block) = current_hunk_range(st, &path) else { return };
+    let Some(lines) = crate::navigation::diff_lines(st, &path) else { return };
+    // Built against the *post-image* side, the way unstaging builds it: what we
+    // are undoing the change to is the content that already has it. A patch
+    // built forwards has its context on the pre-image side and would refuse to
+    // apply whenever another block of the same file is still there.
+    let Some(patch) = crate::diff::build_hunk_patch(lines, block, true) else {
+        st.status = "That block can't be reverted by hunk.".into();
+        return;
+    };
+    st.overlay = Overlay::Confirm {
+        prompt: format!("Discard this hunk of {path}?  (y/n)"),
+        kind: ConfirmKind::RevertHunk { path, patch, staged },
+    };
+}
+
 /// Move the cursor between the unstaged (left) and staged (right) columns of a
 /// split local diff, each keeping its own scroll + selected block.
 pub fn switch_stage_side(st: &mut State, staged: bool) {
@@ -1132,6 +1172,14 @@ pub fn confirm_action(st: &mut State, tx: &Sender<Job>) {
             submit(st, tx, Job::DiscardEdit { wt, path, added });
         }
         ConfirmKind::ForcePush => submit_push(st, tx, true),
+        ConfirmKind::RevertHunk { path, patch, staged } => {
+            let wt = st.active_worktree.clone();
+            if wt.is_empty() {
+                return;
+            }
+            st.status = format!("Discarding a hunk of {path}…");
+            submit(st, tx, Job::RevertHunk { wt, patch, staged });
+        }
     }
 }
 
