@@ -336,6 +336,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::PageDown => st.edit_diff_scroll += page,
             KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
             KeyCode::Enter => controller::enter_local_diff(st),
+            KeyCode::Char(' ') => controller::toggle_stage(st, tx),
             KeyCode::Char('c') => controller::begin_commit_edits(st),
             KeyCode::Char('P') => controller::push_edits(st, tx),
             KeyCode::Char('d') => controller::begin_discard_edit(st),
@@ -350,6 +351,9 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
         Focus::Diff => match k.code {
             KeyCode::Down | KeyCode::Char('j') => nav::jump_hunk(st, 1),
             KeyCode::Up | KeyCode::Char('k') => nav::jump_hunk(st, -1),
+            KeyCode::Left | KeyCode::Char('h') => controller::switch_stage_side(st, false),
+            KeyCode::Right | KeyCode::Char('l') => controller::switch_stage_side(st, true),
+            KeyCode::Char(' ') => controller::toggle_stage_hunk(st, tx),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Char('c') => controller::enter_comment_mode(st),
@@ -669,7 +673,7 @@ fn checkout_local(st: &mut State, tx: &mpsc::Sender<Job>) {
 
 
 fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
-    let (rects, _, _) = ui::compute_layout(area, st.focus, st.local_diff_path.is_some());
+    let (rects, _, _) = ui::compute_layout(area, st);
     let (col, row) = (m.column, m.row);
     let hit = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
     let pane = if hit(rects.prs) {

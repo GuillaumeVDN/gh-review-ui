@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::api;
-use crate::models::{Commit, EditEntry, FileEntry, LineInfo, PendingComment, Pr};
+use crate::models::{Commit, FileEntry, LineInfo, PendingComment, Pr};
 
 type Diff = HashMap<String, Vec<String>>;
 type Info = HashMap<String, Vec<LineInfo>>;
@@ -38,6 +38,8 @@ pub enum Job {
     },
     LoadEdits { wt: String },
     DiscardEdit { wt: String, path: String, added: bool },
+    /// Stage/unstage whole `paths`, or a single hunk when `patch` is set.
+    Stage { wt: String, paths: Vec<String>, patch: Option<String>, unstage: bool },
     CommitEdits { wt: String, message: String, paths: Vec<String> },
     PushEdits {
         wt: String,
@@ -70,7 +72,7 @@ pub enum Msg {
     PrDetails { number: i64, data: Value },
     PendingList { pending: Vec<PendingComment>, status: String },
     ReviewSubmitted(String),
-    Edits { files: Vec<EditEntry>, diff: Diff, info: Info },
+    Edits(api::Edits),
     EditsCommitted { status: String },
     /// Generic "job done" notice: clears `kind` from busy and shows `msg`.
     Done { kind: String, msg: String },
@@ -88,7 +90,7 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::LoadPrDetails(_) => "details",
         Job::AddPending { .. } | Job::DiscardPending { .. } | Job::EditPending { .. } => "pending",
         Job::SubmitReview { .. } | Job::PostLocalReview { .. } => "review",
-        Job::LoadEdits { .. } | Job::DiscardEdit { .. } => "edits",
+        Job::LoadEdits { .. } | Job::DiscardEdit { .. } | Job::Stage { .. } => "edits",
         Job::CommitEdits { .. } => "editcommit",
         Job::PushEdits { .. } => "editpush",
         Job::CheckoutLocal { .. } => "checkout",
@@ -182,20 +184,23 @@ fn run(job: &Job) -> anyhow::Result<Msg> {
             api::save_local_comments(owner, name, *number, &[]); // drafts consumed
             Msg::ReviewSubmitted(event.clone())
         }
-        Job::LoadEdits { wt } => {
-            let (files, diff, info) = api::load_edits(wt);
-            Msg::Edits { files, diff, info }
-        }
+        Job::LoadEdits { wt } => Msg::Edits(api::load_edits(wt)),
         Job::DiscardEdit { wt, path, added } => {
             api::discard_edit(wt, path, *added)?;
-            let (files, diff, info) = api::load_edits(wt);
-            Msg::Edits { files, diff, info }
+            Msg::Edits(api::load_edits(wt))
+        }
+        Job::Stage { wt, paths, patch, unstage } => {
+            match patch {
+                Some(p) => api::apply_index_patch(wt, p, *unstage)?,
+                None => api::stage_paths(wt, paths, *unstage)?,
+            }
+            Msg::Edits(api::load_edits(wt))
         }
         Job::CommitEdits { wt, message, paths } => {
             let committed = api::commit_edit_files(wt, message, paths)?;
             Msg::EditsCommitted {
-                status: if committed {
-                    format!("Committed {} file(s)", paths.len())
+                status: if committed > 0 {
+                    format!("Committed {committed} file(s)")
                 } else {
                     "No local changes to commit".into()
                 },

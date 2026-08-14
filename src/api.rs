@@ -324,16 +324,14 @@ pub fn open_pr_worktree(
 
 // ---- pending edits (local worktree changes) ----
 
-/// A unified diff of the worktree against its checked-out commit, including
-/// untracked files (shown as additions) and deletions. The index is left clean.
+/// Run `git diff [rev]` with untracked files made visible (as additions), then
+/// restore the index: `add -N` exposes them without staging content, `reset -q`
+/// drops those intent-to-add marks again.
 ///
-/// `add -N` makes untracked files visible to `git diff` without staging content;
-/// `reset -q` then drops those intent-to-add marks so a later commit stages
-/// exactly the paths we ask for.
-pub fn worktree_diff(wt: &str) -> String {
-    // Intent-to-add only the *untracked* files so they show in `git diff` as
-    // additions. A blanket `add -N .` would also stage tracked deletions, which
-    // then vanish from the unstaged diff (so they'd go undetected).
+/// Intent-to-add only the *untracked* files so they show in `git diff` as
+/// additions. A blanket `add -N .` would also stage tracked deletions, which
+/// then vanish from the unstaged diff (so they'd go undetected).
+fn diff_with_untracked(wt: &str, extra: &[&str]) -> String {
     let untracked = sh(&["git", "-C", wt, "ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
     let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
     if !files.is_empty() {
@@ -343,7 +341,9 @@ pub fn worktree_diff(wt: &str) -> String {
     }
     // Force standard a/ b/ prefixes; a user's diff.mnemonicPrefix / diff.noprefix
     // would otherwise emit i/ w/ (or none), which the parser can't key on.
-    let raw = sh(&["git", "-C", wt, "diff", "--src-prefix=a/", "--dst-prefix=b/"]).unwrap_or_default();
+    let mut args: Vec<&str> = vec!["git", "-C", wt, "diff", "--src-prefix=a/", "--dst-prefix=b/"];
+    args.extend_from_slice(extra);
+    let raw = sh(&args).unwrap_or_default();
     // Clear only the intent-to-add marks we added (scoped, so a user's own staged
     // changes in the main repo aren't disturbed in local mode).
     if !files.is_empty() {
@@ -354,40 +354,128 @@ pub fn worktree_diff(wt: &str) -> String {
     raw
 }
 
-/// The changed files in `wt` (sorted, with kinds), their per-file diff, and the
-/// per-file line info (used to overlay local edits onto the PR diff).
-pub fn load_edits(wt: &str) -> (Vec<crate::models::EditEntry>, Diff, Info) {
-    let raw = worktree_diff(wt);
-    let edits = crate::diff::classify_edits(&raw);
-    let (diff, info) = parse_diff(&raw);
-    (edits, diff, info)
+/// The three views of the local changes in `wt`, each parsed per file.
+pub struct Edits {
+    /// Changed files (sorted, with kinds) — the union of staged and unstaged.
+    pub files: Vec<crate::models::EditEntry>,
+    /// HEAD → worktree: everything changed locally, whichever side of the index.
+    pub combined: (Diff, Info),
+    /// index → worktree.
+    pub unstaged: (Diff, Info),
+    /// HEAD → index.
+    pub staged: (Diff, Info),
 }
 
-/// Revert a single file's local change: delete an untracked new file, else
-/// restore the tracked file (or a deletion) from the checked-out commit.
+/// Load the local changes of `wt` split by index side, plus the combined view
+/// (used to overlay local edits onto the PR diff and to list the changed files).
+pub fn load_edits(wt: &str) -> Edits {
+    // `--cached` first: it must not see the intent-to-add marks that the
+    // worktree diffs add for untracked files (they'd show up as empty new files).
+    let staged_raw = sh(&["git", "-C", wt, "diff", "--cached", "--src-prefix=a/", "--dst-prefix=b/"])
+        .unwrap_or_default();
+    let unstaged_raw = diff_with_untracked(wt, &[]);
+    let combined_raw = diff_with_untracked(wt, &["HEAD"]);
+    // The combined diff normally lists everything, but a change that is staged
+    // *and* reverted in the worktree only shows in the per-side diffs.
+    let mut files = crate::diff::classify_edits(&combined_raw);
+    for raw in [&staged_raw, &unstaged_raw] {
+        for e in crate::diff::classify_edits(raw) {
+            if !files.iter().any(|f| f.path == e.path) {
+                files.push(e);
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Edits {
+        files,
+        combined: parse_diff(&combined_raw),
+        unstaged: parse_diff(&unstaged_raw),
+        staged: parse_diff(&staged_raw),
+    }
+}
+
+/// Stage (`git add`) or unstage (`git reset`) whole paths in `wt`.
+pub fn stage_paths(wt: &str, paths: &[String], unstage: bool) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = if unstage {
+        vec!["git", "-C", wt, "reset", "-q", "--"]
+    } else {
+        vec!["git", "-C", wt, "add", "-A", "--"]
+    };
+    for p in paths {
+        args.push(p.as_str());
+    }
+    sh(&args).map(|_| ())
+}
+
+/// Apply `patch` to the index only (`git apply --cached`), forward to stage a
+/// hunk or reversed to unstage it. `--recount` lets git fix the hunk header
+/// counts of the patch we synthesise.
+pub fn apply_index_patch(wt: &str, patch: &str, reverse: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C", wt, "apply", "--cached", "--recount", "--whitespace=nowarn"]);
+    if reverse {
+        cmd.arg("--reverse");
+    }
+    cmd.arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("git apply: no stdin"))?;
+        stdin.write_all(patch.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("git apply: {}", err.trim().replace('\n', " | ").chars().take(300).collect::<String>()));
+    }
+    Ok(())
+}
+
+/// Revert a single file's local change: delete a new file, else restore the
+/// tracked file (or a deletion) from the checked-out commit.
+///
+/// Restoring from `HEAD` rather than the index so a partly-staged file is
+/// reverted whole — index included.
 pub fn discard_edit(wt: &str, path: &str, added: bool) -> Result<()> {
     if added {
         std::fs::remove_file(std::path::Path::new(wt).join(path)).ok();
         sh(&["git", "-C", wt, "reset", "-q", "--", path]).ok();
         Ok(())
     } else {
-        sh(&["git", "-C", wt, "checkout", "--", path]).map(|_| ())
+        sh(&["git", "-C", wt, "checkout", "HEAD", "--", path]).map(|_| ())
     }
 }
 
-/// Stage exactly `paths` and commit them (no push). Returns `false` (no-op) when
-/// `paths` is empty. Skips hooks — review fixups shouldn't be blocked by them.
-pub fn commit_edit_files(wt: &str, message: &str, paths: &[String]) -> Result<bool> {
-    if paths.is_empty() {
-        return Ok(false);
+/// Commit the pending edits (no push), returning how many files went in.
+///
+/// Anything already staged is taken as the selection (lazygit-style: what you
+/// staged is what you commit); with an empty index, `paths` is staged first so
+/// the plain "commit all my edits" flow is unchanged. Skips hooks — review
+/// fixups shouldn't be blocked by them.
+pub fn commit_edit_files(wt: &str, message: &str, paths: &[String]) -> Result<usize> {
+    let staged_names = || sh(&["git", "-C", wt, "diff", "--cached", "--name-only"]).unwrap_or_default();
+    if staged_names().trim().is_empty() {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
+        for p in paths {
+            add_args.push(p.as_str());
+        }
+        sh(&add_args)?;
     }
-    let mut add_args: Vec<&str> = vec!["git", "-C", wt, "add", "-A", "--"];
-    for p in paths {
-        add_args.push(p.as_str());
+    let n = staged_names().lines().filter(|l| !l.is_empty()).count();
+    if n == 0 {
+        return Ok(0);
     }
-    sh(&add_args)?;
     sh(&["git", "-C", wt, "commit", "--no-verify", "-m", message])?;
-    Ok(true)
+    Ok(n)
 }
 
 /// The remote branch's current tip sha (before a push), if it exists.

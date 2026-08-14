@@ -58,8 +58,8 @@ of the file, and worktrees are reused/refreshed on subsequent opens and on `r`.
 ## Keys
 
 Global:
-- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending → Diff)
-- `0` / `1` / `2` / `3` / `4` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending)
+- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending edits → Pending comments → Diff)
+- `0`…`5` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending edits, `5` Pending comments)
 - `q` — quit
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
@@ -98,7 +98,19 @@ Files pane:
 - `e` — open the selected file in the editor (top of file)
 - `Enter` — open file in the diff pane (folder: collapse / expand)
 
-Pending pane:
+Pending edits pane (local, uncommitted changes in the worktree):
+- `j` / `k` — move (`Alt+j` / `Alt+k` skip folder rows)
+- `Space` — stage / unstage the file (or every file under a folder). The mark on
+  the left is the pane's "viewed" equivalent: `[ ]` unstaged, `[~]` partly
+  staged, `[✔]` fully staged (dimmed).
+- `Enter` — show the file's local diff in the diff pane, with hunk navigation
+- `c` — commit; what is staged is what gets committed. With an empty index the
+  whole list is committed, as before.
+- `P` — push the commits to the PR branch
+- `d` — revert the file (worktree *and* index, back to the PR head)
+- `e` — open the file in the editor
+
+Pending comments pane:
 - `j` / `k` — move
 - `Enter` — open the submit-review modal
 - `e` — edit the highlighted comment (reopens the editor, updates it on GitHub)
@@ -113,6 +125,14 @@ Diff pane:
 - `c` — start the comment line picker (see below)
 - `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
+- on a **local** diff (opened with `Enter` from the pending-edits pane):
+  - `Space` — stage / unstage the selected change block (lazygit-style)
+  - `h` / `l` — move between the two columns of a partly-staged file
+
+A partly-staged file splits the pane in two columns — unstaged on the left,
+staged on the right — and the left panes shrink to make room. The focused column
+(marked `▌`) is what `j`/`k` and `Space` act on: `Space` stages a block from the
+left column and unstages one from the right.
 
 A "hunk" here is a **change block** — a contiguous run of `+`/`-` lines. Context
 (and the extra context rendered around edits) splits blocks, so two edits
@@ -166,10 +186,12 @@ the chosen event.
 
 ### Editor integration (`e`)
 
-`e` opens the file in a running Neovim server (`/tmp/nvim.sock`) at the relevant
-line and focuses the window via `hyprctl`. This is wired for an Omarchy/Hyprland
-+ Neovim setup; adjust `open_in_editor` in `src/editor.rs` for a different
-editor or window manager.
+`e` opens the file at the relevant line in a Neovim dedicated to the checkout
+being reviewed (its own Ghostty window, grouped as a tab beside the TUI, talking
+over `/tmp/nvim-ghr-<id>.sock`). Later opens reuse that Neovim and focus its
+window. Closing the TUI closes the editors it started. This is wired for an
+Omarchy/Hyprland + Neovim setup; adjust `open_in_dedicated_editor` in
+`src/editor.rs` for a different editor or window manager.
 
 ## Notes
 
@@ -178,6 +200,8 @@ editor or window manager.
 - Opening a PR fetches its head and (re)builds its worktree — press `r` to re-fetch and reload after new pushes.
 - Review worktrees live under `~/.cache/gh-review-ui/worktrees/` and are reused across sessions; delete that directory (or `git worktree remove` them) to clean up.
 - File pagination handles PRs with up to a few hundred files.
+- Staging in the pending-edits pane writes to the real git index of the worktree
+  (or of your checkout, when reviewing the locally checked-out PR).
 
 ## Project layout
 

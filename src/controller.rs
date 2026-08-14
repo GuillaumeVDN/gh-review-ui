@@ -6,12 +6,12 @@ use crate::api;
 use crate::diff::compute_hunks;
 use crate::editor;
 use crate::models::{
-    Category, ConfirmKind, FileEntry, Focus, Overlay, PendingComment, Pr, State, TreeRow,
-    SUBMIT_CHOICES,
+    Category, ConfirmKind, FileEntry, Focus, Overlay, PendingComment, Pr, StageState, State,
+    TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
     cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
-    is_local_diff, line_target,
+    hunk_unstages, is_local_diff, is_split, line_target, stage_state,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -55,8 +55,12 @@ fn reset_review_panels(st: &mut State) {
     st.edit_tree.clear();
     st.edit_diff_by_file.clear();
     st.edit_info_by_file.clear();
+    st.unstaged_diff_by_file.clear();
+    st.staged_diff_by_file.clear();
     st.edit_idx = 0;
     st.edit_offset = 0;
+    st.staged_side = false;
+    st.alt_diff_view = (0, 0);
     set_diff(st, Default::default(), Default::default());
     st.focus = Focus::Files;
 }
@@ -283,13 +287,17 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove("review");
             st.status = format!("Review submitted ({event})");
         }
-        Msg::Edits { files, diff, info } => {
+        Msg::Edits(edits) => {
             st.busy.remove("edits");
-            st.edit_hunks_by_file = diff.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+            let api::Edits { files, combined, unstaged, staged } = edits;
+            st.edit_hunks_by_file = combined.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+            st.unstaged_hunks_by_file = unstaged.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+            st.staged_hunks_by_file = staged.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
             st.edit_kind_by_path = files.iter().map(|e| (e.path.clone(), e.kind)).collect();
             st.edit_files = files;
-            st.edit_diff_by_file = diff;
-            st.edit_info_by_file = info;
+            (st.edit_diff_by_file, st.edit_info_by_file) = combined;
+            (st.unstaged_diff_by_file, st.unstaged_info_by_file) = unstaged;
+            (st.staged_diff_by_file, st.staged_info_by_file) = staged;
             st.edit_diff_scroll = 0;
             tree::rebuild_edits(st);
             if st.edit_idx >= st.edit_tree.len() {
@@ -302,6 +310,10 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     if st.focus == Focus::Diff {
                         st.focus = Focus::Edits;
                     }
+                } else if !is_split(st, &p) {
+                    // Staging closed the split: back to the single combined view.
+                    st.staged_side = false;
+                    st.alt_diff_view = (0, 0);
                 }
             }
             // Merge edit-only files (new/deleted/renamed, not in the PR diff) into
@@ -919,6 +931,77 @@ fn merge_edit_files_into_tree(st: &mut State) {
     tree::rebuild(st);
 }
 
+/// Paths of the pending edits under `dir` (its whole subtree).
+fn edit_paths_under_dir(st: &State, dir: &str) -> Vec<String> {
+    let prefix = format!("{dir}/");
+    st.edit_files.iter().filter(|e| e.path.starts_with(&prefix)).map(|e| e.path.clone()).collect()
+}
+
+/// Stage / unstage the selected file (or whole folder) in [4] — the pending
+/// edits' equivalent of marking a PR file viewed.
+pub fn toggle_stage(st: &mut State, tx: &Sender<Job>) {
+    if st.active_worktree.is_empty() || st.busy.contains("edits") {
+        return;
+    }
+    let (paths, label) = match st.edit_tree.get(st.edit_idx).cloned() {
+        Some(TreeRow::File { index, .. }) => match st.edit_files.get(index) {
+            Some(e) => (vec![e.path.clone()], e.path.clone()),
+            None => return,
+        },
+        Some(TreeRow::Dir { path, .. }) => (edit_paths_under_dir(st, &path), format!("{path}/")),
+        None => return,
+    };
+    if paths.is_empty() {
+        return;
+    }
+    // A folder (or a partly-staged file) stages first, and only unstages once
+    // everything under it is staged.
+    let unstage = paths.iter().all(|p| stage_state(st, p) == StageState::Staged);
+    // Optimistic wording: a failure comes back as an Error and overwrites this.
+    st.status = format!("{} {label}", if unstage { "Unstaged" } else { "Staged" });
+    let wt = st.active_worktree.clone();
+    submit(st, tx, Job::Stage { wt, paths, patch: None, unstage });
+}
+
+/// Stage / unstage the selected change block of the local diff shown in [0]
+/// (lazygit-style hunk staging). On a split, the focused column decides the
+/// direction; otherwise the file's own side does.
+pub fn toggle_stage_hunk(st: &mut State, tx: &Sender<Job>) {
+    if st.active_worktree.is_empty() || st.busy.contains("edits") {
+        return;
+    }
+    let Some(path) = diff_path(st) else { return };
+    if !is_local_diff(st, &path) {
+        st.status = "Staging only applies to the local diff (Enter from [4]).".into();
+        return;
+    }
+    let unstage = hunk_unstages(st, &path);
+    let Some(block) = current_hunk_range(st, &path) else { return };
+    let Some(lines) = crate::navigation::diff_lines(st, &path) else { return };
+    let Some(patch) = crate::diff::build_hunk_patch(lines, block, unstage) else {
+        st.status = "That block can't be staged by hunk.".into();
+        return;
+    };
+    st.status = format!("{} a hunk of {path}", if unstage { "Unstaged" } else { "Staged" });
+    let wt = st.active_worktree.clone();
+    submit(st, tx, Job::Stage { wt, paths: vec![path], patch: Some(patch), unstage });
+}
+
+/// Move the cursor between the unstaged (left) and staged (right) columns of a
+/// split local diff, each keeping its own scroll + selected block.
+pub fn switch_stage_side(st: &mut State, staged: bool) {
+    let Some(path) = diff_path(st) else { return };
+    if !is_local_diff(st, &path) || !is_split(st, &path) || st.staged_side == staged {
+        return;
+    }
+    st.staged_side = staged;
+    let cur = (st.diff_scroll, st.diff_hunk_idx);
+    (st.diff_scroll, st.diff_hunk_idx) = st.alt_diff_view;
+    st.alt_diff_view = cur;
+    st.comment_mode = false;
+    st.diff_reveal_pending = true;
+}
+
 /// Show the selected pending-edit file's local diff in [0] with hunk navigation.
 pub fn enter_local_diff(st: &mut State) {
     let Some(TreeRow::File { index, .. }) = st.edit_tree.get(st.edit_idx).cloned() else {
@@ -933,6 +1016,8 @@ pub fn enter_local_diff(st: &mut State) {
     st.focus = Focus::Diff;
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.staged_side = false; // a split opens on the unstaged (left) column
+    st.alt_diff_view = (0, 0);
     st.diff_reveal_pending = true;
 }
 

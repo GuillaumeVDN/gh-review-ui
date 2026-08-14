@@ -9,6 +9,10 @@ use crate::textbuffer::TextArea;
 pub type LineInfo = (Option<i64>, Option<i64>);
 /// A hunk/block range into a file's diff-line list: `[start, end)`.
 pub type Range = (usize, usize);
+/// Per-file diff lines / line info / change blocks.
+pub type DiffMap = HashMap<String, Vec<String>>;
+pub type InfoMap = HashMap<String, Vec<LineInfo>>;
+pub type HunkMap = HashMap<String, Vec<Range>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -75,6 +79,26 @@ impl EditKind {
 pub struct EditEntry {
     pub path: String,
     pub kind: EditKind,
+}
+
+/// How much of a locally-changed file sits in the git index — the [4] pane's
+/// equivalent of the Files pane's "viewed" mark.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StageState {
+    Unstaged,
+    /// Some hunks staged, some not (the [0] pane splits into two columns).
+    Partial,
+    Staged,
+}
+
+impl StageState {
+    pub fn mark(self) -> &'static str {
+        match self {
+            StageState::Unstaged => " ",
+            StageState::Partial => "~",
+            StageState::Staged => "✔",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -212,9 +236,24 @@ pub struct State {
     pub edit_tree: Vec<TreeRow>,
     pub edit_idx: usize,
     pub edit_offset: usize,
-    pub edit_diff_by_file: HashMap<String, Vec<String>>,
-    pub edit_info_by_file: HashMap<String, Vec<LineInfo>>,
-    pub edit_hunks_by_file: HashMap<String, Vec<Range>>,
+    /// Everything changed vs HEAD (staged + unstaged), shown whenever a file
+    /// sits entirely on one side of the index.
+    pub edit_diff_by_file: DiffMap,
+    pub edit_info_by_file: InfoMap,
+    pub edit_hunks_by_file: HunkMap,
+    /// Worktree vs index (`git diff`) — the left column of a split local diff.
+    pub unstaged_diff_by_file: DiffMap,
+    pub unstaged_info_by_file: InfoMap,
+    pub unstaged_hunks_by_file: HunkMap,
+    /// Index vs HEAD (`git diff --cached`) — the right column of a split.
+    pub staged_diff_by_file: DiffMap,
+    pub staged_info_by_file: InfoMap,
+    pub staged_hunks_by_file: HunkMap,
+    /// In a split local diff, whether the staged (right) column has the cursor.
+    pub staged_side: bool,
+    /// `(scroll, hunk_idx)` of the *other* column of a split local diff; swapped
+    /// with the live pair when switching sides.
+    pub alt_diff_view: (usize, usize),
     pub edit_diff_scroll: usize,
     /// When set, the [0] pane shows this file's *local* diff (from [4]) with hunk
     /// navigation instead of the PR review diff.
@@ -231,9 +270,9 @@ pub struct State {
     pub worktree_editors: HashMap<String, bool>,
     pub entered_group: bool,
 
-    pub diff_by_file: HashMap<String, Vec<String>>,
-    pub info_by_file: HashMap<String, Vec<LineInfo>>,
-    pub hunks_by_file: HashMap<String, Vec<Range>>,
+    pub diff_by_file: DiffMap,
+    pub info_by_file: InfoMap,
+    pub hunks_by_file: HunkMap,
     pub diff_scroll: usize,
     pub diff_hunk_idx: usize,
     /// Set when a keyboard action should scroll the selected hunk/comment into

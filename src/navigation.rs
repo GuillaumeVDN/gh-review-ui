@@ -4,23 +4,57 @@
 //! starts on a real changed line. Helpers still tolerate a header at the start
 //! (they skip `(None, None)` rows), so they work either way.
 
-use crate::models::{LineInfo, PendingComment, Range, State, TreeRow};
+use crate::models::{DiffMap, HunkMap, InfoMap, LineInfo, PendingComment, Range, StageState, State, TreeRow};
+
+/// The three per-file maps backing `path`'s currently-shown diff: the PR review
+/// diff, one column of a split local diff, or the combined local diff.
+pub fn source_maps<'a>(st: &'a State, path: &str) -> (&'a DiffMap, &'a InfoMap, &'a HunkMap) {
+    if !is_local_diff(st, path) {
+        (&st.diff_by_file, &st.info_by_file, &st.hunks_by_file)
+    } else if !is_split(st, path) {
+        (&st.edit_diff_by_file, &st.edit_info_by_file, &st.edit_hunks_by_file)
+    } else if st.staged_side {
+        (&st.staged_diff_by_file, &st.staged_info_by_file, &st.staged_hunks_by_file)
+    } else {
+        (&st.unstaged_diff_by_file, &st.unstaged_info_by_file, &st.unstaged_hunks_by_file)
+    }
+}
 
 /// The diff lines backing `path`'s currently-shown diff (local edits or PR).
 pub fn diff_lines<'a>(st: &'a State, path: &str) -> Option<&'a Vec<String>> {
-    if is_local_diff(st, path) {
-        st.edit_diff_by_file.get(path)
-    } else {
-        st.diff_by_file.get(path)
-    }
+    source_maps(st, path).0.get(path)
 }
 
 /// The per-line info backing `path`'s currently-shown diff (local edits or PR).
 pub fn info_lines<'a>(st: &'a State, path: &str) -> Option<&'a Vec<LineInfo>> {
-    if is_local_diff(st, path) {
-        st.edit_info_by_file.get(path)
-    } else {
-        st.info_by_file.get(path)
+    source_maps(st, path).1.get(path)
+}
+
+/// How much of `path`'s local change is staged.
+pub fn stage_state(st: &State, path: &str) -> StageState {
+    match (
+        st.staged_diff_by_file.contains_key(path),
+        st.unstaged_diff_by_file.contains_key(path),
+    ) {
+        (true, true) => StageState::Partial,
+        (true, false) => StageState::Staged,
+        _ => StageState::Unstaged,
+    }
+}
+
+/// Whether `path`'s local diff has content on both sides of the index, so the
+/// [0] pane splits into unstaged (left) / staged (right) columns.
+pub fn is_split(st: &State, path: &str) -> bool {
+    stage_state(st, path) == StageState::Partial
+}
+
+/// Whether Space on a hunk of `path`'s local diff *unstages* it: on the staged
+/// column of a split, or anywhere in an entirely-staged file.
+pub fn hunk_unstages(st: &State, path: &str) -> bool {
+    match stage_state(st, path) {
+        StageState::Staged => true,
+        StageState::Partial => st.staged_side,
+        StageState::Unstaged => false,
     }
 }
 
@@ -66,11 +100,7 @@ pub fn diff_path(st: &State) -> Option<String> {
 }
 
 pub fn current_hunk_range(st: &State, path: &str) -> Option<Range> {
-    let hunks = if is_local_diff(st, path) {
-        st.edit_hunks_by_file.get(path)?
-    } else {
-        st.hunks_by_file.get(path)?
-    };
+    let hunks = source_maps(st, path).2.get(path)?;
     if hunks.is_empty() {
         return None;
     }
@@ -147,8 +177,7 @@ pub fn scroll_diff(st: &mut State, delta: i64) {
 /// Move the hunk selection. Scrolling to keep it visible is a render concern.
 pub fn jump_hunk(st: &mut State, direction: i64) {
     let Some(path) = diff_path(st) else { return };
-    let hunks = if is_local_diff(st, &path) { &st.edit_hunks_by_file } else { &st.hunks_by_file };
-    let len = hunks.get(&path).map_or(0, |h| h.len());
+    let len = source_maps(st, &path).2.get(&path).map_or(0, |h| h.len());
     if len == 0 {
         return;
     }
@@ -159,7 +188,7 @@ pub fn jump_hunk(st: &mut State, direction: i64) {
 
 /// New-file line to open in the editor for the selected hunk.
 pub fn current_hunk_editor_line(st: &State, path: &str) -> i64 {
-    let info_map = if is_local_diff(st, path) { &st.edit_info_by_file } else { &st.info_by_file };
+    let info_map = source_maps(st, path).1;
     if let Some((s, e)) = current_hunk_range(st, path) {
         if let Some(info) = info_map.get(path) {
             for i in s..e {

@@ -189,6 +189,75 @@ pub fn compute_hunks(diff_lines: &[String]) -> Vec<Range> {
     blocks
 }
 
+/// The `@@` section (header row included, `[start, end)`) containing diff row
+/// `idx`, or `None` if `idx` sits before the first hunk header.
+fn section_of(lines: &[String], idx: usize) -> Option<Range> {
+    let start = (0..=idx.min(lines.len().saturating_sub(1))).rev().find(|&i| lines[i].starts_with("@@"))?;
+    let end = ((start + 1)..lines.len()).find(|&i| lines[i].starts_with("@@")).unwrap_or(lines.len());
+    Some((start, end))
+}
+
+/// Build a patch that carries *only* the change block `block` of one file's
+/// diff, ready for `git apply --cached` (`reverse = false`: stage the block) or
+/// `git apply --cached --reverse` (`reverse = true`: unstage it).
+///
+/// The other changes of the same `@@` section have to be neutralised so the
+/// patch still applies to the index: whichever side of them the index already
+/// holds becomes context, the other side is dropped. Staging keeps the *old*
+/// side (the index is the unstaged diff's old side); unstaging keeps the *new*
+/// side (the index is the staged diff's new side).
+pub fn build_hunk_patch(lines: &[String], block: Range, reverse: bool) -> Option<String> {
+    let (hs, he) = section_of(lines, block.0)?;
+    let (old_start, new_start) = parse_hunk_header(&lines[hs])?;
+    let start = if reverse { new_start } else { old_start };
+
+    let mut body: Vec<String> = Vec::new();
+    let (mut old_count, mut new_count) = (0i64, 0i64);
+    let mut kept_last = false;
+    for (i, l) in lines.iter().enumerate().take(he).skip(hs + 1) {
+        if l.is_empty() {
+            continue; // trailing artifact of the split, not a diff row
+        }
+        if l.starts_with('\\') {
+            // "\ No newline at end of file" belongs to the row just above.
+            if kept_last {
+                body.push(l.clone());
+            }
+            continue;
+        }
+        let in_block = block.0 <= i && i < block.1;
+        let (keep, as_context) = match l.chars().next() {
+            Some('+') => (in_block || reverse, !in_block),
+            Some('-') => (in_block || !reverse, !in_block),
+            Some(' ') => (true, true),
+            _ => return None, // binary / malformed — not stageable by hunk
+        };
+        kept_last = keep;
+        if !keep {
+            continue;
+        }
+        let row = if as_context { format!(" {}", &l[1..]) } else { l.clone() };
+        if !row.starts_with('+') {
+            old_count += 1;
+        }
+        if !row.starts_with('-') {
+            new_count += 1;
+        }
+        body.push(row);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let os = if old_count == 0 { start } else { start.max(1) };
+    let ns = if new_count == 0 { start } else { start.max(1) };
+
+    let mut out: Vec<String> = lines[..hs].to_vec(); // diff --git / index / --- / +++
+    out.push(format!("@@ -{os},{old_count} +{ns},{new_count} @@"));
+    out.extend(body);
+    out.push(String::new()); // trailing newline
+    Some(out.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +434,50 @@ mod tests {
         let edits = classify_edits(raw);
         assert_eq!(edits.iter().map(|e| (e.path.as_str(), e.kind)).collect::<Vec<_>>(),
                    vec![("img.png", EditKind::Modified)]);
+    }
+
+    fn two_block_file() -> (Vec<String>, Vec<Range>) {
+        let raw = "diff --git a/f b/f\nindex 111..222 100644\n--- a/f\n+++ b/f\n\
+                   @@ -1,4 +1,4 @@\n-test\n+test2\n context\n-test3\n+test4\n";
+        let (files, _) = parse_diff(raw);
+        let lines = files["f"].clone();
+        let hunks = compute_hunks(&lines);
+        (lines, hunks)
+    }
+
+    #[test]
+    fn hunk_patch_keeps_only_the_block_forward() {
+        let (lines, hunks) = two_block_file();
+        let patch = build_hunk_patch(&lines, hunks[1], false).unwrap();
+        // The other block's `-` side stays as context (it's in the index), its
+        // `+` side is dropped (it isn't).
+        assert!(patch.starts_with("diff --git a/f b/f\nindex 111..222 100644\n--- a/f\n+++ b/f\n"));
+        assert!(patch.ends_with("@@ -1,3 +1,3 @@\n test\n context\n-test3\n+test4\n"));
+    }
+
+    #[test]
+    fn hunk_patch_keeps_only_the_block_reversed() {
+        let (lines, hunks) = two_block_file();
+        // Unstaging matches against the index, i.e. the diff's *new* side.
+        let patch = build_hunk_patch(&lines, hunks[1], true).unwrap();
+        assert!(patch.ends_with("@@ -1,3 +1,3 @@\n test2\n context\n-test3\n+test4\n"));
+    }
+
+    #[test]
+    fn hunk_patch_of_a_new_file_starts_the_new_side_at_one() {
+        let (files, _) = parse_diff(added_file());
+        let lines = files["new.txt"].clone();
+        let hunks = compute_hunks(&lines);
+        let patch = build_hunk_patch(&lines, (hunks[0].0, hunks[0].0 + 1), false).unwrap();
+        assert!(patch.ends_with("@@ -0,0 +1,1 @@\n+hello\n"), "{patch}");
+    }
+
+    #[test]
+    fn hunk_patch_rejects_a_binary_diff() {
+        let raw = "diff --git a/img.png b/img.png\nindex 1..2 100644\n\
+                   Binary files a/img.png and b/img.png differ\n";
+        let (files, _) = parse_diff(raw);
+        assert!(build_hunk_patch(&files["img.png"], (2, 3), false).is_none());
     }
 
     #[test]
