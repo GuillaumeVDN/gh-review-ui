@@ -43,14 +43,21 @@ pub fn socket_path(root: &str) -> PathBuf {
 /// one. A socket left behind by a crashed instance fails to connect and is
 /// removed, so it cannot wedge every later attempt.
 pub fn send_open(root: &str, file: &str) -> bool {
+    send_line(root, &format!("open {file}"))
+}
+
+/// Ask a running instance to quit, so it closes its own child windows.
+pub fn send_quit(root: &str) -> bool {
+    send_line(root, "quit")
+}
+
+fn send_line(root: &str, line: &str) -> bool {
     let path = socket_path(root);
     if !path.exists() {
         return false;
     }
     match UnixStream::connect(&path) {
-        Ok(mut stream) => stream
-            .write_all(format!("open {file}\n").as_bytes())
-            .is_ok(),
+        Ok(mut stream) => stream.write_all(format!("{line}\n").as_bytes()).is_ok(),
         Err(_) => {
             let _ = std::fs::remove_file(&path);
             false
@@ -62,11 +69,21 @@ pub fn send_open(root: &str, file: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Open(String),
+    /// Quit as if the user had pressed `q`.
+    ///
+    /// Killing our window instead would skip the cleanup, leaving the Neovim
+    /// and Claude windows this session opened behind with nobody to close
+    /// them.
+    Quit,
 }
 
-/// Parse one line of the protocol. Deliberately tiny: one verb, one argument.
+/// Parse one line of the protocol. Deliberately tiny: a verb and at most one
+/// argument.
 pub fn parse_request(line: &str) -> Option<Request> {
     let line = line.trim();
+    if line == "quit" {
+        return Some(Request::Quit);
+    }
     let rest = line.strip_prefix("open ")?;
     if rest.is_empty() {
         return None;
@@ -164,8 +181,10 @@ mod tests {
             None,
             "an empty path is not a request"
         );
-        assert_eq!(parse_request("quit"), None);
+        assert_eq!(parse_request("quit"), Some(Request::Quit));
+        assert_eq!(parse_request("  quit \n"), Some(Request::Quit));
         assert_eq!(parse_request(""), None);
+        assert_eq!(parse_request("shutdown"), None);
     }
 
     /// A path with spaces must survive, since the verb is the only delimiter.
@@ -191,6 +210,7 @@ mod tests {
     #[test]
     fn sending_to_nobody_says_so_rather_than_failing() {
         assert!(!send_open("/nonexistent/checkout-xyz", "a.rs"));
+        assert!(!send_quit("/nonexistent/checkout-xyz"));
     }
 
     /// End to end: a listener receives what a client sends.
@@ -205,6 +225,14 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("delivered");
         assert_eq!(got, Request::Open("src/a.rs".into()));
+
+        // Quitting travels the same way, so a card being closed can shut the
+        // review down cleanly rather than killing its window.
+        assert!(send_quit(&root));
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delivered");
+        assert_eq!(got, Request::Quit);
     }
 
     /// A socket left by a crashed instance must not wedge every later start.

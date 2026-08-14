@@ -70,10 +70,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, open_file: Option<String>
         while let Ok(msg) = msg_rx.try_recv() {
             controller::apply_msg(&mut st, msg, &job_tx);
         }
-        while let Ok(crate::ipc::Request::Open(file)) = ipc_rx.try_recv() {
-            st.pending_open_file = Some(crate::ipc::relative_to(&st.repo_root, &file));
-            // The request came from another window, so bring ours forward.
-            editor::focus_self();
+        while let Ok(req) = ipc_rx.try_recv() {
+            match req {
+                crate::ipc::Request::Open(file) => {
+                    st.pending_open_file =
+                        Some(crate::ipc::relative_to(&st.repo_root, &file));
+                    // The request came from another window, so bring ours forward.
+                    editor::focus_self();
+                }
+                // Treated as a clean quit, which is what runs the cleanup that
+                // closes the windows this session opened.
+                crate::ipc::Request::Quit => st.should_quit = true,
+            }
         }
         controller::try_open_pending_file(&mut st, &job_tx);
         if st.focus == Focus::Prs {
