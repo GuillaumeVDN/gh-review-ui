@@ -110,8 +110,8 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<&'static st
         let instruction =
             format!("Read {fp} and address all the review comments described in it.");
         let script = format!(
-            "hyprctl dispatch focuswindow title:^{REVIEW_TITLE}$; sleep 0.2; \
-             wtype {q}; wtype -k Return",
+            "{focus}; sleep 0.2; wtype {q}; wtype -k Return",
+            focus = hypr_focus_sh(&format!("title:^{REVIEW_TITLE}$")),
             q = shell_single_quote(&instruction),
         );
         spawn_bash(&script, "");
@@ -131,7 +131,7 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<&'static st
             .args(["keyword", "windowrulev2", &format!("workspace 4 silent, title:^{REVIEW_TITLE}$")])
             .output();
     } else if !in_group() {
-        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+        hypr_toggle_group();
         st.entered_group = true;
     }
     Command::new("ghostty")
@@ -217,9 +217,7 @@ pub fn close_worktree_editor(sock: &str) {
 /// walking up to whichever ancestor owns one.
 pub fn focus_self() {
     let Some(address) = own_window_address() else { return };
-    let _ = Command::new("hyprctl")
-        .args(["dispatch", "focuswindow", &format!("address:{address}")])
-        .output();
+    hypr_focus(&format!("address:{address}"));
 }
 
 /// The Hyprland address of the window we are running inside, if any.
@@ -259,19 +257,69 @@ fn parse_ppid(stat: &str) -> Option<u32> {
 }
 
 
+/// The shell form of a focus, for the scripts that run one alongside other
+/// commands. Same two shapes as [`hypr_dispatch`], chained so the old one runs
+/// only when the new one is rejected.
+fn hypr_focus_sh(selector: &str) -> String {
+    format!(
+        "hyprctl dispatch 'hl.dsp.focus({{window = \"{selector}\"}})' \
+         || hyprctl dispatch focuswindow '{selector}'"
+    )
+}
+
+/// Run a Hyprland dispatcher, in the shape the running compositor understands.
+///
+/// Hyprland 0.56 routes `hyprctl dispatch` through a Lua evaluator, so the
+/// string form every version took until then (`focuswindow title:^x$`) no
+/// longer parses: it has to be a Lua call, `hl.dsp.focus({window = ...})`.
+/// Nothing announces which shape a machine speaks and hyprctl exits non-zero on
+/// the one it does not, so the new form goes first and the old one is the
+/// fallback. Reading (`clients -j`, `activewindow -j`) is untouched.
+fn hypr_dispatch(lua: &str, legacy: &[&str]) -> bool {
+    let run = |args: &[&str]| {
+        Command::new("hyprctl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if run(&["dispatch", lua]) {
+        return true;
+    }
+    let mut args = vec!["dispatch"];
+    args.extend_from_slice(legacy);
+    run(&args)
+}
+
+fn hypr_focus(selector: &str) {
+    hypr_dispatch(&format!("hl.dsp.focus({{window = \"{selector}\"}})"), &["focuswindow", selector]);
+}
+
+fn hypr_toggle_group() {
+    hypr_dispatch("hl.dsp.group.toggle({})", &["togglegroup"]);
+}
+
+fn hypr_close(selector: &str) {
+    hypr_dispatch(
+        &format!("hl.dsp.window.close({{window = \"{selector}\"}})"),
+        &["closewindow", selector],
+    );
+}
+
 /// Close the Claude window this checkout spawned, if it is still around.
 pub fn close_review_claude() {
     if window_exists(REVIEW_TITLE) {
-        let _ = Command::new("hyprctl")
-            .args(["dispatch", "closewindow", &format!("title:^{REVIEW_TITLE}$")])
-            .output();
+        hypr_close(&format!("title:^{REVIEW_TITLE}$"));
     }
 }
 
 /// Dissolve the current Hyprland group if the active window is grouped.
 pub fn ungroup_active() {
     if in_group() {
-        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+        hypr_toggle_group();
     }
 }
 
@@ -288,8 +336,8 @@ pub fn open_in_dedicated_editor(st: &mut State, root: &str, abs_path: &str, line
         // Already open: jump to the file/line and focus its window.
         let ex_path = abs_path.replace(' ', "\\ ");
         let script = format!(
-            "nvim --server {sock} --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" ; \
-             hyprctl dispatch focuswindow title:{title}"
+            "nvim --server {sock} --remote-send \"<C-\\><C-N>:edit +{line} {ex_path}<CR>\" ; {focus}",
+            focus = hypr_focus_sh(&format!("title:{title}"))
         );
         spawn_bash(&script, root);
         return;
@@ -297,7 +345,7 @@ pub fn open_in_dedicated_editor(st: &mut State, root: &str, abs_path: &str, line
     // First open for this checkout: make sure the TUI window forms a group so the
     // new terminal opens as a tab beside it, then launch Ghostty + Neovim.
     if !in_group() {
-        let _ = Command::new("hyprctl").args(["dispatch", "togglegroup"]).output();
+        hypr_toggle_group();
         st.entered_group = true;
     }
     let _ = Command::new("ghostty")
@@ -423,6 +471,15 @@ mod tests {
 
     /// A process name can contain spaces and parentheses, so the fields cannot
     /// be counted from the left.
+    /// The Lua form runs first and the old string is chained behind it, so a
+    /// machine on either Hyprland gets its focus.
+    #[test]
+    fn the_shell_focus_carries_both_shapes() {
+        let sh = hypr_focus_sh("title:^ghr:x$");
+        assert!(sh.contains(r#"hl.dsp.focus({window = "title:^ghr:x$"})"#), "{sh}");
+        assert!(sh.contains("|| hyprctl dispatch focuswindow 'title:^ghr:x$'"), "{sh}");
+    }
+
     #[test]
     fn the_parent_pid_survives_an_awkward_process_name() {
         assert_eq!(parse_ppid("42 (bash) S 7 42 42 0 -1 4194304"), Some(7));
