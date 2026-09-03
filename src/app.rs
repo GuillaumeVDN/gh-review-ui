@@ -20,7 +20,7 @@ use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
 use crate::{api, controller, editor, ui, worker};
 
-pub fn run(open_file: Option<String>, open_commit: Option<String>, open_edits: bool) -> Result<()> {
+pub fn run(open_file: Option<String>, open_commit: Option<Vec<String>>, open_edits: bool) -> Result<()> {
     let mut terminal = ratatui::init();
     // Best-effort: distinct Shift/Ctrl+Enter, Alt+Backspace on supporting terminals.
     let _ = execute!(
@@ -38,7 +38,7 @@ pub fn run(open_file: Option<String>, open_commit: Option<String>, open_edits: b
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     open_file: Option<String>,
-    open_commit: Option<String>,
+    open_commit: Option<Vec<String>>,
     open_edits: bool,
 ) -> Result<()> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();

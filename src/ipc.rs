@@ -73,8 +73,11 @@ pub fn send_prompt(root: &str, file: &str) -> bool {
 ///
 /// The commit pane already reviews a range of the PR's commits, so showing one
 /// is a matter of telling it which.
-pub fn send_commit(root: &str, sha: &str) -> bool {
-    send_line(root, &format!("commit {sha}"))
+pub fn send_commit(root: &str, shas: &[String]) -> bool {
+    if shas.is_empty() {
+        return false;
+    }
+    send_line(root, &format!("commit {}", shas.join(" ")))
 }
 
 /// Ask a running instance to show `file`.
@@ -126,8 +129,8 @@ fn send_line_to(path: &Path, line: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Open(String),
-    /// Select this commit and review it.
-    Commit(String),
+    /// Select these commits and review them, as one range.
+    Commit(Vec<String>),
     /// Bring our window forward.
     Focus,
     /// Open this checkout's PR and land on the Pending-edits pane.
@@ -154,10 +157,12 @@ pub fn parse_request(line: &str) -> Option<Request> {
         return Some(Request::Edits);
     }
     if let Some(rest) = line.strip_prefix("commit ") {
-        if rest.is_empty() {
+        // One or several: the manager sends the range its pane has selected.
+        let shas: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+        if shas.is_empty() {
             return None;
         }
-        return Some(Request::Commit(rest.to_string()));
+        return Some(Request::Commit(shas));
     }
     let rest = line.strip_prefix("open ")?;
     if rest.is_empty() {
@@ -256,9 +261,11 @@ mod tests {
             None,
             "an empty path is not a request"
         );
+        assert_eq!(parse_request("commit abc1234"), Some(Request::Commit(vec!["abc1234".into()])));
         assert_eq!(
-            parse_request("commit abc1234"),
-            Some(Request::Commit("abc1234".into()))
+            parse_request("commit abc1234 def5678"),
+            Some(Request::Commit(vec!["abc1234".into(), "def5678".into()])),
+            "a range travels whole"
         );
         assert_eq!(parse_request("commit "), None);
         assert_eq!(parse_request("focus"), Some(Request::Focus));

@@ -1039,7 +1039,16 @@ pub fn fold_staged(st: &mut State) {
 /// Rebuild the Files list as the PR files plus edit-only local files (new /
 /// deleted / renamed) so [3] shows them too (item 7).
 fn merge_edit_files_into_tree(st: &mut State) {
-    let mut files = st.pr_files.clone();
+    // `pr_files` holds what GitHub said when the PR loaded, so a file marked
+    // viewed since would come back unviewed every time this rebuilds. What the
+    // session knows lives in `viewed_by_path`, which is what the marks write
+    // to, so it decides.
+    let viewed_now = |f: &FileEntry| *st.viewed_by_path.get(&f.path).unwrap_or(&f.viewed);
+    let mut files: Vec<FileEntry> = st
+        .pr_files
+        .iter()
+        .map(|f| FileEntry { path: f.path.clone(), viewed: viewed_now(f) })
+        .collect();
     for e in &st.edit_files {
         if !st.pr_files.iter().any(|f| f.path == e.path) {
             let viewed = *st.viewed_by_path.get(&e.path).unwrap_or(&false);
@@ -1439,6 +1448,7 @@ pub fn try_open_pending_edits(st: &mut State, tx: &std::sync::mpsc::Sender<Job>)
 /// caller's Enter do nothing at all.
 pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
     let Some(wanted) = st.pending_open_commit.clone() else { return };
+    let named = wanted.join(" ");
     if st.active_pr.is_none() {
         if opening_checked_out_pr(st, tx) {
             return;
@@ -1446,19 +1456,26 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
         // No PR for this branch, so there is no commit list to select in.
         // Saying so beats waiting for one that is never coming.
         st.pending_open_commit = None;
-        st.status = format!("no open PR for this branch, so {wanted} has nothing to open in");
+        st.status = format!("no open PR for this branch, so {named} has nothing to open in");
         return;
     }
     if st.commits.is_empty() {
         return;
     }
-    // The caller has an abbreviated hash; we hold full oids.
-    match st.commits.iter().position(|c| c.oid.starts_with(&wanted)) {
-        Some(i) => {
+    // The caller has abbreviated hashes; we hold full oids.
+    let found: Vec<usize> = wanted
+        .iter()
+        .filter_map(|w| st.commits.iter().position(|c| c.oid.starts_with(w)))
+        .collect();
+    match found.first().copied() {
+        Some(first) => {
             st.pending_open_commit = None;
             st.focus = Focus::Commits;
-            st.commit_idx = i;
-            st.commit_selected = std::iter::once(st.commits[i].oid.clone()).collect();
+            // The cursor lands on the newest of them, which is the top of the
+            // range as the pane lists it.
+            st.commit_idx = found.iter().copied().min().unwrap_or(first);
+            st.commit_selected =
+                found.iter().map(|&i| st.commits[i].oid.clone()).collect();
             apply_commit_selection(st, tx);
         }
         None => {
@@ -1466,9 +1483,12 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
             // Not in the PR's commits — which only lists what is pushed. A
             // commit made locally is still one we can diff, since that diff
             // comes from this checkout rather than from GitHub.
-            st.status = format!("{wanted} is not pushed yet — showing it from the checkout");
+            st.status = format!("{named} is not pushed yet — showing it from the checkout");
             st.focus = Focus::Diff;
-            submit(st, tx, Job::LoadCommitDiff { first: wanted.clone(), last: wanted });
+            // Oldest to newest, the way a range is read.
+            let first = wanted.last().cloned().unwrap_or_default();
+            let last = wanted.first().cloned().unwrap_or_default();
+            submit(st, tx, Job::LoadCommitDiff { first, last });
         }
     }
 }
@@ -1685,12 +1705,16 @@ mod tests {
         other.category = Category::Review;
         let checked_out = pr(7); // the helper's default category
         st.prs = vec![other, checked_out];
-        st.pending_open_commit = Some("abc".into());
+        st.pending_open_commit = Some(vec!["abc".into()]);
 
         try_open_pending_commit(&mut st, &tx);
         assert_eq!(st.active_pr.as_ref().map(|p| p.number), Some(7), "the checked-out one");
         assert!(st.local_mode, "in place: this checkout is already on that branch");
-        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "the request waits for it");
+        assert_eq!(
+            st.pending_open_commit.as_deref(),
+            Some(&["abc".to_string()][..]),
+            "the request waits for it"
+        );
         assert!(rx.try_iter().count() > 0, "and the load was submitted");
     }
 
@@ -1703,7 +1727,7 @@ mod tests {
         let mut other = pr(3);
         other.category = Category::Review; // someone else's, not checked out here
         st.prs = vec![other];
-        st.pending_open_commit = Some("abc".into());
+        st.pending_open_commit = Some(vec!["abc".into()]);
 
         try_open_pending_commit(&mut st, &tx);
         assert!(st.pending_open_commit.is_none());
@@ -1717,11 +1741,28 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut st = State::default();
         st.busy.insert("prs".to_string());
-        st.pending_open_commit = Some("abc".into());
+        st.pending_open_commit = Some(vec!["abc".into()]);
 
         try_open_pending_commit(&mut st, &tx);
-        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"));
+        assert_eq!(st.pending_open_commit.as_deref(), Some(&["abc".to_string()][..]));
         assert!(st.active_pr.is_none());
+    }
+
+    /// A range selected in the manager arrives whole, and reviewing it means
+    /// reviewing all of it: taking only one of them was the bug.
+    #[test]
+    fn a_requested_range_selects_every_commit_in_it() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(1));
+        st.commits = vec![commit("aaaaaaaaaaaa"), commit("bbbbbbbbbbbb"), commit("cccccccccccc")];
+        st.pending_open_commit = Some(vec!["aaaaaaa".into(), "bbbbbbb".into()]);
+
+        try_open_pending_commit(&mut st, &tx);
+        assert_eq!(st.commit_selected.len(), 2, "both of them");
+        assert!(st.commit_selected.contains("aaaaaaaaaaaa"));
+        assert!(st.commit_selected.contains("bbbbbbbbbbbb"));
+        assert_eq!(st.commit_idx, 0, "the cursor sits on the newest of the range");
     }
 
     /// The manager holds abbreviated hashes; we hold full oids.
@@ -1731,7 +1772,7 @@ mod tests {
         let mut st = State::default();
         st.active_pr = Some(pr(1));
         st.commits = vec![commit("aaaaaaaaaaaa"), commit("bbbbbbbbbbbb")];
-        st.pending_open_commit = Some("bbbbbbb".into());
+        st.pending_open_commit = Some(vec!["bbbbbbb".into()]);
 
         try_open_pending_commit(&mut st, &tx);
         assert_eq!(st.commit_idx, 1);
@@ -1748,9 +1789,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut st = State::default();
         st.active_pr = Some(pr(7)); // opening; its commits have not arrived
-        st.pending_open_commit = Some("abc".into());
+        st.pending_open_commit = Some(vec!["abc".into()]);
         try_open_pending_commit(&mut st, &tx);
-        assert_eq!(st.pending_open_commit.as_deref(), Some("abc"), "still waiting");
+        assert_eq!(st.pending_open_commit.as_deref(), Some(&["abc".to_string()][..]), "waiting");
     }
 
     /// The commit list is what GitHub knows, which is what has been pushed. A
@@ -1762,7 +1803,7 @@ mod tests {
         let mut st = State::default();
         st.active_pr = Some(pr(1));
         st.commits = vec![commit("aaaaaaaaaaaa")];
-        st.pending_open_commit = Some("ffffff".into());
+        st.pending_open_commit = Some(vec!["ffffff".into()]);
 
         try_open_pending_commit(&mut st, &tx);
         assert!(st.pending_open_commit.is_none(), "not retried forever");
@@ -1792,6 +1833,36 @@ mod tests {
         assert_eq!(st.files.iter().filter(|f| f.path == "b.rs").count(), 1, "no duplicate");
         // Existing PR files keep their viewed flag.
         assert!(st.files.iter().find(|f| f.path == "a.rs").unwrap().viewed);
+    }
+
+    /// Editing a file rebuilds this list, and a mark made during the session
+    /// lives only in `viewed_by_path`: read from `pr_files` instead, every
+    /// mark disappears the moment a file is touched.
+    #[test]
+    fn a_rebuild_keeps_the_marks_made_since_the_pr_loaded() {
+        let mut st = State::default();
+        st.pr_files = vec![
+            FileEntry { path: "a.rs".into(), viewed: false },
+            FileEntry { path: "b.rs".into(), viewed: true },
+        ];
+        // Marked here, unmarked there, after the PR was loaded.
+        st.viewed_by_path.insert("a.rs".into(), true);
+        st.viewed_by_path.insert("b.rs".into(), false);
+        st.edit_files = vec![EditEntry { path: "a.rs".into(), kind: EditKind::Modified }];
+
+        merge_edit_files_into_tree(&mut st);
+        let viewed = |p: &str| st.files.iter().find(|f| f.path == p).unwrap().viewed;
+        assert!(viewed("a.rs"), "the mark survives the edit");
+        assert!(!viewed("b.rs"), "and so does its removal");
+    }
+
+    /// A file the session has said nothing about keeps what GitHub said.
+    #[test]
+    fn a_rebuild_falls_back_to_what_the_pr_said() {
+        let mut st = State::default();
+        st.pr_files = vec![FileEntry { path: "a.rs".into(), viewed: true }];
+        merge_edit_files_into_tree(&mut st);
+        assert!(st.files[0].viewed);
     }
 
     #[test]

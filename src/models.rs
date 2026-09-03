@@ -309,8 +309,8 @@ pub struct State {
     /// A file another tool asked us to show, held until the edit list has
     /// loaded and we can actually select it.
     pub pending_open_file: Option<String>,
-    /// A commit another tool asked us to review, held until a PR is loaded.
-    pub pending_open_commit: Option<String>,
+    /// The commits another tool asked us to review, held until a PR is loaded.
+    pub pending_open_commit: Option<Vec<String>>,
     /// Someone asked for the Pending-edits pane on this checkout's PR.
     pub pending_open_edits: bool,
     /// Set by an amend: the branch's history was rewritten, so the next push

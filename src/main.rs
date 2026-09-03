@@ -7,7 +7,8 @@ gh-review-ui — review GitHub PRs in the terminal
 
   gh-review-ui                  review the PRs of the repo you are in
   gh-review-ui --file <path>    open a worktree file in the Pending-edits pane
-  gh-review-ui --commit <sha>   review one commit of the open PR
+  gh-review-ui --commit <sha>   review a commit of the open PR (comma-separated
+                                for a range)
   gh-review-ui --edits          open this checkout's PR on its local changes
 
 Both hand the argument to an instance already running on this checkout when
@@ -15,7 +16,8 @@ there is one, so a second window is not opened for it.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut open_file, mut open_commit) = (None, None);
+    let mut open_file: Option<String> = None;
+    let mut open_commit: Option<Vec<String>> = None;
     let mut open_edits = false;
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
@@ -24,7 +26,8 @@ fn main() -> ExitCode {
         }
         Some(flag @ ("--file" | "--commit")) => match args.get(1) {
             Some(v) if flag == "--file" => open_file = Some(v.clone()),
-            Some(v) => open_commit = Some(v.clone()),
+            // Several, so a range selected elsewhere arrives whole.
+            Some(v) => open_commit = Some(v.split(',').map(str::to_string).collect()),
             None => {
                 eprintln!("usage: gh-review-ui {flag} <value>");
                 return ExitCode::FAILURE;
@@ -46,7 +49,7 @@ fn main() -> ExitCode {
             .unwrap_or_default();
         let sent = match (&open_file, &open_commit) {
             (Some(file), _) => ghreview::ipc::send_open(&root, file),
-            (_, Some(sha)) => ghreview::ipc::send_commit(&root, sha),
+            (_, Some(shas)) => ghreview::ipc::send_commit(&root, shas),
             _ => ghreview::ipc::send_edits(&root),
         };
         if sent {
