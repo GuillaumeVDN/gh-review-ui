@@ -76,7 +76,7 @@ pub enum Msg {
     PendingList { pending: Vec<PendingComment>, status: String },
     ReviewSubmitted(String),
     Edits(api::Edits),
-    EditsCommitted { status: String, amended: bool },
+    EditsCommitted { status: String, amended: bool, committed: bool },
     /// One line of a running commit's hook output.
     HookLine(String),
     /// The hooks rejected the commit; nothing was committed.
@@ -229,11 +229,18 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                     (CommitKind::Amend, n) => format!("Amended HEAD with {n} file(s)"),
                     (_, n) => format!("Committed {n} file(s)"),
                 };
-                Msg::EditsCommitted { status, amended: *kind == CommitKind::Amend }
+                Msg::EditsCommitted {
+                    status,
+                    amended: *kind == CommitKind::Amend,
+                    // An amend rewrote what the remote has, so it is not a
+                    // plain push and not something to do unasked.
+                    committed: *kind != CommitKind::Amend,
+                }
             } else {
                 Msg::EditsCommitted {
                     status: "No local changes to commit".into(),
                     amended: false,
+                    committed: false,
                 }
             }
         }

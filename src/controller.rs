@@ -340,7 +340,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
             st.status = status;
         }
-        Msg::EditsCommitted { status, amended } => {
+        Msg::EditsCommitted { status, amended, committed } => {
             st.busy.remove("editcommit");
             // Rewriting HEAD is what makes the next push need a lease-force.
             st.amended |= amended;
@@ -350,6 +350,12 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
             st.status = status;
             reload_edits(st, tx); // now clean
+            // A commit made here is meant for the PR, and a commit sitting
+            // unpushed is one the reviewers cannot see. Plain, never forced:
+            // an amend rewrote the remote's history and asks before it lands.
+            if committed {
+                submit_push(st, tx, false);
+            }
         }
         Msg::Done { kind, msg } => {
             st.busy.remove(&kind);
@@ -1605,6 +1611,73 @@ mod tests {
             2,
             "one per draft"
         );
+    }
+
+    /// A commit made here is for the PR, and one sitting unpushed is one the
+    /// reviewers cannot see.
+    #[test]
+    fn a_commit_is_pushed_as_soon_as_it_lands() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+
+        apply_msg(
+            &mut st,
+            Msg::EditsCommitted {
+                status: "Committed 2 file(s)".into(),
+                amended: false,
+                committed: true,
+            },
+            &tx,
+        );
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(
+            jobs.iter().any(|j| matches!(j, Job::PushEdits { force: false, .. })),
+            "plain, never forced"
+        );
+    }
+
+    /// An amend rewrote what the remote has: that push asks first.
+    #[test]
+    fn an_amend_is_not_pushed_on_its_own() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+
+        apply_msg(
+            &mut st,
+            Msg::EditsCommitted {
+                status: "Amended HEAD with 1 file(s)".into(),
+                amended: true,
+                committed: false,
+            },
+            &tx,
+        );
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(!jobs.iter().any(|j| matches!(j, Job::PushEdits { .. })), "it waits for P");
+        assert!(st.amended, "and P will ask about the lease");
+    }
+
+    /// Nothing committed, nothing to push.
+    #[test]
+    fn a_commit_that_found_nothing_pushes_nothing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+
+        apply_msg(
+            &mut st,
+            Msg::EditsCommitted {
+                status: "No local changes to commit".into(),
+                amended: false,
+                committed: false,
+            },
+            &tx,
+        );
+        assert!(!rx.try_iter().any(|j| matches!(j, Job::PushEdits { .. })));
     }
 
     /// Rewriting history is not something to do to a shared branch on the
