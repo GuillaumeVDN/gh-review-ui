@@ -153,6 +153,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
         }
         Msg::Active { number, pr_id, files, diff, info, pending, commits, stale_viewed } => {
+            let here = cur_file_path(st);
             st.busy.remove("active");
             st.pending = pending;
             if st.pending_idx >= st.pending.len() {
@@ -193,12 +194,15 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.active_pr = Some(pr);
                     // Cleared here rather than downstream, so the marks, the
                     // PR list and the pane all read the same thing.
-                    let mut files = files;
+                    // What GitHub has, which is what it accepts a mark for.
+                    st.pr_paths = files.iter().map(|f| f.path.clone()).collect();
+                    // The old map, so a mark on a file only the checkout has
+                    // survives a refresh — GitHub cannot hold that one for us.
+                    let mut files = files_the_diff_shows(files, &diff, &st.viewed_by_path);
                     let unviewed = clear_stale_marks(&mut files, &stale_viewed);
                     st.viewed_by_path = files.iter().map(|f| (f.path.clone(), f.viewed)).collect();
-                    st.pr_paths = files.iter().map(|f| f.path.clone()).collect();
                     st.pr_files = files.clone();
-                    st.files = with_diff_only_files(files, &diff, &st.viewed_by_path);
+                    st.files = files;
                     st.commit_selected = commits.iter().map(|c| c.oid.clone()).collect();
                     st.commits = commits;
                     st.commit_idx = 0;
@@ -217,9 +221,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     );
                 }
             }
-            st.file_idx = 0;
             st.file_offset = 0;
             tree::rebuild(st);
+            // A reload runs after every commit, and the cursor stays on the
+            // file being worked on rather than jumping to the top of the tree.
+            st.file_idx = here.and_then(|p| file_row(st, &p)).unwrap_or(0);
             reload_edits(st, tx);
         }
         Msg::CommitDiff { diff, info } => {
@@ -363,10 +369,14 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
             st.status = status;
             reload_edits(st, tx); // now clean
-            // A commit made here is meant for the PR, and a commit sitting
-            // unpushed is one the reviewers cannot see. Plain, never forced:
-            // an amend rewrote the remote's history and asks before it lands.
             if committed {
+                // The change is in the branch now, so the commit list and the
+                // range diff have to be read again to hold it.
+                reload_active(st, tx);
+                // A commit made here is meant for the PR, and a commit sitting
+                // unpushed is one the reviewers cannot see. Plain, never
+                // forced: an amend rewrote the remote's history and asks
+                // before it lands.
                 submit_push(st, tx, false);
             }
         }
@@ -377,6 +387,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                 // The remote now has the rewritten history.
                 st.amended = false;
                 reload_edits(st, tx); // committed edits are gone from the worktree
+                // Every commit is pushed now, and GitHub holds the marks the
+                // push re-made, so both lists are read again.
+                reload_active(st, tx);
             }
         }
         Msg::Error { kind, msg } => {
@@ -1112,7 +1125,7 @@ fn merge_edit_files_into_tree(st: &mut State) {
     // The same display rule the PR load applies: a file only an unpushed commit
     // touches is in the diff and nowhere else, and rebuilding from `pr_files`
     // alone would drop it.
-    let mut files = with_diff_only_files(files, &st.diff_by_file, &st.viewed_by_path);
+    let mut files = files_the_diff_shows(files, &st.diff_by_file, &st.viewed_by_path);
     for e in &st.edit_files {
         if !files.iter().any(|f| f.path == e.path) {
             let viewed = *st.viewed_by_path.get(&e.path).unwrap_or(&false);
@@ -1269,6 +1282,27 @@ pub fn reload_edits(st: &mut State, tx: &Sender<Job>) {
     }
     let wt = st.active_worktree.clone();
     submit(st, tx, Job::LoadEdits { wt });
+}
+
+/// Re-read the PR: its commits, its diff and its viewed state.
+///
+/// A commit or a push moves a change out of the Pending-edits pane and into
+/// the branch. Both panes read the same checkout, so the commit list and the
+/// range diff have to be read again, or the change belongs to neither and the
+/// file it touches has nothing left to show.
+pub fn reload_active(st: &mut State, tx: &Sender<Job>) {
+    let Some(pr) = st.active_pr.clone() else { return };
+    if st.busy.contains("active") {
+        return;
+    }
+    let (wt, owner, name, login) = (
+        st.active_worktree.clone(),
+        st.repo_owner.clone(),
+        st.repo_name.clone(),
+        st.viewer.clone(),
+    );
+    let local = st.local_mode;
+    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local });
 }
 
 /// Ask to revert the selected file's local change (confirmation before the
@@ -1589,18 +1623,21 @@ fn clear_stale_marks(
     cleared
 }
 
-/// GitHub's file list plus whatever else the diff touches.
+/// The files the diff pane has something to show for.
 ///
-/// The list comes from the PR, so it covers what has been pushed; the diff
-/// comes from the checkout, so on a branch with local commits it reaches
-/// files the PR has never heard of. Without them the tree would hide changes
-/// the diff pane is holding.
-fn with_diff_only_files(
-    mut files: Vec<FileEntry>,
+/// The diff comes from the checkout and decides the list, because a row the
+/// diff cannot fill opens on nothing. GitHub's list alone answers neither
+/// side of that: it misses the files only a local commit touches, and it
+/// carries the files a rebase dropped, which the branch no longer changes.
+/// GitHub's entries keep their viewed state; the rest read it from `viewed`,
+/// where the session's own marks live.
+fn files_the_diff_shows(
+    files: Vec<FileEntry>,
     diff: &std::collections::HashMap<String, Vec<String>>,
     viewed: &std::collections::HashMap<String, bool>,
 ) -> Vec<FileEntry> {
-    let known: std::collections::HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut kept: Vec<FileEntry> = files.into_iter().filter(|f| diff.contains_key(&f.path)).collect();
+    let known: std::collections::HashSet<&str> = kept.iter().map(|f| f.path.as_str()).collect();
     let mut extra: Vec<&String> = diff.keys().filter(|p| !known.contains(p.as_str())).collect();
     extra.sort();
     // `viewed` decides, not `false`: this runs again on every edits reload, and
@@ -1609,8 +1646,16 @@ fn with_diff_only_files(
         .into_iter()
         .map(|p| FileEntry { path: p.clone(), viewed: *viewed.get(p).unwrap_or(&false) })
         .collect();
-    files.extend(extra);
-    files
+    kept.extend(extra);
+    kept
+}
+
+/// The row in the file tree showing `path`.
+fn file_row(st: &State, path: &str) -> Option<usize> {
+    st.tree.iter().position(|row| match row {
+        TreeRow::File { index, .. } => st.files.get(*index).is_some_and(|f| f.path == path),
+        TreeRow::Dir { .. } => false,
+    })
 }
 
 /// The row in the edit tree showing `path`.
@@ -1679,9 +1724,10 @@ mod tests {
     }
 
     /// A branch with local commits touches files the PR has never seen; the
-    /// diff pane holds them, so the tree has to list them.
+    /// diff pane holds them, so the tree has to list them. A PR file the
+    /// branch does not touch goes the other way.
     #[test]
-    fn files_the_diff_touches_are_listed_even_when_the_pr_has_not_seen_them() {
+    fn the_tree_lists_what_the_diff_touches_and_only_that() {
         let pr_files = vec![
             FileEntry { path: "src/a.rs".into(), viewed: true },
             FileEntry { path: "src/b.rs".into(), viewed: false },
@@ -1696,13 +1742,13 @@ mod tests {
         let mut viewed = std::collections::HashMap::new();
         viewed.insert("src/z.rs".to_string(), true);
 
-        let files = with_diff_only_files(pr_files, &diff, &viewed);
+        let files = files_the_diff_shows(pr_files, &diff, &viewed);
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, ["src/a.rs", "src/b.rs", "src/c.rs", "src/z.rs"]);
+        assert_eq!(paths, ["src/a.rs", "src/c.rs", "src/z.rs"], "src/b.rs has nothing to show");
         assert!(files[0].viewed, "the PR's own entries keep their viewed state");
         assert!(!files.iter().any(|f| f.path == "src/a.rs" && !f.viewed), "and are not doubled");
-        assert!(files[3].viewed, "src/z.rs");
-        assert!(!files[2].viewed, "src/c.rs was never marked");
+        assert!(files[2].viewed, "src/z.rs");
+        assert!(!files[1].viewed, "src/c.rs was never marked");
     }
 
     /// A file ticked off on GitHub that a local commit has changed since: the
@@ -1836,6 +1882,10 @@ mod tests {
         assert!(
             jobs.iter().any(|j| matches!(j, Job::PushEdits { force: false, .. })),
             "plain, never forced"
+        );
+        assert!(
+            jobs.iter().any(|j| matches!(j, Job::LoadActive { wt, .. } if wt == "/tmp/wt")),
+            "the commit list and the range diff hold the change now"
         );
     }
 
@@ -2125,6 +2175,12 @@ mod tests {
         );
     }
 
+    /// A diff that shows every one of `paths`, which is what puts a file in
+    /// the tree.
+    fn diff_of(paths: &[&str]) -> std::collections::HashMap<String, Vec<String>> {
+        paths.iter().map(|p| ((*p).to_string(), vec![])).collect()
+    }
+
     #[test]
     fn merge_adds_edit_only_files_without_dups() {
         let mut st = State::default();
@@ -2132,6 +2188,7 @@ mod tests {
             FileEntry { path: "a.rs".into(), viewed: true },
             FileEntry { path: "b.rs".into(), viewed: false },
         ];
+        st.diff_by_file = diff_of(&["a.rs", "b.rs"]);
         st.edit_files = vec![
             EditEntry { path: "b.rs".into(), kind: EditKind::Modified }, // already a PR file
             EditEntry { path: "new.rs".into(), kind: EditKind::Added },  // edit-only
@@ -2154,6 +2211,7 @@ mod tests {
             FileEntry { path: "a.rs".into(), viewed: false },
             FileEntry { path: "b.rs".into(), viewed: true },
         ];
+        st.diff_by_file = diff_of(&["a.rs", "b.rs"]);
         // Marked here, unmarked there, after the PR was loaded.
         st.viewed_by_path.insert("a.rs".into(), true);
         st.viewed_by_path.insert("b.rs".into(), false);
@@ -2170,8 +2228,25 @@ mod tests {
     fn a_rebuild_falls_back_to_what_the_pr_said() {
         let mut st = State::default();
         st.pr_files = vec![FileEntry { path: "a.rs".into(), viewed: true }];
+        st.diff_by_file = diff_of(&["a.rs"]);
         merge_edit_files_into_tree(&mut st);
         assert!(st.files[0].viewed);
+    }
+
+    /// A rebase drops a file from the branch while the PR still lists it. Its
+    /// row would open on an empty diff, so the tree leaves it out.
+    #[test]
+    fn a_pr_file_the_checkout_no_longer_changes_is_dropped() {
+        let mut st = State::default();
+        st.pr_files = vec![
+            FileEntry { path: "kept.rs".into(), viewed: false },
+            FileEntry { path: "dropped.rs".into(), viewed: true },
+        ];
+        st.diff_by_file = diff_of(&["kept.rs"]);
+        st.edit_files = vec![EditEntry { path: "uncommitted.rs".into(), kind: EditKind::Added }];
+        merge_edit_files_into_tree(&mut st);
+        let paths: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["kept.rs", "uncommitted.rs"], "a pending edit stays, with no diff yet");
     }
 
     #[test]

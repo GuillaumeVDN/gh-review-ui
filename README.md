@@ -8,8 +8,10 @@ Five panes (left column stacked, right side full-height):
 - **Commits** — commits of the active PR. All are selected by default (whole
   PR); unselect and pick a range (or a single commit) to review only those.
 - **Files** — file tree of the currently checked-out PR, with viewed-state.
-  Includes files that only the checkout has, from commits GitHub has not seen.
-  When a commit range is selected, only the files it touches are listed.
+  The diff decides the list: it holds the files only the checkout has, from
+  commits GitHub has not seen, and leaves out the files the PR lists that the
+  branch no longer changes. When a commit range is selected, only the files it
+  touches are listed.
 - **Pending** — review comments queued locally, waiting to be submitted.
 - **Right** — PR description + timeline when the PRs pane is focused,
   selected commit's message when the Commits pane is focused,
@@ -214,6 +216,12 @@ Omarchy/Hyprland + Neovim setup; adjust `open_in_dedicated_editor` in
   changing a thing, and only the added and removed lines are read, so context
   size and blob shas do not count. A mark made in this session stands, since
   it was made looking at the local state.
+- Every `git` call reads the checkout the PR is open in, not the directory the
+  app was started from. Those are two different branches whenever you review a
+  PR from another repo checkout.
+- A commit made from the Pending-edits pane re-reads the PR: it leaves that
+  pane and joins the commit list and the diff in the same pass. The cursor
+  stays on the file it was on.
 - Pending review comments are stored server-side too — close the app and they're still there when you return.
 - Opening a PR fetches its head and (re)builds its worktree — press `r` to re-fetch and reload after new pushes.
 - Review worktrees live under `~/.cache/gh-review-ui/worktrees/` and are reused across sessions; delete that directory (or `git worktree remove` them) to clean up.
