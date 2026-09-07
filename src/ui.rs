@@ -355,7 +355,10 @@ fn render_commits(f: &mut Frame, st: &mut State, area: Rect) {
         let checked = st.commit_selected.contains(&c.oid);
         let selected = i == st.commit_idx && focused;
         let prefix = format!("[{}] {} ", if checked { "x" } else { " " }, c.short());
-        let mut base = if checked { Style::default() } else { theme::dim() };
+        let mut base = if c.pushed { Style::default() } else { theme::unpushed_commit() };
+        if !checked {
+            base = base.add_modifier(Modifier::DIM);
+        }
         if selected {
             base = base.add_modifier(Modifier::BOLD);
         }

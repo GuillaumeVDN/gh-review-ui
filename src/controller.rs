@@ -162,6 +162,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.active_worktree.clear();
                     st.files.clear();
                     st.pr_files.clear();
+                    st.pr_paths.clear();
                     st.viewed_by_path.clear();
                     st.commits.clear();
                     st.commit_selected.clear();
@@ -189,8 +190,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     pr.node_id = pr_id;
                     st.active_pr = Some(pr);
                     st.viewed_by_path = files.iter().map(|f| (f.path.clone(), f.viewed)).collect();
+                    st.pr_paths = files.iter().map(|f| f.path.clone()).collect();
                     st.pr_files = files.clone();
-                    st.files = files;
+                    st.files = with_diff_only_files(files, &diff, &st.viewed_by_path);
                     st.commit_selected = commits.iter().map(|c| c.oid.clone()).collect();
                     st.commits = commits;
                     st.commit_idx = 0;
@@ -929,6 +931,26 @@ pub fn toggle_collapse_edit(st: &mut State, path: &str) {
     tree::rebuild_edits(st);
 }
 
+/// Whether the PR on GitHub has this path.
+///
+/// It rejects a mark on one it does not — `Filepath must be part of pull
+/// request` — and the pane lists plenty of those: a file an unpushed commit
+/// touches, or one that exists only as a pending edit.
+fn pr_has_path(st: &State, path: &str) -> bool {
+    st.pr_paths.contains(path)
+}
+
+/// What to say about marks GitHub was not told about.
+///
+/// They are not lost: the mark is how you keep your place in a review, so it
+/// stands for the session, and pushing re-marks the pushed files for real.
+fn local_mark_note(local_only: usize) -> String {
+    match local_only {
+        0 => String::new(),
+        n => format!(" · {n} not on the PR yet, marked here only"),
+    }
+}
+
 pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
     if st.file_idx >= st.tree.len() || st.active_pr.is_none() || st.busy.contains("viewed") {
         return;
@@ -941,6 +963,14 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
             // Optimistic: reflect it now so a following `z`/navigation sees it.
             st.files[index].viewed = new_v;
             st.viewed_by_path.insert(path.clone(), new_v);
+            if !pr_has_path(st, &path) {
+                st.status = format!(
+                    "{} {path}{}",
+                    if new_v { "Marked" } else { "Unmarked" },
+                    local_mark_note(1)
+                );
+                return;
+            }
             st.viewed_inflight = Some((vec![path.clone()], new_v));
             st.status = format!("{} {path}…", if new_v { "Marking" } else { "Unmarking" });
             submit(st, tx, Job::MarkViewed { pr_id, path, viewed: new_v });
@@ -957,20 +987,32 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
                 .filter(|&&i| st.files[i].viewed != new_v)
                 .map(|&i| st.files[i].path.clone())
                 .collect();
-            if !paths.is_empty() {
-                // Optimistic update for the whole batch.
-                for f in st.files.iter_mut() {
-                    if paths.contains(&f.path) {
-                        f.viewed = new_v;
-                    }
-                }
-                for p in &paths {
-                    st.viewed_by_path.insert(p.clone(), new_v);
-                }
-                st.viewed_inflight = Some((paths.clone(), new_v));
-                st.status = format!("{} {} files in {path}/…", if new_v { "Marking" } else { "Unmarking" }, paths.len());
-                submit(st, tx, Job::MarkViewedBulk { pr_id, paths, viewed: new_v });
+            if paths.is_empty() {
+                return;
             }
+            // Optimistic update for the whole batch.
+            for f in st.files.iter_mut() {
+                if paths.contains(&f.path) {
+                    f.viewed = new_v;
+                }
+            }
+            for p in &paths {
+                st.viewed_by_path.insert(p.clone(), new_v);
+            }
+            // One rejected path fails the batch it is in, so the folder's local
+            // files never reach GitHub at all.
+            let (on_pr, local_only): (Vec<String>, Vec<String>) =
+                paths.into_iter().partition(|p| pr_has_path(st, p));
+            let note = local_mark_note(local_only.len());
+            let verb = if new_v { "Marking" } else { "Unmarking" };
+            if on_pr.is_empty() {
+                let verb = if new_v { "Marked" } else { "Unmarked" };
+                st.status = format!("{verb} {} files in {path}/{note}", local_only.len());
+                return;
+            }
+            st.viewed_inflight = Some((on_pr.clone(), new_v));
+            st.status = format!("{verb} {} files in {path}/…{note}", on_pr.len());
+            submit(st, tx, Job::MarkViewedBulk { pr_id, paths: on_pr, viewed: new_v });
         }
     }
 }
@@ -1042,21 +1084,26 @@ pub fn fold_staged(st: &mut State) {
 
 // ---- pending edits (local worktree changes) ----
 
-/// Rebuild the Files list as the PR files plus edit-only local files (new /
-/// deleted / renamed) so [3] shows them too (item 7).
+/// Rebuild the Files list as the PR files plus everything local that the PR
+/// does not have — files only the diff touches, and edit-only ones (new /
+/// deleted / renamed) — so [3] shows them too (item 7).
 fn merge_edit_files_into_tree(st: &mut State) {
     // `pr_files` holds what GitHub said when the PR loaded, so a file marked
     // viewed since would come back unviewed every time this rebuilds. What the
     // session knows lives in `viewed_by_path`, which is what the marks write
     // to, so it decides.
     let viewed_now = |f: &FileEntry| *st.viewed_by_path.get(&f.path).unwrap_or(&f.viewed);
-    let mut files: Vec<FileEntry> = st
+    let files: Vec<FileEntry> = st
         .pr_files
         .iter()
         .map(|f| FileEntry { path: f.path.clone(), viewed: viewed_now(f) })
         .collect();
+    // The same display rule the PR load applies: a file only an unpushed commit
+    // touches is in the diff and nowhere else, and rebuilding from `pr_files`
+    // alone would drop it.
+    let mut files = with_diff_only_files(files, &st.diff_by_file, &st.viewed_by_path);
     for e in &st.edit_files {
-        if !st.pr_files.iter().any(|f| f.path == e.path) {
+        if !files.iter().any(|f| f.path == e.path) {
             let viewed = *st.viewed_by_path.get(&e.path).unwrap_or(&false);
             files.push(FileEntry { path: e.path.clone(), viewed });
         }
@@ -1499,6 +1546,30 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
     }
 }
 
+/// GitHub's file list plus whatever else the diff touches.
+///
+/// The list comes from the PR, so it covers what has been pushed; the diff
+/// comes from the checkout, so on a branch with local commits it reaches
+/// files the PR has never heard of. Without them the tree would hide changes
+/// the diff pane is holding.
+fn with_diff_only_files(
+    mut files: Vec<FileEntry>,
+    diff: &std::collections::HashMap<String, Vec<String>>,
+    viewed: &std::collections::HashMap<String, bool>,
+) -> Vec<FileEntry> {
+    let known: std::collections::HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut extra: Vec<&String> = diff.keys().filter(|p| !known.contains(p.as_str())).collect();
+    extra.sort();
+    // `viewed` decides, not `false`: this runs again on every edits reload, and
+    // a mark made since would come back undone every time.
+    let extra: Vec<FileEntry> = extra
+        .into_iter()
+        .map(|p| FileEntry { path: p.clone(), viewed: *viewed.get(p).unwrap_or(&false) })
+        .collect();
+    files.extend(extra);
+    files
+}
+
 /// The row in the edit tree showing `path`.
 pub fn find_edit_row(st: &State, path: &str) -> Option<usize> {
     st.edit_tree.iter().position(|row| match row {
@@ -1564,6 +1635,66 @@ mod tests {
         }
     }
 
+    /// A branch with local commits touches files the PR has never seen; the
+    /// diff pane holds them, so the tree has to list them.
+    #[test]
+    fn files_the_diff_touches_are_listed_even_when_the_pr_has_not_seen_them() {
+        let pr_files = vec![
+            FileEntry { path: "src/a.rs".into(), viewed: true },
+            FileEntry { path: "src/b.rs".into(), viewed: false },
+        ];
+        let mut diff = std::collections::HashMap::new();
+        diff.insert("src/a.rs".to_string(), vec![]);
+        diff.insert("src/z.rs".to_string(), vec![]);
+        diff.insert("src/c.rs".to_string(), vec![]);
+
+        // A mark made this session on a file the PR does not have: it must
+        // survive the rebuild, or it comes back undone on every edits reload.
+        let mut viewed = std::collections::HashMap::new();
+        viewed.insert("src/z.rs".to_string(), true);
+
+        let files = with_diff_only_files(pr_files, &diff, &viewed);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs", "src/c.rs", "src/z.rs"]);
+        assert!(files[0].viewed, "the PR's own entries keep their viewed state");
+        assert!(!files.iter().any(|f| f.path == "src/a.rs" && !f.viewed), "and are not doubled");
+        assert!(files[3].viewed, "src/z.rs");
+        assert!(!files[2].viewed, "src/c.rs was never marked");
+    }
+
+    /// GitHub rejects a mark on a path the PR does not have, so those never go
+    /// to the API — the mark stands here and the push carries it over.
+    #[test]
+    fn marking_a_file_the_pr_does_not_have_stays_out_of_githubs_way() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pr_paths = ["on_pr.rs".to_string()].into_iter().collect();
+        st.files = vec![
+            FileEntry { path: "on_pr.rs".into(), viewed: false },
+            FileEntry { path: "local.rs".into(), viewed: false },
+        ];
+        st.tree = vec![
+            TreeRow::File { index: 0, depth: 0, name: "on_pr.rs".into() },
+            TreeRow::File { index: 1, depth: 0, name: "local.rs".into() },
+        ];
+
+        st.file_idx = 1;
+        mark_viewed(&mut st, &tx);
+        assert!(st.files[1].viewed, "the mark still lands");
+        assert_eq!(st.viewed_by_path.get("local.rs"), Some(&true));
+        assert!(rx.try_iter().next().is_none(), "and nothing was sent to GitHub");
+        assert!(st.viewed_inflight.is_none(), "so there is nothing to revert");
+
+        st.file_idx = 0;
+        mark_viewed(&mut st, &tx);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(
+            jobs.iter().any(|j| matches!(j, Job::MarkViewed { path, .. } if path == "on_pr.rs")),
+            "a file the PR has goes to the API as before"
+        );
+    }
+
     fn commit(oid: &str) -> crate::models::Commit {
         crate::models::Commit {
             oid: oid.into(),
@@ -1571,6 +1702,7 @@ mod tests {
             body: String::new(),
             author: "a".into(),
             date: String::new(),
+            pushed: true,
         }
     }
 

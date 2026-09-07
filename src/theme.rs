@@ -82,6 +82,12 @@ pub fn local_marker() -> Style {
     Style::default().fg(LOCAL).add_modifier(Modifier::BOLD)
 }
 
+/// A commit that is on no remote, in the same orange as the uncommitted edits:
+/// both are local work, still yours to rewrite, and neither is on the PR.
+pub fn unpushed_commit() -> Style {
+    Style::default().fg(LOCAL)
+}
+
 /// Row style for a pending-edit entry, by change kind.
 pub fn edit_kind_style(kind: crate::models::EditKind) -> Style {
     use crate::models::EditKind;

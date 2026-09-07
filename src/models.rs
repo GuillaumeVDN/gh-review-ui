@@ -41,6 +41,9 @@ pub struct Commit {
     pub body: String,
     pub author: String,
     pub date: String,
+    /// Whether the commit is on a remote. A local one is still rewritable, and
+    /// is invisible to anyone reading the PR on GitHub.
+    pub pushed: bool,
 }
 
 impl Commit {
@@ -259,6 +262,10 @@ pub struct State {
     /// The PR's own changed files (from GitHub); `files` is this plus any
     /// edit-only local files merged in for display.
     pub pr_files: Vec<FileEntry>,
+    /// The paths the PR has on GitHub, as reported when it loaded. Kept apart
+    /// from `pr_files`, which the panes narrow and widen for display: only
+    /// these can be marked viewed there, and that answer must not move.
+    pub pr_paths: HashSet<String>,
     pub viewed_by_path: HashMap<String, bool>,
     /// In-flight optimistic viewed change: (paths, target value), so a failed
     /// mark can be reverted.

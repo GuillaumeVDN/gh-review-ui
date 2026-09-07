@@ -1,7 +1,7 @@
 //! GitHub domain API — PRs, files, diffs, viewed-state, reviews, worktrees.
 //! Built on [`crate::gh`]; blocking, meant to run on the worker thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -190,10 +190,86 @@ pub fn load_diff_range(first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> 
     Ok(parse_diff(&raw))
 }
 
+/// The commits under review, newest first.
+///
+/// GitHub knows only what has been pushed, so on a branch carrying local
+/// commits — or one rewritten since its last push — its list describes a head
+/// that is not the one in this checkout. When the PR's head branch is the
+/// branch checked out here, `git log` is the honest source, and the same range
+/// ddm counts, so the two tools agree on what the branch contains. `gh` stays
+/// the answer for a PR we are only looking at.
 pub fn load_commits(number: i64) -> Result<Vec<Commit>> {
-    let d = gh_json(&["pr", "view", &number.to_string(), "--json", "commits"])?;
+    let d = gh_json(&[
+        "pr", "view", &number.to_string(), "--json", "commits,headRefName,baseRefName",
+    ])?;
+    let head = d["headRefName"].as_str().unwrap_or("");
+    let base = d["baseRefName"].as_str().unwrap_or("");
+    if !head.is_empty() && !base.is_empty() && current_branch().as_deref() == Some(head) {
+        // An empty list is an answer here (a branch with nothing on it yet);
+        // only a git that could not tell us falls back to GitHub's view.
+        if let Ok(commits) = local_commits(base) {
+            return Ok(commits);
+        }
+    }
+    Ok(commits_from_gh(&d["commits"]))
+}
+
+/// The branch checked out in the cwd, which is the checkout every `git` call
+/// here reads — none for a detached head.
+fn current_branch() -> Option<String> {
+    let b = sh(&["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let b = b.trim();
+    (!b.is_empty() && b != "HEAD").then(|| b.to_string())
+}
+
+/// NUL between fields and RS between commits: a headline can contain anything,
+/// and a body brings newlines of its own.
+const LOG_FORMAT: &str = "--format=%H%x00%s%x00%b%x00%an%x00%aI%x1e";
+
+/// The checked-out branch's commits since it left `base`, newest first.
+fn local_commits(base: &str) -> Result<Vec<Commit>> {
+    let fork = sh(&["git", "merge-base", &format!("origin/{base}"), "HEAD"])?;
+    let fork = fork.trim();
+    if fork.is_empty() {
+        return Err(anyhow!("no merge base with origin/{base}"));
+    }
+    let raw = sh(&["git", "log", LOG_FORMAT, &format!("{fork}..HEAD")])?;
+    // Which of them nobody else can see yet. Failing to work this out is not
+    // worth giving up the list for — it only costs the marker.
+    let unpushed: HashSet<String> = sh(&["git", "rev-list", "HEAD", "--not", "--remotes"])
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    Ok(parse_commit_log(&raw, &unpushed))
+}
+
+/// Parse the [`LOG_FORMAT`] stream, marking every commit in `unpushed`.
+fn parse_commit_log(raw: &str, unpushed: &HashSet<String>) -> Vec<Commit> {
+    raw.split('\x1e')
+        // The newline git puts between records; an oid has none of its own.
+        .map(str::trim_start)
+        .filter(|r| !r.is_empty())
+        .map(|record| {
+            let mut f = record.split('\0');
+            let oid = f.next().unwrap_or("").to_string();
+            Commit {
+                pushed: !unpushed.contains(&oid),
+                oid,
+                headline: f.next().unwrap_or("").to_string(),
+                body: f.next().unwrap_or("").trim_end().to_string(),
+                author: f.next().unwrap_or("").to_string(),
+                date: f.next().unwrap_or("").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The `commits` field of `gh pr view`, which is what the PR has on GitHub and
+/// therefore pushed by definition.
+fn commits_from_gh(commits: &Value) -> Vec<Commit> {
     let mut out = Vec::new();
-    if let Some(arr) = d["commits"].as_array() {
+    if let Some(arr) = commits.as_array() {
         for c in arr {
             let author = c["authors"]
                 .as_array()
@@ -212,11 +288,12 @@ pub fn load_commits(number: i64) -> Result<Vec<Commit>> {
                 body: c["messageBody"].as_str().unwrap_or("").to_string(),
                 author,
                 date: c["authoredDate"].as_str().unwrap_or("").to_string(),
+                pushed: true,
             });
         }
     }
     out.reverse(); // gh returns oldest first; show newest at the top
-    Ok(out)
+    out
 }
 
 pub fn load_pr_details(number: i64) -> Result<Value> {
@@ -901,6 +978,66 @@ pub fn load_last_pr(owner: &str, name: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::models::PendingComment;
+
+    fn log(records: &[&str]) -> String {
+        // git ends every record with the separator and puts a newline between
+        // them, so the stream has a trailing one too.
+        records.iter().map(|r| format!("{r}\x1e\n")).collect()
+    }
+
+    /// A commit body has newlines and a headline can hold anything, so the
+    /// fields are read by separator, never by line.
+    #[test]
+    fn a_commit_log_survives_bodies_and_headlines_with_newlines() {
+        let raw = log(&[
+            "aaa111\0feat: a || b\0why\n\nand more\0Ada\x002026-09-07T10:00:00+02:00",
+            "bbb222\0fix: c\0\0Bo\x002026-09-06T10:00:00+02:00",
+        ]);
+        let commits = parse_commit_log(&raw, &HashSet::new());
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].oid, "aaa111");
+        assert_eq!(commits[0].headline, "feat: a || b");
+        assert_eq!(commits[0].body, "why\n\nand more");
+        assert_eq!(commits[0].author, "Ada");
+        assert_eq!(commits[0].date, "2026-09-07T10:00:00+02:00");
+        assert_eq!(commits[1].oid, "bbb222");
+        assert_eq!(commits[1].body, "", "an empty body is empty, not the next field");
+    }
+
+    /// The whole point of reading the log: what is not on a remote is still
+    /// local work, and the pane says so.
+    #[test]
+    fn the_commits_no_remote_has_are_marked_unpushed() {
+        let raw = log(&["aaa111\0new\0\0Ada\0d", "bbb222\0old\0\0Ada\0d"]);
+        let unpushed: HashSet<String> = ["aaa111".to_string()].into_iter().collect();
+        let commits = parse_commit_log(&raw, &unpushed);
+        assert!(!commits[0].pushed);
+        assert!(commits[1].pushed);
+    }
+
+    #[test]
+    fn an_empty_log_is_no_commits_rather_than_one_blank_one() {
+        assert!(parse_commit_log("", &HashSet::new()).is_empty());
+        assert!(parse_commit_log("\n", &HashSet::new()).is_empty());
+    }
+
+    /// GitHub only ever hands us commits it has, so they are pushed by
+    /// definition — and it lists them oldest first, where the pane wants the
+    /// newest at the top.
+    #[test]
+    fn githubs_commits_are_pushed_and_come_back_newest_first() {
+        let v = serde_json::json!([
+            {"oid": "old", "messageHeadline": "first", "messageBody": "", "authoredDate": "d",
+             "authors": [{"login": "ada"}]},
+            {"oid": "new", "messageHeadline": "second", "messageBody": "", "authoredDate": "d",
+             "authors": [{"name": "Bo"}]},
+        ]);
+        let commits = commits_from_gh(&v);
+        assert_eq!(commits[0].oid, "new");
+        assert_eq!(commits[1].author, "ada");
+        assert_eq!(commits[0].author, "Bo", "a name stands in for a missing login");
+        assert!(commits.iter().all(|c| c.pushed));
+    }
 
     #[test]
     fn local_comment_json_round_trip() {
