@@ -150,7 +150,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                 a.head = h;
             }
         }
-        Msg::Active { number, pr_id, files, diff, info, pending, commits } => {
+        Msg::Active { number, pr_id, files, diff, info, pending, commits, stale_viewed } => {
             st.busy.remove("active");
             st.pending = pending;
             if st.pending_idx >= st.pending.len() {
@@ -189,6 +189,10 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     });
                     pr.node_id = pr_id;
                     st.active_pr = Some(pr);
+                    // Cleared here rather than downstream, so the marks, the
+                    // PR list and the pane all read the same thing.
+                    let mut files = files;
+                    let unviewed = clear_stale_marks(&mut files, &stale_viewed);
                     st.viewed_by_path = files.iter().map(|f| (f.path.clone(), f.viewed)).collect();
                     st.pr_paths = files.iter().map(|f| f.path.clone()).collect();
                     st.pr_files = files.clone();
@@ -199,11 +203,15 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.commit_offset = 0;
                     set_diff(st, diff, info);
                     st.status = format!(
-                        "#{n} · {} file{} · {} commit{}",
+                        "#{n} · {} file{} · {} commit{}{}",
                         st.files.len(),
                         if st.files.len() == 1 { "" } else { "s" },
                         st.commits.len(),
                         if st.commits.len() == 1 { "" } else { "s" },
+                        match unviewed {
+                            0 => String::new(),
+                            n => format!(" · {n} unviewed again, changed since you pushed"),
+                        },
                     );
                 }
             }
@@ -1546,6 +1554,30 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
     }
 }
 
+/// Drop the viewed mark from every file a local commit has changed since.
+///
+/// GitHub's answer describes the file as the PR has it. A commit it does not
+/// have makes that mark stand for something no longer there, and a file you
+/// have already ticked off is a file you will not look at again — which is the
+/// whole point of the mark, and exactly why a stale one is worse than none.
+///
+/// Returns how many were cleared, so the load can say so.
+///
+/// Only the marks GitHub gave us are touched. One made in this session was
+/// made *looking at* the local state, so it stands: clearing those would undo
+/// a mark the moment an agent touched the file again.
+fn clear_stale_marks(
+    files: &mut [FileEntry],
+    stale: &std::collections::HashSet<String>,
+) -> usize {
+    let mut cleared = 0;
+    for f in files.iter_mut().filter(|f| f.viewed && stale.contains(&f.path)) {
+        f.viewed = false;
+        cleared += 1;
+    }
+    cleared
+}
+
 /// GitHub's file list plus whatever else the diff touches.
 ///
 /// The list comes from the PR, so it covers what has been pushed; the diff
@@ -1660,6 +1692,25 @@ mod tests {
         assert!(!files.iter().any(|f| f.path == "src/a.rs" && !f.viewed), "and are not doubled");
         assert!(files[3].viewed, "src/z.rs");
         assert!(!files[2].viewed, "src/c.rs was never marked");
+    }
+
+    /// A file ticked off on GitHub that a local commit has changed since: the
+    /// mark stands for a version that is no longer there, and leaving it means
+    /// never looking at the change.
+    #[test]
+    fn a_mark_github_gave_us_goes_when_a_local_commit_changes_the_file() {
+        let mut files = vec![
+            FileEntry { path: "touched.rs".into(), viewed: true },
+            FileEntry { path: "untouched.rs".into(), viewed: true },
+            FileEntry { path: "never_viewed.rs".into(), viewed: false },
+        ];
+        let stale: std::collections::HashSet<String> =
+            ["touched.rs".to_string(), "never_viewed.rs".to_string()].into_iter().collect();
+
+        assert_eq!(clear_stale_marks(&mut files, &stale), 1, "only a mark it had counts");
+        assert!(!files[0].viewed);
+        assert!(files[1].viewed, "nothing local touched it");
+        assert!(!files[2].viewed);
     }
 
     /// GitHub rejects a mark on a path the PR does not have, so those never go

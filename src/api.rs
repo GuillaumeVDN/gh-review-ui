@@ -214,6 +214,20 @@ pub fn load_commits(number: i64) -> Result<Vec<Commit>> {
     Ok(commits_from_gh(&d["commits"]))
 }
 
+/// The files that commits no remote has touch.
+///
+/// A file GitHub reports as viewed was viewed as the PR has it; a local commit
+/// changing it since makes that mark describe something that is no longer
+/// there, so the review has to see it again.
+///
+/// Merges contribute nothing: `git log --name-only` lists no files for one, and
+/// a merge brings no changes of its own to review here.
+pub fn unpushed_paths() -> HashSet<String> {
+    sh(&["git", "log", "--name-only", "--format=", "HEAD", "--not", "--remotes"])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
 /// The branch checked out in the cwd, which is the checkout every `git` call
 /// here reads — none for a detached head.
 fn current_branch() -> Option<String> {

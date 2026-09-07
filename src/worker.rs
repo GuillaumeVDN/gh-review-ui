@@ -3,7 +3,7 @@
 //! The UI sends [`Job`]s and receives [`Msg`]s over channels;
 //! [`crate::controller`] owns the meaning of both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
 use serde_json::Value;
@@ -67,6 +67,9 @@ pub enum Msg {
         info: Info,
         pending: Vec<PendingComment>,
         commits: Vec<Commit>,
+        /// Paths GitHub's viewed state can no longer speak for, because a
+        /// commit it does not have changes them.
+        stale_viewed: std::collections::HashSet<String>,
     },
     CommitDiff { diff: Diff, info: Info },
     PrOpened { number: i64, path: String },
@@ -118,10 +121,18 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 info: HashMap::new(),
                 pending: vec![],
                 commits: vec![],
+                stale_viewed: HashSet::new(),
             },
             Some(n) => {
                 let (pr_id, files) = api::load_files(owner, name, *n)?;
                 let commits = api::load_commits(*n).unwrap_or_default();
+                // Only the local list holds commits no remote has, so this is
+                // also how we know GitHub's file list is the stale one.
+                let stale_viewed = if commits.iter().any(|c| !c.pushed) {
+                    api::unpushed_paths()
+                } else {
+                    HashSet::new()
+                };
                 let (diff, info) = if let (Some(oldest), Some(newest)) = (commits.last(), commits.first()) {
                     api::load_diff_range(&oldest.oid, &newest.oid)?
                 } else {
@@ -135,7 +146,16 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 } else {
                     api::load_pending_comments(owner, name, *n, login).unwrap_or_default()
                 };
-                Msg::Active { number: Some(*n), pr_id, files, diff, info, pending, commits }
+                Msg::Active {
+                    number: Some(*n),
+                    pr_id,
+                    files,
+                    diff,
+                    info,
+                    pending,
+                    commits,
+                    stale_viewed,
+                }
             }
         },
         Job::LoadCommitDiff { first, last } => {
