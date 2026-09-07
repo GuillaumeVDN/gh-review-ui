@@ -15,10 +15,10 @@ pub fn parse_hunk_header(line: &str) -> Option<(i64, i64)> {
     Some((old.parse().ok()?, new.parse().ok()?))
 }
 
-fn is_add(line: &str) -> bool {
+pub fn is_add(line: &str) -> bool {
     line.starts_with('+') && !line.starts_with("+++")
 }
-fn is_del(line: &str) -> bool {
+pub fn is_del(line: &str) -> bool {
     line.starts_with('-') && !line.starts_with("---")
 }
 

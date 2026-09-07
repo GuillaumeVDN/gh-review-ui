@@ -103,7 +103,9 @@ Files pane:
 - `e` — open the selected file in the editor (top of file)
 - `Enter` — open file in the diff pane (folder: collapse / expand)
 
-Pending edits pane (local, uncommitted changes in the worktree):
+Pending edits pane (local, uncommitted changes in the worktree). `--edits`
+lands here when there is something uncommitted, and on the Files pane when the
+tree is clean:
 - `j` / `k` — move (`Alt+j` / `Alt+k` skip folder rows)
 - `Space` — stage / unstage the file (or every file under a folder). The mark on
   the left is the pane's "viewed" equivalent: `[ ]` unstaged, `[~]` partly
@@ -205,10 +207,13 @@ Omarchy/Hyprland + Neovim setup; adjust `open_in_dedicated_editor` in
   touches — is marked here only: GitHub refuses a path that is not on the PR
   (`Filepath must be part of pull request`). Pushing re-marks the pushed files
   for real, so the mark carries over.
-- A mark GitHub gave us is dropped for any file a local commit has changed
-  since: it stood for the version the PR has, and a file already ticked off is
-  one you will not look at again. A mark made in this session stands, since it
-  was made looking at the local state.
+- A mark GitHub gave us is dropped for any file whose local change is not the
+  one the PR has: it stood for the version the PR has, and a file already
+  ticked off is one you will not look at again. The two diffs are compared
+  line by line, not the commit lists — a rebase rewrites every commit without
+  changing a thing, and only the added and removed lines are read, so context
+  size and blob shas do not count. A mark made in this session stands, since
+  it was made looking at the local state.
 - Pending review comments are stored server-side too — close the app and they're still there when you return.
 - Opening a PR fetches its head and (re)builds its worktree — press `r` to re-fetch and reload after new pushes.
 - Review worktrees live under `~/.cache/gh-review-ui/worktrees/` and are reused across sessions; delete that directory (or `git worktree remove` them) to clean up.

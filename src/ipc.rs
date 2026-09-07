@@ -89,7 +89,8 @@ pub fn send_open(root: &str, file: &str) -> bool {
     send_line(root, &format!("open {file}"))
 }
 
-/// Ask a running instance to show this checkout's local changes.
+/// Ask a running instance to show this checkout's local state: the pending
+/// edits when there are any, its files when the tree is clean.
 pub fn send_edits(root: &str) -> bool {
     send_line(root, "edits")
 }

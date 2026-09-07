@@ -210,7 +210,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                         if st.commits.len() == 1 { "" } else { "s" },
                         match unviewed {
                             0 => String::new(),
-                            n => format!(" · {n} unviewed again, changed since you pushed"),
+                            n => format!(" · {n} unviewed again, not what the PR has"),
                         },
                     );
                 }
@@ -1481,10 +1481,13 @@ pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) 
     }
 }
 
-/// Land on the Pending-edits pane, opening this checkout's PR on the way.
+/// Land where this checkout's work is, opening its PR on the way.
 ///
 /// Asked for by a tool that has a card open on this worktree: what it wants
-/// shown is the local changes, and the PR is the context they belong to.
+/// shown is the local state, and the PR is the context it belongs to. Which
+/// pane that is depends on the tree — the Pending-edits one when something is
+/// uncommitted, the Files one when it is clean, since an empty edits pane says
+/// nothing and costs a keypress to leave.
 pub fn try_open_pending_edits(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) {
     if !st.pending_open_edits {
         return;
@@ -1495,11 +1498,14 @@ pub fn try_open_pending_edits(st: &mut State, tx: &std::sync::mpsc::Sender<Job>)
     // Opening a PR resets the panels and takes the focus with it, so the move
     // waits for that to finish. A branch with no PR at all still gets the pane:
     // the edits come from the checkout, not from GitHub.
-    if st.busy.contains("active") || st.busy.contains("worktree") {
+    //
+    // The edits load waits too — deciding on a list still being read would
+    // land on Files every time, since it starts empty.
+    if st.busy.contains("active") || st.busy.contains("worktree") || st.busy.contains("edits") {
         return;
     }
     st.pending_open_edits = false;
-    st.focus = Focus::Edits;
+    st.focus = if st.edit_files.is_empty() { Focus::Files } else { Focus::Edits };
 }
 
 /// Select the commit another tool asked for, once the PR holding it is loaded.
@@ -1554,12 +1560,13 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
     }
 }
 
-/// Drop the viewed mark from every file a local commit has changed since.
+/// Drop the viewed mark from every file whose change is not the PR's.
 ///
-/// GitHub's answer describes the file as the PR has it. A commit it does not
-/// have makes that mark stand for something no longer there, and a file you
-/// have already ticked off is a file you will not look at again — which is the
-/// whole point of the mark, and exactly why a stale one is worse than none.
+/// GitHub's answer describes the file as the PR has it. Where the checkout
+/// shows a different change, that mark stands for something not on the screen,
+/// and a file you have already ticked off is a file you will not look at again
+/// — which is the whole point of the mark, and exactly why a stale one is
+/// worse than none.
 ///
 /// Returns how many were cleared, so the load can say so.
 ///
@@ -1746,6 +1753,13 @@ mod tests {
         );
     }
 
+    fn edit(path: &str) -> crate::models::EditEntry {
+        crate::models::EditEntry {
+            path: path.into(),
+            kind: crate::models::EditKind::Modified,
+        }
+    }
+
     fn commit(oid: &str) -> crate::models::Commit {
         crate::models::Commit {
             oid: oid.into(),
@@ -1927,11 +1941,45 @@ mod tests {
         assert_ne!(st.focus, Focus::Edits, "opening a PR takes the focus itself");
         assert!(rx.try_iter().count() > 0);
 
-        // Once it has loaded, the focus moves.
+        // Once it has loaded, the focus moves. Opening the PR cleared the
+        // panels, so the edits arrive again the way the reload brings them.
         st.busy.remove("active");
+        st.edit_files = vec![edit("a.rs")];
         try_open_pending_edits(&mut st, &tx);
         assert_eq!(st.focus, Focus::Edits);
         assert!(!st.pending_open_edits);
+    }
+
+    /// A clean tree has no edits to show, and an empty pane is a keypress to
+    /// leave: the files are what there is to look at.
+    #[test]
+    fn asking_for_the_edits_lands_on_the_files_when_there_are_none() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pending_open_edits = true;
+
+        try_open_pending_edits(&mut st, &tx);
+        assert_eq!(st.focus, Focus::Files);
+        assert!(!st.pending_open_edits);
+    }
+
+    /// Deciding on a list still being read would land on Files every time.
+    #[test]
+    fn the_landing_pane_waits_for_the_edits_to_load() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pending_open_edits = true;
+        st.busy.insert("edits".into());
+
+        try_open_pending_edits(&mut st, &tx);
+        assert!(st.pending_open_edits, "still waiting");
+
+        st.busy.remove("edits");
+        st.edit_files = vec![edit("a.rs")];
+        try_open_pending_edits(&mut st, &tx);
+        assert_eq!(st.focus, Focus::Edits);
     }
 
     /// A branch with no PR still has local changes, and that pane is about the
@@ -1944,6 +1992,7 @@ mod tests {
         other.category = Category::Review;
         st.prs = vec![other];
         st.pending_open_edits = true;
+        st.edit_files = vec![edit("a.rs")];
 
         try_open_pending_edits(&mut st, &tx);
         assert_eq!(st.focus, Focus::Edits);

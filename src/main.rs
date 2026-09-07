@@ -9,7 +9,8 @@ gh-review-ui — review GitHub PRs in the terminal
   gh-review-ui --file <path>    open a worktree file in the Pending-edits pane
   gh-review-ui --commit <sha>   review a commit of the open PR (comma-separated
                                 for a range)
-  gh-review-ui --edits          open this checkout's PR on its local changes
+  gh-review-ui --edits          open this checkout's PR on its local state:
+                                the pending edits, or its files when clean
 
 Both hand the argument to an instance already running on this checkout when
 there is one, so a second window is not opened for it.";

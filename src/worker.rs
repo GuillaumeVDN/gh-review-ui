@@ -126,17 +126,18 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             Some(n) => {
                 let (pr_id, files) = api::load_files(owner, name, *n)?;
                 let commits = api::load_commits(*n).unwrap_or_default();
-                // Only the local list holds commits no remote has, so this is
-                // also how we know GitHub's file list is the stale one.
-                let stale_viewed = if commits.iter().any(|c| !c.pushed) {
-                    api::unpushed_paths()
-                } else {
-                    HashSet::new()
-                };
                 let (diff, info) = if let (Some(oldest), Some(newest)) = (commits.last(), commits.first()) {
                     api::load_diff_range(&oldest.oid, &newest.oid)?
                 } else {
                     api::load_diff(*n)?
+                };
+                // Only the local list holds commits no remote has, and only
+                // then can what we show differ from what the PR has. It costs
+                // a second diff fetch, so it is not asked for otherwise.
+                let stale_viewed = if commits.iter().any(|c| !c.pushed) {
+                    api::diverged_from_pr(&diff, *n)
+                } else {
+                    HashSet::new()
                 };
                 // Local mode: comments live in a local store, not on the PR.
                 let pending = if *local {

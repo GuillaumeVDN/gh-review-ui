@@ -214,18 +214,40 @@ pub fn load_commits(number: i64) -> Result<Vec<Commit>> {
     Ok(commits_from_gh(&d["commits"]))
 }
 
-/// The files that commits no remote has touch.
+/// The files whose change, as the panes show it, is not the change the PR has.
 ///
-/// A file GitHub reports as viewed was viewed as the PR has it; a local commit
-/// changing it since makes that mark describe something that is no longer
-/// there, so the review has to see it again.
+/// A viewed mark GitHub gives us stands for the file as the PR has it. When
+/// the local change differs, the mark describes something that is not on the
+/// screen, and a file already ticked off is one you will not look at again.
 ///
-/// Merges contribute nothing: `git log --name-only` lists no files for one, and
-/// a merge brings no changes of its own to review here.
-pub fn unpushed_paths() -> HashSet<String> {
-    sh(&["git", "log", "--name-only", "--format=", "HEAD", "--not", "--remotes"])
-        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
-        .unwrap_or_default()
+/// Comparing the diffs rather than the commit list is what a rebase forces:
+/// it rewrites every commit, so a file whose content never moved still counts
+/// as touched by a commit no remote has. Only the added and removed lines are
+/// compared — GitHub serves three lines of context where we ask for eight, and
+/// a rebase gives every blob a new `index` sha, and neither is a change.
+pub fn diverged_from_pr(local: &Diff, number: i64) -> HashSet<String> {
+    // Nothing to compare against: leaving the marks alone beats dropping them
+    // over a fetch that failed.
+    let Ok((remote, _)) = load_diff(number) else { return HashSet::new() };
+    local
+        .keys()
+        .chain(remote.keys())
+        .filter(|p| changed_lines(local.get(*p)) != changed_lines(remote.get(*p)))
+        .cloned()
+        .collect()
+}
+
+/// The lines a file's diff adds and removes, in order. A file the diff does
+/// not mention changes nothing, which is what an empty list says.
+fn changed_lines(diff: Option<&Vec<String>>) -> Vec<&str> {
+    diff.map(|lines| {
+        lines
+            .iter()
+            .map(String::as_str)
+            .filter(|l| crate::diff::is_add(l) || crate::diff::is_del(l))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// The branch checked out in the cwd, which is the checkout every `git` call
@@ -992,6 +1014,63 @@ pub fn load_last_pr(owner: &str, name: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::models::PendingComment;
+
+    fn diff_of(entries: &[(&str, &str)]) -> Diff {
+        entries.iter().map(|(p, d)| (p.to_string(), d.lines().map(String::from).collect())).collect()
+    }
+
+    /// A rebase rewrites every commit and every blob sha, and we ask git for
+    /// eight lines of context where GitHub serves three. None of that is a
+    /// change, and a mark must survive all of it.
+    #[test]
+    fn the_same_change_reads_the_same_through_context_and_rebase() {
+        let ours = "diff --git a/a.rs b/a.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/a.rs\n\
+                    +++ b/a.rs\n\
+                    @@ -1,9 +1,9 @@\n\
+                     ctx1\n\
+                     ctx2\n\
+                     ctx3\n\
+                    -gone\n\
+                    +added\n\
+                     ctx4";
+        let theirs = "diff --git a/a.rs b/a.rs\n\
+                      index 9999999..8888888 100644\n\
+                      --- a/a.rs\n\
+                      +++ b/a.rs\n\
+                      @@ -4,3 +4,3 @@\n\
+                       ctx3\n\
+                      -gone\n\
+                      +added\n\
+                       ctx4";
+        assert_eq!(
+            changed_lines(diff_of(&[("a.rs", ours)]).get("a.rs")),
+            changed_lines(diff_of(&[("a.rs", theirs)]).get("a.rs")),
+        );
+    }
+
+    /// And a real difference has to read as one, in either direction.
+    #[test]
+    fn a_changed_line_and_a_file_only_one_side_has_both_count() {
+        let base = "@@ -1 +1 @@\n-gone\n+added";
+        let moved = "@@ -1 +1 @@\n-gone\n+added twice";
+        assert_ne!(
+            changed_lines(diff_of(&[("a.rs", base)]).get("a.rs")),
+            changed_lines(diff_of(&[("a.rs", moved)]).get("a.rs")),
+        );
+        // A file the other side does not mention at all.
+        assert_ne!(changed_lines(diff_of(&[("a.rs", base)]).get("a.rs")), changed_lines(None));
+        assert!(changed_lines(None).is_empty());
+    }
+
+    /// The `+++`/`---` header lines start with the same characters as a change
+    /// and are not one.
+    #[test]
+    fn the_file_headers_are_not_counted_as_changes() {
+        let only_headers = "--- a/a.rs\n+++ b/a.rs";
+        assert!(changed_lines(diff_of(&[("a.rs", only_headers)]).get("a.rs")).is_empty());
+    }
 
     fn log(records: &[&str]) -> String {
         // git ends every record with the separator and puts a newline between
