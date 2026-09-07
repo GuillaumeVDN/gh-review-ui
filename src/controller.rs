@@ -85,7 +85,8 @@ pub fn begin_open_local_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
     st.active_pr = Some(pr.clone());
     st.status = format!("Reviewing #{} locally…", pr.number);
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-    submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number), local: true });
+    let wt = st.active_worktree.clone();
+    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true });
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {
@@ -128,7 +129,8 @@ pub fn apply_commit_selection(st: &mut State, tx: &Sender<Job>) {
         oldest.short(),
         newest.short()
     );
-    submit(st, tx, Job::LoadCommitDiff { first: oldest.oid, last: newest.oid });
+    let wt = st.active_worktree.clone();
+    submit(st, tx, Job::LoadCommitDiff { wt, first: oldest.oid, last: newest.oid });
 }
 
 pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
@@ -241,7 +243,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.status = format!("Worktree ready for #{number} — loading…");
             api::save_last_pr(&st.repo_owner, &st.repo_name, number);
             let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-            submit(st, tx, Job::LoadActive { owner, name, login, number: Some(number), local: false });
+            let wt = st.active_worktree.clone();
+            submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(number), local: false });
         }
         Msg::ViewedOk { paths, viewed } => {
             // Optimistic state already matches; just confirm and clear the record.
@@ -1555,7 +1558,8 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
             // Oldest to newest, the way a range is read.
             let first = wanted.last().cloned().unwrap_or_default();
             let last = wanted.first().cloned().unwrap_or_default();
-            submit(st, tx, Job::LoadCommitDiff { first, last });
+            let wt = st.active_worktree.clone();
+            submit(st, tx, Job::LoadCommitDiff { wt, first, last });
         }
     }
 }
@@ -2115,7 +2119,7 @@ mod tests {
         assert!(st.status.contains("not pushed yet"), "{}", st.status);
         let jobs: Vec<Job> = rx.try_iter().collect();
         assert!(
-            jobs.iter().any(|j| matches!(j, Job::LoadCommitDiff { first, last }
+            jobs.iter().any(|j| matches!(j, Job::LoadCommitDiff { first, last, .. }
                 if first == "ffffff" && last == "ffffff")),
             "the diff was asked for from the checkout"
         );

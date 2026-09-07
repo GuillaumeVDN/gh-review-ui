@@ -16,8 +16,9 @@ type Info = HashMap<String, Vec<LineInfo>>;
 
 pub enum Job {
     LoadPrs { repo_root: String },
-    LoadActive { owner: String, name: String, login: String, number: Option<i64>, local: bool },
-    LoadCommitDiff { first: String, last: String },
+    /// `wt` is the checkout under review: the worktree the PR was opened in.
+    LoadActive { wt: String, owner: String, name: String, login: String, number: Option<i64>, local: bool },
+    LoadCommitDiff { wt: String, first: String, last: String },
     OpenPr { repo_root: String, owner: String, name: String, number: i64, head: String },
     MarkViewed { pr_id: String, path: String, viewed: bool },
     MarkViewedBulk { pr_id: String, paths: Vec<String>, viewed: bool },
@@ -112,7 +113,7 @@ pub fn job_tag(job: &Job) -> &'static str {
 fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
     Ok(match job {
         Job::LoadPrs { repo_root } => Msg::Prs(api::load_prs(repo_root)?),
-        Job::LoadActive { owner, name, login, number, local } => match number {
+        Job::LoadActive { wt, owner, name, login, number, local } => match number {
             None => Msg::Active {
                 number: None,
                 pr_id: String::new(),
@@ -125,9 +126,9 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             },
             Some(n) => {
                 let (pr_id, files) = api::load_files(owner, name, *n)?;
-                let commits = api::load_commits(*n).unwrap_or_default();
+                let commits = api::load_commits(wt, *n).unwrap_or_default();
                 let (diff, info) = if let (Some(oldest), Some(newest)) = (commits.last(), commits.first()) {
-                    api::load_diff_range(&oldest.oid, &newest.oid)?
+                    api::load_diff_range(wt, &oldest.oid, &newest.oid)?
                 } else {
                     api::load_diff(*n)?
                 };
@@ -159,8 +160,8 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 }
             }
         },
-        Job::LoadCommitDiff { first, last } => {
-            let (diff, info) = api::load_diff_range(first, last)?;
+        Job::LoadCommitDiff { wt, first, last } => {
+            let (diff, info) = api::load_diff_range(wt, first, last)?;
             Msg::CommitDiff { diff, info }
         }
         Job::OpenPr { repo_root, owner, name, number, head } => {

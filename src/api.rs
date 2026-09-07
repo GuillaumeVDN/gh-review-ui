@@ -180,8 +180,14 @@ pub fn load_diff(number: i64) -> Result<(Diff, Info)> {
     Ok(parse_diff(&raw))
 }
 
-pub fn load_diff_range(first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> {
-    let raw = sh(&[
+/// The change `first_oid^..last_oid` makes, read from the checkout under
+/// review.
+///
+/// `wt` is that checkout, because the oids are the ones [`load_commits`] gave
+/// us: a branch rewritten since its last push has commits only its own
+/// worktree holds, and the cwd this process was started in is another branch.
+pub fn load_diff_range(wt: &str, first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> {
+    let raw = sh_cwd(wt, &[
         "git", "diff",
         &format!("-U{DIFF_CONTEXT}"),
         "--src-prefix=a/", "--dst-prefix=b/",
@@ -198,16 +204,19 @@ pub fn load_diff_range(first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> 
 /// branch checked out here, `git log` is the honest source, and the same range
 /// ddm counts, so the two tools agree on what the branch contains. `gh` stays
 /// the answer for a PR we are only looking at.
-pub fn load_commits(number: i64) -> Result<Vec<Commit>> {
+///
+/// `wt` is the checkout under review, which is the worktree the PR was opened
+/// in rather than the directory this process was started in.
+pub fn load_commits(wt: &str, number: i64) -> Result<Vec<Commit>> {
     let d = gh_json(&[
         "pr", "view", &number.to_string(), "--json", "commits,headRefName,baseRefName",
     ])?;
     let head = d["headRefName"].as_str().unwrap_or("");
     let base = d["baseRefName"].as_str().unwrap_or("");
-    if !head.is_empty() && !base.is_empty() && current_branch().as_deref() == Some(head) {
+    if !head.is_empty() && !base.is_empty() && current_branch(wt).as_deref() == Some(head) {
         // An empty list is an answer here (a branch with nothing on it yet);
         // only a git that could not tell us falls back to GitHub's view.
-        if let Ok(commits) = local_commits(base) {
+        if let Ok(commits) = local_commits(wt, base) {
             return Ok(commits);
         }
     }
@@ -250,10 +259,9 @@ fn changed_lines(diff: Option<&Vec<String>>) -> Vec<&str> {
     .unwrap_or_default()
 }
 
-/// The branch checked out in the cwd, which is the checkout every `git` call
-/// here reads — none for a detached head.
-fn current_branch() -> Option<String> {
-    let b = sh(&["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+/// The branch checked out in `wt` — none for a detached head.
+fn current_branch(wt: &str) -> Option<String> {
+    let b = sh_cwd(wt, &["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
     let b = b.trim();
     (!b.is_empty() && b != "HEAD").then(|| b.to_string())
 }
@@ -262,17 +270,17 @@ fn current_branch() -> Option<String> {
 /// and a body brings newlines of its own.
 const LOG_FORMAT: &str = "--format=%H%x00%s%x00%b%x00%an%x00%aI%x1e";
 
-/// The checked-out branch's commits since it left `base`, newest first.
-fn local_commits(base: &str) -> Result<Vec<Commit>> {
-    let fork = sh(&["git", "merge-base", &format!("origin/{base}"), "HEAD"])?;
+/// The branch checked out in `wt`, since it left `base`, newest first.
+fn local_commits(wt: &str, base: &str) -> Result<Vec<Commit>> {
+    let fork = sh_cwd(wt, &["git", "merge-base", &format!("origin/{base}"), "HEAD"])?;
     let fork = fork.trim();
     if fork.is_empty() {
         return Err(anyhow!("no merge base with origin/{base}"));
     }
-    let raw = sh(&["git", "log", LOG_FORMAT, &format!("{fork}..HEAD")])?;
+    let raw = sh_cwd(wt, &["git", "log", LOG_FORMAT, &format!("{fork}..HEAD")])?;
     // Which of them nobody else can see yet. Failing to work this out is not
     // worth giving up the list for — it only costs the marker.
-    let unpushed: HashSet<String> = sh(&["git", "rev-list", "HEAD", "--not", "--remotes"])
+    let unpushed: HashSet<String> = sh_cwd(wt, &["git", "rev-list", "HEAD", "--not", "--remotes"])
         .unwrap_or_default()
         .split_whitespace()
         .map(str::to_string)
@@ -1231,5 +1239,40 @@ mod worktree_sharing_tests {
     #[test]
     fn a_repo_that_is_not_one_yields_nothing_rather_than_failing() {
         assert_eq!(worktree_for_branch("/nonexistent/xyz", "feat/x"), None);
+    }
+
+    /// A checkout with an `origin`, standing in for the worktree a PR is open
+    /// in. The process runs in another directory, which is the whole point.
+    fn checkout_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("ghr-checkout-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--initial-branch=dev"]);
+        std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+        git(&origin, &["add", "-A"]);
+        git(&origin, &["commit", "-qm", "initial"]);
+
+        let clone = root.join("clone");
+        git(&origin, &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()]);
+        git(&clone, &["checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(clone.join("a.txt"), "b\n").unwrap();
+        git(&clone, &["commit", "-qam", "feat: local work"]);
+        (root, clone)
+    }
+
+    /// The panes describe the checkout the PR was opened in, which is not the
+    /// directory this process was started in.
+    #[test]
+    fn the_branch_and_its_commits_come_from_the_given_checkout() {
+        let (root, clone) = checkout_fixture("branch");
+        let wt = clone.to_str().unwrap();
+        assert_eq!(current_branch(wt).as_deref(), Some("feat/x"));
+
+        let commits = local_commits(wt, "dev").unwrap();
+        assert_eq!(commits.len(), 1, "only what the branch added to dev");
+        assert_eq!(commits[0].headline, "feat: local work");
+        assert!(!commits[0].pushed, "no remote has it");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

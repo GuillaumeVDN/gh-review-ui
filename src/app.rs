@@ -271,7 +271,8 @@ fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
         if st.local_mode {
             if !st.busy.contains("active") {
                 let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
-                controller::submit(st, tx, Job::LoadActive { owner, name, login, number: Some(pr.number), local: true });
+                let wt = st.active_worktree.clone();
+                controller::submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true });
             }
         } else if !st.busy.contains("worktree") && !st.busy.contains("active") {
             let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
