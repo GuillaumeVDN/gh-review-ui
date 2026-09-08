@@ -139,8 +139,13 @@ pub fn sel_marker() -> Style {
 pub fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
+/// List section header: bold, in a muted gray.
+///
+/// The gray comes from the color, not from `DIM`. A cell that carries both
+/// `DIM` and `BOLD` renders differently depending on the order the backend
+/// emits the two SGR codes, which changes with the redraw path.
 pub fn section_header() -> Style {
-    Style::default().fg(Color::White).add_modifier(Modifier::DIM | Modifier::BOLD)
+    Style::default().fg(Color::Indexed(245)).add_modifier(Modifier::BOLD)
 }
 
 /// Style for a markdown line kind (PR summary pane).
