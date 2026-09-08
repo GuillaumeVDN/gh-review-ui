@@ -473,7 +473,7 @@ pub fn confirm_ask(st: &mut State) {
          My question:\n{question}\n"
     );
     let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
-    match editor::ask_claude(&prompt, &cwd) {
+    match editor::ask_claude(st, &prompt, &cwd) {
         Ok(()) => st.status = "Launched Claude in a new terminal…".into(),
         Err(e) => st.status = format!("Failed to launch Claude: {e}"),
     }

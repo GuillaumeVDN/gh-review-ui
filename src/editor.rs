@@ -17,10 +17,13 @@ fn cache_dir() -> PathBuf {
 /// Launch a new Ghostty window running an interactive `claude` seeded with
 /// `prompt`, in `cwd` (the PR worktree, so Claude can open the real files).
 ///
+/// The window opens as a tab beside the TUI, so the TUI window has to form a
+/// Hyprland group first.
+///
 /// The prompt is written to a temp file and read back into claude's argument
 /// (`claude "$(cat file)"`) so a large multi-line diff survives intact without
 /// depending on env-var propagation; the file is removed once read.
-pub fn ask_claude(prompt: &str, cwd: &str) -> Result<(), String> {
+pub fn ask_claude(st: &mut State, prompt: &str, cwd: &str) -> Result<(), String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -31,6 +34,10 @@ pub fn ask_claude(prompt: &str, cwd: &str) -> Result<(), String> {
     // auto-mode (skip permission prompts so it can read files freely).
     let script =
         format!("p=\"$(cat '{fp}')\"; rm -f '{fp}'; exec claude --dangerously-skip-permissions \"$p\"");
+    if !in_group() {
+        hypr_toggle_group();
+        st.entered_group = true;
+    }
     Command::new("ghostty")
         .arg("-e")
         .arg("bash")
