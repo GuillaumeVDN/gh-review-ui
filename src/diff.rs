@@ -166,6 +166,72 @@ pub fn local_overlay(lines: &[String], info: &[LineInfo]) -> LocalOverlay {
     ov
 }
 
+/// One row of a side-by-side diff, as diff-line indices: the old side on the
+/// left, the new side on the right. A `wide` row (file header, `@@` header,
+/// `\ No newline`) carries its index on the left and spans both columns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SbsRow {
+    pub left: Option<usize>,
+    pub right: Option<usize>,
+    pub wide: bool,
+}
+
+impl SbsRow {
+    /// The diff line the row starts on.
+    pub fn line(self) -> Option<usize> {
+        self.left.or(self.right)
+    }
+}
+
+/// Pair each deletion of a unified diff with the addition that replaces it, so
+/// one row holds both sides of the same change.
+///
+/// A run of `-` lines followed by a run of `+` lines pairs up index by index,
+/// and the longer side keeps the extra rows to itself. A context line sits in
+/// both columns. Anything else spans the two columns.
+pub fn side_by_side(lines: &[String]) -> Vec<SbsRow> {
+    fn flush(rows: &mut Vec<SbsRow>, dels: &mut Vec<usize>, adds: &mut Vec<usize>) {
+        for k in 0..dels.len().max(adds.len()) {
+            rows.push(SbsRow { left: dels.get(k).copied(), right: adds.get(k).copied(), wide: false });
+        }
+        dels.clear();
+        adds.clear();
+    }
+
+    let mut rows: Vec<SbsRow> = Vec::new();
+    let (mut dels, mut adds): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (i, l) in lines.iter().enumerate() {
+        if is_del(l) {
+            if !adds.is_empty() {
+                flush(&mut rows, &mut dels, &mut adds); // a new block starts
+            }
+            dels.push(i);
+        } else if is_add(l) {
+            adds.push(i);
+        } else {
+            flush(&mut rows, &mut dels, &mut adds);
+            let context = l.is_empty() || l.starts_with(' ');
+            rows.push(SbsRow { left: Some(i), right: context.then_some(i), wide: !context });
+        }
+    }
+    flush(&mut rows, &mut dels, &mut adds);
+    rows
+}
+
+/// Row index of every diff line, so a scroll position keeps its place across a
+/// switch between the inline and side-by-side views.
+pub fn sbs_row_by_line(rows: &[SbsRow], n_lines: usize) -> Vec<usize> {
+    let mut out = vec![0usize; n_lines];
+    for (r, row) in rows.iter().enumerate() {
+        for i in [row.left, row.right].into_iter().flatten() {
+            if i < n_lines {
+                out[i] = r;
+            }
+        }
+    }
+    out
+}
+
 /// Contiguous runs of changed (`+`/`-`) lines — the app's navigable "hunks".
 ///
 /// Context lines, `@@` headers and file headers break a run, so extended
@@ -478,6 +544,93 @@ mod tests {
                    Binary files a/img.png and b/img.png differ\n";
         let (files, _) = parse_diff(raw);
         assert!(build_hunk_patch(&files["img.png"], (2, 3), false).is_none());
+    }
+
+    #[test]
+    fn side_by_side_pairs_a_replacement() {
+        let (files, _) = parse_diff(&sample());
+        let lines = &files["foo.py"];
+        let rows = side_by_side(lines);
+        let shown: Vec<(Option<&str>, Option<&str>, bool)> = rows
+            .iter()
+            .map(|r| (r.left.map(|i| lines[i].as_str()), r.right.map(|i| lines[i].as_str()), r.wide))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (Some("diff --git a/foo.py b/foo.py"), None, true),
+                (Some("index 111..222 100644"), None, true),
+                (Some("--- a/foo.py"), None, true),
+                (Some("+++ b/foo.py"), None, true),
+                (Some("@@ -1,3 +1,4 @@"), None, true),
+                (Some(" ctx"), Some(" ctx"), false),
+                (Some("-old line"), Some("+new line"), false),
+                (None, Some("+added line"), false),
+                (Some("@@ -10,2 +11,2 @@"), None, true),
+                (Some(" keep"), Some(" keep"), false),
+                (Some("-gone"), Some("+fresh"), false),
+                (Some(""), Some(""), false), // trailing artifact of the split
+            ]
+        );
+    }
+
+    #[test]
+    fn side_by_side_splits_two_blocks_of_one_hunk() {
+        // `-a +A ctx -b +B` is two separate replacements, not one four-line block.
+        let raw = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n-a\n+A\n ctx\n-b\n+B\n";
+        let (files, _) = parse_diff(raw);
+        let lines = &files["f"];
+        let rows = side_by_side(lines);
+        let pairs: Vec<(Option<usize>, Option<usize>)> =
+            rows.iter().filter(|r| !r.wide).map(|r| (r.left, r.right)).collect();
+        let i = |s: &str| lines.iter().position(|l| l == s).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(i("-a")), Some(i("+A"))),
+                (Some(i(" ctx")), Some(i(" ctx"))),
+                (Some(i("-b")), Some(i("+B"))),
+                (Some(i("")), Some(i(""))),
+            ]
+        );
+    }
+
+    #[test]
+    fn side_by_side_keeps_an_unpaired_side_alone() {
+        let changed = |lines: &[String], rows: Vec<SbsRow>| -> Vec<SbsRow> {
+            let is_change = |i: Option<usize>| {
+                i.map_or(false, |i| is_add(&lines[i]) || is_del(&lines[i]))
+            };
+            rows.into_iter().filter(|r| is_change(r.left) || is_change(r.right)).collect()
+        };
+
+        let (files, _) = parse_diff(added_file());
+        let adds = changed(&files["new.txt"], side_by_side(&files["new.txt"]));
+        assert_eq!(adds.len(), 2);
+        assert!(adds.iter().all(|r| r.left.is_none() && r.right.is_some()), "{adds:?}");
+
+        let (files, _) = parse_diff(deleted_file());
+        let dels = changed(&files["gone.txt"], side_by_side(&files["gone.txt"]));
+        assert_eq!(dels.len(), 1);
+        assert!(dels[0].left.is_some() && dels[0].right.is_none());
+    }
+
+    #[test]
+    fn side_by_side_row_map_covers_every_line() {
+        let (files, _) = parse_diff(&sample());
+        let lines = &files["foo.py"];
+        let rows = side_by_side(lines);
+        let by_line = sbs_row_by_line(&rows, lines.len());
+        assert_eq!(by_line.len(), lines.len());
+        for (i, &r) in by_line.iter().enumerate() {
+            assert!(rows[r].left == Some(i) || rows[r].right == Some(i), "line {i} maps to row {r}");
+        }
+    }
+
+    #[test]
+    fn side_by_side_empty() {
+        assert!(side_by_side(&[]).is_empty());
+        assert!(sbs_row_by_line(&[], 0).is_empty());
     }
 
     #[test]

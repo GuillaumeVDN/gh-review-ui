@@ -103,6 +103,7 @@ Files pane:
 - `Space` — toggle viewed on file, or on all files under a folder
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `e` — open the selected file in the editor (top of file)
+- `s` — switch the review diff between inline and side by side
 - `Enter` — open file in the diff pane (folder: collapse / expand)
 
 Pending edits pane (local, uncommitted changes in the worktree). `--edits`
@@ -132,11 +133,21 @@ Diff pane:
 - `j` / `k` / arrows — jump to next / previous change block
 - `PgDn` / `PgUp` — page down / up
 - `c` — start the comment line picker (see below)
+- `s` — switch the review diff between inline and side by side
 - `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
 - on a **local** diff (opened with `Enter` from the pending-edits pane):
   - `Space` — stage / unstage the selected change block (lazygit-style)
   - `h` / `l` — move between the two columns of a partly-staged file
+
+`s` draws the review diff side by side: the old side on the left, the new side
+on the right, and the left panes shrink to make room. Each deletion sits across
+from the addition that replaces it; an unpaired change leaves the other column
+empty. File headers, `@@` headers and pending comments span both columns, and
+local worktree edits stay on the new side. Everything else carries over from the
+inline view: the change-block band, the comment picker, `j`/`k`, and the scroll
+keeps its place across the switch. A local diff from the pending-edits pane
+always stays inline, since its columns are the index instead.
 
 A partly-staged file splits the pane in two columns — unstaged on the left,
 staged on the right — and the left panes shrink to make room. The focused column

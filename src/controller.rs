@@ -1247,6 +1247,31 @@ pub fn switch_stage_side(st: &mut State, staged: bool) {
     st.diff_reveal_pending = true;
 }
 
+/// Switch the review diff between the inline and the side-by-side view.
+///
+/// `diff_scroll` counts diff lines inline and side-by-side rows in the other
+/// view, so it is converted and the reader keeps their place. A local diff from
+/// [4] always stays inline: its columns are the index, not the two sides.
+pub fn toggle_side_by_side(st: &mut State) {
+    let sbs = !st.side_by_side;
+    if let Some(path) = diff_path(st).filter(|p| !is_local_diff(st, p)) {
+        if let Some(lines) = st.diff_by_file.get(&path) {
+            let rows = crate::diff::side_by_side(lines);
+            st.diff_scroll = if sbs {
+                crate::diff::sbs_row_by_line(&rows, lines.len())
+                    .get(st.diff_scroll)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                rows.get(st.diff_scroll).and_then(|r| r.line()).unwrap_or(0)
+            };
+        }
+    }
+    st.side_by_side = sbs;
+    st.diff_reveal_pending = true;
+    st.status = if sbs { "Diff side by side." } else { "Diff inline." }.into();
+}
+
 /// Show the selected pending-edit file's local diff in [0] with hunk navigation.
 /// Enter in the Pending-edits pane: a file opens its diff, a folder folds.
 ///
@@ -1682,6 +1707,51 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn review_diff_state() -> State {
+        let raw = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n\
+                   @@ -1,4 +1,5 @@\n keep\n-old\n+new\n+extra\n tail\n";
+        let mut st = State::default();
+        st.files = vec![FileEntry { path: "f".into(), viewed: false }];
+        st.tree = vec![TreeRow::File { depth: 0, name: "f".into(), index: 0 }];
+        let (d, i) = crate::diff::parse_diff(raw);
+        st.hunks_by_file = d.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+        (st.diff_by_file, st.info_by_file) = (d, i);
+        st
+    }
+
+    /// The scroll counts diff lines inline and rows side by side, so the toggle
+    /// converts it and the same line stays at the top.
+    #[test]
+    fn the_side_by_side_toggle_carries_the_scroll_over() {
+        let mut st = review_diff_state();
+        let lines = st.diff_by_file["f"].clone();
+        let extra = lines.iter().position(|l| l == "+extra").unwrap();
+
+        st.diff_scroll = extra;
+        toggle_side_by_side(&mut st);
+        assert!(st.side_by_side);
+        let rows = crate::diff::side_by_side(&lines);
+        assert_eq!(rows[st.diff_scroll].right, Some(extra), "the same line tops the view");
+
+        toggle_side_by_side(&mut st);
+        assert!(!st.side_by_side);
+        assert_eq!(st.diff_scroll, extra);
+    }
+
+    /// A local diff from [4] has no old/new sides to split, so the toggle only
+    /// records the choice for the review diff.
+    #[test]
+    fn the_side_by_side_toggle_leaves_a_local_diff_alone() {
+        let mut st = review_diff_state();
+        st.edit_diff_by_file.insert("f".into(), vec!["+local".into()]);
+        st.local_diff_path = Some("f".into());
+        st.diff_scroll = 3;
+
+        toggle_side_by_side(&mut st);
+        assert!(st.side_by_side);
+        assert_eq!(st.diff_scroll, 3);
     }
 
     /// Enter on a folder folds it, the way it does in the Files pane. A folder

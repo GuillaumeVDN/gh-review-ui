@@ -363,6 +363,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 st.status = "Unfolded all folders.".into();
             }
             KeyCode::Char('e') => editor::open_current_in_editor(st, true),
+            KeyCode::Char('s') => controller::toggle_side_by_side(st),
             _ => {}
         },
         Focus::Edits => match k.code {
@@ -409,6 +410,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char('c') => controller::enter_comment_mode(st),
             KeyCode::Char('a') => controller::begin_ask(st),
             KeyCode::Char('e') => editor::open_current_in_editor(st, false),
+            KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Esc => {
                 if st.local_diff_path.take().is_some() {
                     st.focus = Focus::Edits; // came from [4]

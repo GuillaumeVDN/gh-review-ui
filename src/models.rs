@@ -333,6 +333,9 @@ pub struct State {
     /// Set when a keyboard action should scroll the selected hunk/comment into
     /// view on the next render; free scrolling (mouse/PgUp/Dn) leaves it unset.
     pub diff_reveal_pending: bool,
+    /// The review diff draws side by side (old left, new right) instead of
+    /// inline. `diff_scroll` counts side-by-side rows while this is set.
+    pub side_by_side: bool,
 
     // In-hunk comment picker.
     pub comment_mode: bool,

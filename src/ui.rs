@@ -36,8 +36,17 @@ pub fn shows_split_diff(st: &State) -> bool {
     st.local_diff_path.as_deref().map_or(false, |p| is_split(st, p))
 }
 
+/// Whether the [0] pane draws the review diff side by side, which needs the
+/// same extra width as a split local diff.
+pub fn shows_sbs_diff(st: &State) -> bool {
+    st.side_by_side
+        && matches!(st.focus, Focus::Files | Focus::Diff)
+        && diff_path(st).map_or(false, |p| !is_local_diff(st, &p))
+}
+
 pub fn compute_layout(area: Rect, st: &State) -> (PaneRects, Rect, Rect) {
-    compute_layout_at(area, st.focus, st.local_diff_path.is_some(), shows_split_diff(st))
+    let two_columns = shows_split_diff(st) || shows_sbs_diff(st);
+    compute_layout_at(area, st.focus, st.local_diff_path.is_some(), two_columns)
 }
 
 pub fn compute_layout_at(area: Rect, focus: Focus, local_diff: bool, split: bool) -> (PaneRects, Rect, Rect) {
@@ -284,12 +293,12 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · o: open web · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed · e: editor · z/Z: fold/unfold · gg/G · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed · s: side by side · e: editor · z/Z: fold/unfold · gg/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · Space: stage hunk · d: revert hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
         }
-        Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
     }
 }
 
@@ -671,14 +680,250 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     f.render_widget(Paragraph::new(sep), cols[1]);
 }
 
+/// One column of one side-by-side row: the wrapped text plus the styling the
+/// line carries (hunk band, comment picker, local overlay).
+struct SbsCell {
+    chunks: Vec<String>,
+    style: Style,
+    marker: &'static str,
+    m_style: Style,
+}
+
+impl SbsCell {
+    fn blank() -> Self {
+        SbsCell {
+            chunks: vec![String::new()],
+            style: Style::default(),
+            marker: " ",
+            m_style: Style::default(),
+        }
+    }
+}
+
+/// Push one side-by-side row, wrapping both columns and keeping them aligned:
+/// the shorter column pads out to the taller one's height.
+fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: SbsCell, r: SbsCell) {
+    for k in 0..l.chunks.len().max(r.chunks.len()) {
+        if out.len() >= vh {
+            return;
+        }
+        let lc = l.chunks.get(k).map(String::as_str).unwrap_or("");
+        let rc = r.chunks.get(k).map(String::as_str).unwrap_or("");
+        out.push(Line::from(vec![
+            Span::styled(if k == 0 { l.marker } else { " " }, l.m_style),
+            Span::styled(pad(lc, w.0), l.style),
+            Span::styled("│", theme::dim()),
+            Span::styled(if k == 0 { r.marker } else { " " }, r.m_style),
+            Span::styled(pad(rc, w.1), r.style),
+        ]));
+    }
+}
+
+/// The review diff side by side: the old side left, the new side right.
+///
+/// Deletions pair with the additions that replace them, so a rewritten line
+/// reads across. File and `@@` headers and pending comments span both columns;
+/// local worktree edits stay on the new side. `diff_scroll` counts rows here,
+/// not diff lines.
+fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    let empty: Vec<String> = Vec::new();
+    let rows = crate::diff::side_by_side(st.diff_by_file.get(path).unwrap_or(&empty));
+    let row_by_line =
+        crate::diff::sbs_row_by_line(&rows, st.diff_by_file.get(path).map_or(0, Vec::len));
+
+    let focused = st.focus == Focus::Diff;
+    let cur_hr = if focused { current_hunk_range(st, path) } else { None };
+    if st.diff_reveal_pending {
+        let target = if st.comment_mode {
+            Some((st.comment_line, st.comment_line))
+        } else {
+            cur_hr.map(|(s, e)| (s, e.saturating_sub(1)))
+        };
+        if let Some((s, e)) = target {
+            let lo = row_by_line.get(s).copied().unwrap_or(0);
+            let hi = row_by_line.get(e).copied().unwrap_or(lo);
+            st.diff_scroll = reveal_scroll(st.diff_scroll, lo, hi + 1, vh);
+        }
+        st.diff_reveal_pending = false;
+    }
+    st.diff_scroll = st.diff_scroll.min(rows.len().saturating_sub(1));
+    let scroll = st.diff_scroll;
+
+    let diff_lines: &[String] = match st.diff_by_file.get(path) {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let msg = Line::styled("(no diff — binary, removed, or too large)", theme::dim());
+            f.render_widget(Paragraph::new(msg), inner);
+            return;
+        }
+    };
+
+    // One marker column plus text on each side, with a 1-column separator.
+    let half = iw.saturating_sub(1) / 2;
+    let (ltw, rtw) = (half.saturating_sub(1), iw.saturating_sub(1 + half).saturating_sub(1));
+
+    let (sel_lo, sel_hi) = if st.comment_mode {
+        let anchor = st.comment_start.unwrap_or(st.comment_line);
+        (anchor.min(st.comment_line), anchor.max(st.comment_line))
+    } else {
+        (1usize, 0usize) // empty
+    };
+
+    let pending_here: Vec<&PendingComment> = st.pending.iter().filter(|c| c.path == path).collect();
+    let info_here = st.info_by_file.get(path);
+    let overlay = match (st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
+        (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
+        _ => None,
+    };
+    // A locally re-added line that the PR deleted is a restore, not an addition.
+    let pr_deleted: HashSet<&str> = diff_lines
+        .iter()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .map(|l| &l[1..])
+        .collect();
+
+    let new_side = |i: usize| info_here.and_then(|inf| inf.get(i)).and_then(|&(_, n)| n);
+    let cell = |idx: Option<usize>, tw: usize, is_new: bool| -> SbsCell {
+        let Some(i) = idx else { return SbsCell::blank() };
+        let ln = &diff_lines[i];
+        let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
+        let selected = sel_lo <= i && i <= sel_hi;
+        // Only the new side can hold a line the worktree has since removed.
+        let local_del = is_new
+            && overlay
+                .as_ref()
+                .zip(new_side(i))
+                .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
+        let mut style = theme::diff_line_style(ln, current);
+        if local_del {
+            style = theme::local_del();
+        }
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        SbsCell {
+            chunks: wrap_hard(&ln.replace('\t', "    "), tw.max(1)),
+            style,
+            marker: if selected {
+                "▶"
+            } else if local_del {
+                "▎"
+            } else if current {
+                "▌"
+            } else {
+                " "
+            },
+            m_style: if selected {
+                theme::focus()
+            } else if local_del {
+                theme::local_marker()
+            } else if current {
+                theme::hunk_marker()
+            } else {
+                Style::default()
+            },
+        }
+    };
+    // Local additions belong to the new side, so they fill the right column.
+    let local_cell = |add: &str| -> SbsCell {
+        let prefix = if pr_deleted.contains(add) { ' ' } else { '+' };
+        SbsCell {
+            chunks: wrap_hard(&format!("{prefix}{}", add.replace('\t', "    ")), rtw.max(1)),
+            style: theme::local_add(),
+            marker: "▎",
+            m_style: theme::local_marker(),
+        }
+    };
+
+    let mut out: Vec<Line> = Vec::new();
+    let mut top_done = false;
+    for row in rows.iter().skip(scroll) {
+        if out.len() >= vh {
+            break;
+        }
+        // Local additions anchored before the first head line show once, up top.
+        if let (Some(ov), false) = (&overlay, top_done) {
+            if row.right.and_then(new_side).is_some() {
+                for add in &ov.adds_top {
+                    push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(), local_cell(add));
+                }
+                top_done = true;
+            }
+        }
+        if row.wide {
+            let Some(i) = row.line() else { continue };
+            let ln = &diff_lines[i];
+            let style = theme::diff_line_style(ln, false);
+            for chunk in wrap_hard(&ln.replace('\t', "    "), iw.saturating_sub(1)) {
+                if out.len() >= vh {
+                    break;
+                }
+                out.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(pad(&chunk, iw.saturating_sub(1)), style),
+                ]));
+            }
+        } else {
+            push_sbs_row(
+                &mut out,
+                vh,
+                (ltw, rtw),
+                cell(row.left, ltw, false),
+                cell(row.right, rtw, true),
+            );
+        }
+        // Local additions inserted after this head line (orange, new side).
+        if let (Some(ov), Some(l)) = (&overlay, row.right.and_then(new_side)) {
+            for add in ov.adds_after.get(&l).into_iter().flatten() {
+                push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(), local_cell(add));
+            }
+        }
+        // Pending comments anchored to either side, spanning both columns.
+        let mut seen = None;
+        for i in [row.left, row.right].into_iter().flatten() {
+            if seen == Some(i) {
+                continue;
+            }
+            seen = Some(i);
+            let Some(&(old, new)) = info_here.and_then(|inf| inf.get(i)) else { continue };
+            for c in &pending_here {
+                let hit = if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) };
+                if !hit {
+                    continue;
+                }
+                let range_tag = match c.start_line {
+                    Some(s) => format!("[{}-{}] ", s.min(c.line), s.max(c.line)),
+                    None => String::new(),
+                };
+                for (bi, bl) in c.body.lines().enumerate() {
+                    if out.len() >= vh {
+                        break;
+                    }
+                    let gutter = if bi == 0 { "▏💬 " } else { "▏   " };
+                    let tag = if bi == 0 { range_tag.as_str() } else { "" };
+                    let text = format!("{gutter}{tag}{}", bl.replace('\t', "    "));
+                    out.push(Line::from(Span::styled(pad(&text, iw), theme::comment_inline())));
+                }
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(out), inner);
+}
+
 fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let path = diff_path(st);
     let local = path.as_ref().map_or(false, |p| is_local_diff(st, p));
     let has_overlay = !local && path.as_ref().map_or(false, |p| st.edit_diff_by_file.contains_key(p));
     let split = local && path.as_ref().map_or(false, |p| is_split(st, p));
+    let sbs = !local && st.side_by_side && path.is_some();
     let title = match (&path, local) {
         (Some(p), true) => format!("[0] Local diff — {p}{}", if split { "  · unstaged | staged" } else { "" }),
-        (Some(p), false) => format!("[0] Diff — {p}{}", if has_overlay { "  · +local edits" } else { "" }),
+        (Some(p), false) => format!(
+            "[0] Diff — {p}{}{}",
+            if sbs { "  · old | new" } else { "" },
+            if has_overlay { "  · +local edits" } else { "" }
+        ),
         (None, _) => "[0] Diff".to_string(),
     };
     let b = block(&title, st.focus == Focus::Diff, false);
@@ -687,6 +932,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     if split {
         let p = path.unwrap();
         render_split_diff(f, st, inner, &p);
+        return;
+    }
+    if sbs && !(is_loading(st) && st.diff_by_file.is_empty()) {
+        let p = path.unwrap();
+        render_sbs_diff(f, st, inner, &p);
         return;
     }
     let (vh, iw) = (inner.height as usize, inner.width as usize);
