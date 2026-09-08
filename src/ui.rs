@@ -10,7 +10,8 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    CommitKind, Focus, Overlay, PendingComment, StageState, State, TreeRow, SUBMIT_CHOICES,
+    CommitKind, Focus, LineInfo, Overlay, PendingComment, StageState, State, TreeRow,
+    SUBMIT_CHOICES,
 };
 use crate::navigation::{
     current_hunk_range, diff_path, hunk_for_comment, is_local_diff, is_split, source_maps,
@@ -152,6 +153,41 @@ fn wrap_hard(s: &str, width: usize) -> Vec<String> {
         return vec![String::new()];
     }
     chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
+
+/// Columns one line number takes in a diff gutter, from the file's largest one.
+fn num_width(info: Option<&Vec<LineInfo>>) -> usize {
+    let max = info.map_or(0, |inf| {
+        inf.iter().map(|&(o, n)| o.unwrap_or(0).max(n.unwrap_or(0))).max().unwrap_or(0)
+    });
+    max.to_string().len().max(3)
+}
+
+/// One right-aligned line number, blank where the row has none.
+fn num(no: Option<i64>, w: usize) -> String {
+    match no {
+        Some(n) => format!("{n:>w$}"),
+        None => " ".repeat(w),
+    }
+}
+
+/// The gutter of a diff row, and the blank of the same width for the
+/// continuation rows of a wrapped line. `nos` is one number per column.
+fn gutter(nos: &[Option<i64>], w: usize) -> String {
+    if w == 0 {
+        return String::new();
+    }
+    nos.iter().map(|&n| format!("{} ", num(n, w))).collect()
+}
+
+/// Line-number width that leaves the text at least `keep` columns, else 0 (the
+/// gutter is dropped rather than squeezing the code out of a narrow pane).
+fn fit_num_width(w: usize, columns: usize, text_w: usize, keep: usize) -> usize {
+    if text_w >= columns * (w + 1) + keep {
+        w
+    } else {
+        0
+    }
 }
 
 /// Shared tree/list renderer: given one `(text, base_style)` per row, handle
@@ -564,16 +600,23 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
 /// selection reversed.
 fn diff_column_rows(
     lines: &[String],
+    info: Option<&Vec<LineInfo>>,
     scroll: usize,
     vh: usize,
     tw: usize,
     cur: Option<(usize, usize)>,
     sel: (usize, usize),
 ) -> Vec<Line<'static>> {
+    // The column is narrow, so it carries the new-side number alone.
+    let nw = fit_num_width(num_width(info), 1, tw, 12);
+    let gw = if nw == 0 { 0 } else { nw + 1 };
+    let tw = tw.saturating_sub(gw);
     let mut out: Vec<Line> = Vec::new();
     let mut i = scroll;
     while out.len() < vh && i < lines.len() {
         let ln = &lines[i];
+        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
+        let g = gutter(&[new.or(old)], nw);
         let current = cur.map_or(false, |(s, e)| s <= i && i < e);
         let selected = sel.0 <= i && i <= sel.1;
         let mut style = theme::diff_line_style(ln, current);
@@ -599,8 +642,10 @@ fn diff_column_rows(
                 break;
             }
             let marker = if k > 0 { " " } else { base_marker };
+            let g = if k > 0 { " ".repeat(gw) } else { g.clone() };
             out.push(Line::from(vec![
                 Span::styled(marker, m_style),
+                Span::styled(g, theme::dim()),
                 Span::styled(pad(&chunk, tw), style),
             ]));
         }
@@ -641,7 +686,7 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
 
     for (staged, area) in [(false, cols[0]), (true, cols[2])] {
         let active = staged == st.staged_side;
-        let (diffs, _, hunks) = if staged {
+        let (diffs, infos, hunks) = if staged {
             (&st.staged_diff_by_file, &st.staged_info_by_file, &st.staged_hunks_by_file)
         } else {
             (&st.unstaged_diff_by_file, &st.unstaged_info_by_file, &st.unstaged_hunks_by_file)
@@ -667,6 +712,7 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         *scroll = (*scroll).min(lines.len().saturating_sub(1));
         let rows = diff_column_rows(
             lines,
+            infos.get(path),
             *scroll,
             body.height as usize,
             tw,
@@ -680,9 +726,11 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     f.render_widget(Paragraph::new(sep), cols[1]);
 }
 
-/// One column of one side-by-side row: the wrapped text plus the styling the
-/// line carries (hunk band, comment picker, local overlay).
+/// One column of one side-by-side row: the line-number gutter and the wrapped
+/// text, plus the styling the line carries (hunk band, comment picker, local
+/// overlay).
 struct SbsCell {
+    gutter: String,
     chunks: Vec<String>,
     style: Style,
     marker: &'static str,
@@ -690,8 +738,10 @@ struct SbsCell {
 }
 
 impl SbsCell {
-    fn blank() -> Self {
+    /// An empty column: the side the change does not touch.
+    fn blank(nw: usize) -> Self {
         SbsCell {
+            gutter: gutter(&[None], nw),
             chunks: vec![String::new()],
             style: Style::default(),
             marker: " ",
@@ -703,17 +753,25 @@ impl SbsCell {
 /// Push one side-by-side row, wrapping both columns and keeping them aligned:
 /// the shorter column pads out to the taller one's height.
 fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: SbsCell, r: SbsCell) {
+    let blank = " ".repeat(l.gutter.chars().count());
     for k in 0..l.chunks.len().max(r.chunks.len()) {
         if out.len() >= vh {
             return;
         }
         let lc = l.chunks.get(k).map(String::as_str).unwrap_or("");
         let rc = r.chunks.get(k).map(String::as_str).unwrap_or("");
+        let (lg, rg) = if k == 0 {
+            (l.gutter.clone(), r.gutter.clone())
+        } else {
+            (blank.clone(), blank.clone())
+        };
         out.push(Line::from(vec![
             Span::styled(if k == 0 { l.marker } else { " " }, l.m_style),
+            Span::styled(lg, theme::dim()),
             Span::styled(pad(lc, w.0), l.style),
             Span::styled("│", theme::dim()),
             Span::styled(if k == 0 { r.marker } else { " " }, r.m_style),
+            Span::styled(rg, theme::dim()),
             Span::styled(pad(rc, w.1), r.style),
         ]));
     }
@@ -759,10 +817,6 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         }
     };
 
-    // One marker column plus text on each side, with a 1-column separator.
-    let half = iw.saturating_sub(1) / 2;
-    let (ltw, rtw) = (half.saturating_sub(1), iw.saturating_sub(1 + half).saturating_sub(1));
-
     let (sel_lo, sel_hi) = if st.comment_mode {
         let anchor = st.comment_start.unwrap_or(st.comment_line);
         (anchor.min(st.comment_line), anchor.max(st.comment_line))
@@ -783,10 +837,19 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         .map(|l| &l[1..])
         .collect();
 
+    // One marker column, the line-number gutter and text on each side, with a
+    // 1-column separator between them.
+    let half = iw.saturating_sub(1) / 2;
+    let (lw, rw) = (half, iw.saturating_sub(1 + half));
+    let nw = fit_num_width(num_width(info_here), 1, lw.min(rw).saturating_sub(1), 12);
+    let gw = if nw == 0 { 0 } else { nw + 1 };
+    let (ltw, rtw) = (lw.saturating_sub(1 + gw), rw.saturating_sub(1 + gw));
+
     let new_side = |i: usize| info_here.and_then(|inf| inf.get(i)).and_then(|&(_, n)| n);
     let cell = |idx: Option<usize>, tw: usize, is_new: bool| -> SbsCell {
-        let Some(i) = idx else { return SbsCell::blank() };
+        let Some(i) = idx else { return SbsCell::blank(nw) };
         let ln = &diff_lines[i];
+        let (old, new) = info_here.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
         let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
         let selected = sel_lo <= i && i <= sel_hi;
         // Only the new side can hold a line the worktree has since removed.
@@ -803,6 +866,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             style = style.add_modifier(Modifier::REVERSED);
         }
         SbsCell {
+            gutter: gutter(&[if is_new { new } else { old }], nw),
             chunks: wrap_hard(&ln.replace('\t', "    "), tw.max(1)),
             style,
             marker: if selected {
@@ -829,6 +893,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     let local_cell = |add: &str| -> SbsCell {
         let prefix = if pr_deleted.contains(add) { ' ' } else { '+' };
         SbsCell {
+            gutter: gutter(&[None], nw), // the worktree has not numbered it yet
             chunks: wrap_hard(&format!("{prefix}{}", add.replace('\t', "    ")), rtw.max(1)),
             style: theme::local_add(),
             marker: "▎",
@@ -846,7 +911,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         if let (Some(ov), false) = (&overlay, top_done) {
             if row.right.and_then(new_side).is_some() {
                 for add in &ov.adds_top {
-                    push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(), local_cell(add));
+                    push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
                 }
                 top_done = true;
             }
@@ -855,13 +920,15 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             let Some(i) = row.line() else { continue };
             let ln = &diff_lines[i];
             let style = theme::diff_line_style(ln, false);
-            for chunk in wrap_hard(&ln.replace('\t', "    "), iw.saturating_sub(1)) {
+            let tw = iw.saturating_sub(1 + gw);
+            for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
                 if out.len() >= vh {
                     break;
                 }
                 out.push(Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(pad(&chunk, iw.saturating_sub(1)), style),
+                    Span::styled(gutter(&[None], nw), theme::dim()),
+                    Span::styled(pad(&chunk, tw), style),
                 ]));
             }
         } else {
@@ -876,7 +943,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         // Local additions inserted after this head line (orange, new side).
         if let (Some(ov), Some(l)) = (&overlay, row.right.and_then(new_side)) {
             for add in ov.adds_after.get(&l).into_iter().flatten() {
-                push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(), local_cell(add));
+                push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
             }
         }
         // Pending comments anchored to either side, spanning both columns.
@@ -1007,10 +1074,16 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         .map(|l| &l[1..])
         .collect();
 
-    let tw = iw.saturating_sub(1); // text width (1 col for the marker)
+    // The gutter carries both line numbers, old then new; the text column takes
+    // what is left after the marker.
+    let nw = fit_num_width(num_width(info_here), 2, iw.saturating_sub(1), 16);
+    let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
+    let blank = gutter(&[None, None], nw);
+    let tw = iw.saturating_sub(1 + gw); // text width (1 col for the marker)
     // Emit local additions (orange, "▎" marker) — as many wrapped rows as fit.
     // Keep the diff column aligned: real additions/edits get a `+`, a restored
-    // line gets a space so it lines up with the surrounding context.
+    // line gets a space so it lines up with the surrounding context. The
+    // worktree has not numbered them yet, so their gutter stays blank.
     let push_adds = |out: &mut Vec<Line>, adds: &[String]| {
         for add in adds {
             let prefix = if pr_deleted.contains(add.as_str()) { ' ' } else { '+' };
@@ -1022,6 +1095,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
                 let marker = if k > 0 { " " } else { "▎" };
                 out.push(Line::from(vec![
                     Span::styled(marker, theme::local_marker()),
+                    Span::styled(blank.clone(), theme::dim()),
                     Span::styled(pad(&chunk, tw), theme::local_add()),
                 ]));
             }
@@ -1068,12 +1142,19 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
             Style::default()
         };
         // Wrap long lines onto continuation rows so nothing is cut off.
+        let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
+        let g = gutter(&[nos.0, nos.1], nw);
         for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw).into_iter().enumerate() {
             if out.len() >= vh {
                 break;
             }
             let marker = if k > 0 { " " } else { base_marker };
-            out.push(Line::from(vec![Span::styled(marker, m_style), Span::styled(pad(&chunk, tw), style)]));
+            let g = if k > 0 { blank.clone() } else { g.clone() };
+            out.push(Line::from(vec![
+                Span::styled(marker, m_style),
+                Span::styled(g, theme::dim()),
+                Span::styled(pad(&chunk, tw), style),
+            ]));
         }
         // Local additions inserted after this head line (orange).
         if let (Some(ov), Some(l)) = (&overlay, new_side) {
@@ -1209,7 +1290,6 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let inner = b.inner(area);
     f.render_widget(b, area);
     let (vh, iw) = (inner.height as usize, inner.width as usize);
-    let tw = iw.saturating_sub(1);
 
     let empty = Vec::new();
     let lines_vec = path.as_ref().and_then(|p| st.edit_diff_by_file.get(p)).unwrap_or(&empty);
@@ -1218,17 +1298,27 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
         f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
         return;
     }
+    let info = path.as_ref().and_then(|p| st.edit_info_by_file.get(p));
+    let nw = fit_num_width(num_width(info), 2, iw, 16);
+    let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
+    let tw = iw.saturating_sub(gw);
     st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
     let mut out: Vec<Line> = Vec::new();
     let mut i = st.edit_diff_scroll;
     while out.len() < vh && i < lines_vec.len() {
         let ln = &lines_vec[i];
         let style = theme::diff_line_style(ln, false);
-        for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
+        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
+        let g = gutter(&[old, new], nw);
+        for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw.max(1)).into_iter().enumerate() {
             if out.len() >= vh {
                 break;
             }
-            out.push(Line::from(Span::styled(pad(&chunk, tw), style)));
+            let g = if k > 0 { " ".repeat(gw) } else { g.clone() };
+            out.push(Line::from(vec![
+                Span::styled(g, theme::dim()),
+                Span::styled(pad(&chunk, tw), style),
+            ]));
         }
         i += 1;
     }

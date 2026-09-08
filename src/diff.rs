@@ -39,6 +39,12 @@ pub fn parse_diff(raw: &str) -> (HashMap<String, Vec<String>>, HashMap<String, V
     macro_rules! flush {
         () => {
             if let Some(path) = current.take() {
+                // `split('\n')` leaves a trailing empty row on a diff that ends
+                // with a newline. It is not a line of the file.
+                if buf.len() > 1 && buf.last().map_or(false, String::is_empty) {
+                    buf.pop();
+                    info.pop();
+                }
                 per_file.insert(path.clone(), std::mem::take(&mut buf));
                 per_info.insert(path, std::mem::take(&mut info));
             }
@@ -363,6 +369,13 @@ mod tests {
     }
 
     #[test]
+    fn the_trailing_newline_is_not_a_line() {
+        let (files, info) = parse_diff(&sample());
+        assert_eq!(files["foo.py"].last().map(String::as_str), Some("+fresh"));
+        assert_eq!(info["foo.py"].len(), files["foo.py"].len());
+    }
+
+    #[test]
     fn hunks_are_change_blocks() {
         let (files, _) = parse_diff(&sample());
         let fl = &files["foo.py"];
@@ -569,7 +582,6 @@ mod tests {
                 (Some("@@ -10,2 +11,2 @@"), None, true),
                 (Some(" keep"), Some(" keep"), false),
                 (Some("-gone"), Some("+fresh"), false),
-                (Some(""), Some(""), false), // trailing artifact of the split
             ]
         );
     }
@@ -590,7 +602,6 @@ mod tests {
                 (Some(i("-a")), Some(i("+A"))),
                 (Some(i(" ctx")), Some(i(" ctx"))),
                 (Some(i("-b")), Some(i("+B"))),
-                (Some(i("")), Some(i(""))),
             ]
         );
     }

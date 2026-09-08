@@ -9,7 +9,7 @@ use ghreview::ui;
 
 fn review_state() -> State {
     let raw = "diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n\
-               @@ -1,4 +1,5 @@\n keep\n-old\n+new\n+extra\n tail\n";
+               @@ -8,4 +8,5 @@\n keep\n-old\n+new\n+extra\n tail\n";
     let mut st = State::default();
     st.files = vec![FileEntry { path: "f.txt".into(), viewed: false }];
     st.tree = vec![TreeRow::File { depth: 0, name: "f.txt".into(), index: 0 }];
@@ -57,6 +57,51 @@ fn side_by_side_puts_the_old_line_across_from_the_new_one() {
 }
 
 #[test]
+fn side_by_side_numbers_the_old_side_left_and_the_new_side_right() {
+    let mut st = review_state();
+    st.side_by_side = true;
+    let out = screen(&mut st, 160, 30);
+
+    // `-old` is old line 9, and the `+new` that replaces it is new line 9.
+    let row = row_with(&out, "-old");
+    assert!(row.contains("9 -old"), "{row}");
+    assert!(row.contains("9 +new"), "{row}");
+
+    // The unpaired addition numbers the new side alone.
+    let row = row_with(&out, "+extra");
+    assert!(row.contains("10 +extra"), "{row}");
+
+    // Context carries a number on each side, and the two sides drift apart
+    // after the extra line: old 10, new 11.
+    let row = row_with(&out, "tail");
+    assert!(row.contains("10  tail"), "{row}");
+    assert!(row.contains("11  tail"), "{row}");
+}
+
+#[test]
+fn inline_numbers_both_sides_in_one_gutter() {
+    let mut st = review_state();
+    let out = screen(&mut st, 160, 30);
+    assert!(!out.contains("old | new"), "the inline view: {out}");
+
+    // Old then new, and a changed line only fills its own side.
+    assert!(row_with(&out, " keep").contains("8   8  keep"), "{out}");
+    assert!(row_with(&out, "-old").contains("9     -old"), "{out}");
+    assert!(row_with(&out, "+new").contains("9 +new"), "{out}");
+    assert!(row_with(&out, " tail").contains("10  11  tail"), "{out}");
+}
+
+#[test]
+fn a_narrow_pane_drops_the_gutter_rather_than_the_code() {
+    let mut st = review_state();
+    st.side_by_side = true;
+    let out = screen(&mut st, 58, 14);
+    let row = row_with(&out, "-old");
+    assert!(row.contains("+new"), "both columns still readable: {row}");
+    assert!(!row.contains('8') && !row.contains('9'), "no room for the gutter: {row}");
+}
+
+#[test]
 fn side_by_side_narrows_the_left_pane_and_the_inline_view_gives_it_back() {
     let mut st = review_state();
     let area = ratatui::layout::Rect::new(0, 0, 160, 30);
@@ -77,7 +122,7 @@ fn side_by_side_keeps_the_inline_pending_comment() {
     st.pending = vec![PendingComment {
         path: "f.txt".into(),
         body: "needs a test".into(),
-        line: 2,
+        line: 9,
         side: "RIGHT".into(),
         comment_id: "local-1".into(),
         start_line: None,

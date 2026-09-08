@@ -140,6 +140,10 @@ Diff pane:
   - `Space` — stage / unstage the selected change block (lazygit-style)
   - `h` / `l` — move between the two columns of a partly-staged file
 
+Every diff carries a line-number gutter, dimmed on the left of the code: the old
+number then the new one inline, and one number per column side by side. A pane
+too narrow to hold both the numbers and the code drops the gutter.
+
 `s` draws the review diff side by side: the old side on the left, the new side
 on the right, and the left panes shrink to make room. Each deletion sits across
 from the addition that replaces it; an unpaired change leaves the other column
