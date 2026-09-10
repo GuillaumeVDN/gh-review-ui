@@ -49,6 +49,47 @@ pub fn sh_cwd(dir: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Why `gh` cannot reach GitHub right now, if it cannot.
+///
+/// `gh auth status` reports a spent rate limit as "the token in keyring is
+/// invalid", which sends the reader to `gh auth login` for something a login
+/// cannot fix. The verdict comes from the API's own response instead.
+pub fn auth_problem() -> Option<String> {
+    match Command::new("gh").args(["auth", "status"]).output() {
+        Err(e) => return Some(format!("gh not found: {e}")),
+        Ok(o) if o.status.success() => return None,
+        Ok(_) => {}
+    }
+    let out = Command::new("gh").args(["api", "-i", "user"]).output().ok()?;
+    let head = String::from_utf8_lossy(&out.stdout);
+    Some(api_problem(&head).unwrap_or_else(|| "gh is not authenticated. Run `gh auth login` first.".into()))
+}
+
+/// Pure half of [`auth_problem`]: the verdict for one HTTP response head.
+pub fn api_problem(head: &str) -> Option<String> {
+    let status = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok())?;
+    let header = |name: &str| {
+        head.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with(name))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+    };
+    if status == 403 && header("x-ratelimit-remaining").as_deref() == Some("0") {
+        let limit = header("x-ratelimit-limit").unwrap_or_else(|| "?".into());
+        return Some(format!(
+            "GitHub rate limit spent ({limit}/h, counted per account). The gh login is fine: \
+             `gh auth status` reports a spent quota as an invalid token."
+        ));
+    }
+    if status == 401 {
+        return Some("gh is not authenticated. Run `gh auth login` first.".into());
+    }
+    if status >= 400 {
+        return Some(format!("github answered {status} to `gh api user`."));
+    }
+    None
+}
+
 /// Run `gh <args>` and parse its JSON stdout.
 pub fn gh_json(args: &[&str]) -> Result<Value> {
     let mut full = vec!["gh"];
@@ -90,4 +131,32 @@ pub fn gh_graphql(query: &str, vars: &[(&str, Var)]) -> Result<Value> {
         }
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spent quota answers 403 with the counters, not 401. Read as a dead
+    /// token it sends the reader to `gh auth login`, which then answers that
+    /// they were already logged in.
+    #[test]
+    fn a_spent_rate_limit_is_not_a_broken_login() {
+        let head = "HTTP/2 403\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 0\r\n\r\n";
+        let p = api_problem(head).expect("it has a verdict");
+        assert!(p.contains("rate limit spent (5000/h"), "{p}");
+        assert!(p.contains("login is fine"), "{p}");
+    }
+
+    #[test]
+    fn a_dead_token_still_reads_as_a_login_problem() {
+        let head = "HTTP/2 401\r\nx-ratelimit-remaining: 4999\r\n\r\n";
+        assert!(api_problem(head).unwrap().contains("gh auth login"));
+    }
+
+    #[test]
+    fn a_working_call_explains_nothing() {
+        assert_eq!(api_problem("HTTP/2 200\r\n\r\n"), None);
+        assert_eq!(api_problem(""), None);
+    }
 }

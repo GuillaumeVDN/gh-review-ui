@@ -58,9 +58,13 @@ fn main() -> ExitCode {
         }
     }
 
-    // Fail fast if gh isn't authenticated (same guard as the old CLI).
-    if ghreview::gh::sh(&["gh", "auth", "status"]).is_err() {
-        eprintln!("gh is not authenticated. Run `gh auth login` first.");
+    // Fail fast if gh cannot reach GitHub. The window this runs in closes
+    // when we exit, so the reason is held until it is read: a terminal that
+    // flashes and vanishes says nothing at all.
+    if let Some(problem) = ghreview::gh::auth_problem() {
+        eprintln!("{problem}");
+        eprint!("Press Enter to close. ");
+        let _ = std::io::stdin().read_line(&mut String::new());
         return ExitCode::FAILURE;
     }
     match ghreview::app::run(open_file, open_commit, open_edits) {
