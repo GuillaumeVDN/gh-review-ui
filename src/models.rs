@@ -281,6 +281,9 @@ pub struct State {
     pub edit_tree: Vec<TreeRow>,
     pub edit_idx: usize,
     pub edit_offset: usize,
+    /// Set when `space` stages from [4]: the jump to the next unstaged file
+    /// waits for the reload, because git decides what is staged.
+    pub stage_advance: bool,
     /// Everything changed vs HEAD (staged + unstaged), shown whenever a file
     /// sits entirely on one side of the index.
     pub edit_diff_by_file: DiffMap,

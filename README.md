@@ -100,7 +100,9 @@ The right pane shows the selected commit's short SHA, author, date, and message.
 Files pane:
 - `j` / `k` — move (over files *and* folders)
 - `Alt+j` / `Alt+k` — jump to the next / previous file, skipping folder rows
-- `Space` — toggle viewed on file, or on all files under a folder
+- `Space` — toggle viewed on file, or on all files under a folder. A mark does
+  what `z` does next: it folds every fully-viewed folder and jumps to the first
+  unviewed file.
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `e` — open the selected file in the editor (top of file)
 - `s` — switch the review diff between inline and side by side
@@ -112,7 +114,8 @@ tree is clean:
 - `j` / `k` — move (`Alt+j` / `Alt+k` skip folder rows)
 - `Space` — stage / unstage the file (or every file under a folder). The mark on
   the left is the pane's "viewed" equivalent: `[ ]` unstaged, `[~]` partly
-  staged, `[✔]` fully staged (dimmed).
+  staged, `[✔]` fully staged (dimmed). Staging does what `z` does next: it folds
+  every fully-staged folder and jumps to the first unstaged file.
 - `Enter` — show the file's local diff in the diff pane, with hunk navigation
 - `c` — commit; what is staged is what gets committed. With an empty index the
   whole list is committed, as before.

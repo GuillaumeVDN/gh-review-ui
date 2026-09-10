@@ -341,6 +341,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             // Merge edit-only files (new/deleted/renamed, not in the PR diff) into
             // the Files tree so [3] shows them too (item 7).
             merge_edit_files_into_tree(st);
+            // The staging this reload carries came from `space` in [4], which
+            // moves on like `z` once git confirms the file is staged.
+            if std::mem::take(&mut st.stage_advance) {
+                fold_staged(st);
+            }
         }
         Msg::HookLine(line) => {
             if let Overlay::Hooks { lines, .. } = &mut st.overlay {
@@ -394,6 +399,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         }
         Msg::Error { kind, msg } => {
             st.busy.remove(&kind);
+            if kind == "edits" {
+                st.stage_advance = false;
+            }
             // git itself failed rather than the hooks; the window still holds
             // the output, so it stays and turns red like any other refusal.
             if kind == "editcommit" {
@@ -976,8 +984,16 @@ fn local_mark_note(local_only: usize) -> String {
 }
 
 pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
+    if apply_mark(st, tx) == Some(true) {
+        fold_viewed(st);
+    }
+}
+
+/// The mark itself. `Some(true)` when it turned the target viewed, which is
+/// what makes the cursor move on.
+fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
     if st.file_idx >= st.tree.len() || st.active_pr.is_none() || st.busy.contains("viewed") {
-        return;
+        return None;
     }
     let pr_id = st.active_pr.as_ref().unwrap().node_id.clone();
     match st.tree[st.file_idx].clone() {
@@ -993,16 +1009,17 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
                     if new_v { "Marked" } else { "Unmarked" },
                     local_mark_note(1)
                 );
-                return;
+                return Some(new_v);
             }
             st.viewed_inflight = Some((vec![path.clone()], new_v));
             st.status = format!("{} {path}…", if new_v { "Marking" } else { "Unmarking" });
             submit(st, tx, Job::MarkViewed { pr_id, path, viewed: new_v });
+            Some(new_v)
         }
         crate::models::TreeRow::Dir { path, .. } => {
             let idxs = tree::files_under_dir(st, &path);
             if idxs.is_empty() {
-                return;
+                return None;
             }
             let all_v = idxs.iter().all(|&i| st.files[i].viewed);
             let new_v = !all_v;
@@ -1012,7 +1029,7 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
                 .map(|&i| st.files[i].path.clone())
                 .collect();
             if paths.is_empty() {
-                return;
+                return None;
             }
             // Optimistic update for the whole batch.
             for f in st.files.iter_mut() {
@@ -1032,11 +1049,12 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
             if on_pr.is_empty() {
                 let verb = if new_v { "Marked" } else { "Unmarked" };
                 st.status = format!("{verb} {} files in {path}/{note}", local_only.len());
-                return;
+                return Some(new_v);
             }
             st.viewed_inflight = Some((on_pr.clone(), new_v));
             st.status = format!("{verb} {} files in {path}/…{note}", on_pr.len());
             submit(st, tx, Job::MarkViewedBulk { pr_id, paths: on_pr, viewed: new_v });
+            Some(new_v)
         }
     }
 }
@@ -1164,6 +1182,7 @@ pub fn toggle_stage(st: &mut State, tx: &Sender<Job>) {
     let unstage = paths.iter().all(|p| stage_state(st, p) == StageState::Staged);
     // Optimistic wording: a failure comes back as an Error and overwrites this.
     st.status = format!("{} {label}", if unstage { "Unstaged" } else { "Staged" });
+    st.stage_advance = !unstage;
     let wt = st.active_worktree.clone();
     submit(st, tx, Job::Stage { wt, paths, patch: None, unstage });
 }
@@ -1864,13 +1883,118 @@ mod tests {
         assert!(rx.try_iter().next().is_none(), "and nothing was sent to GitHub");
         assert!(st.viewed_inflight.is_none(), "so there is nothing to revert");
 
-        st.file_idx = 0;
+        st.file_idx = st
+            .tree
+            .iter()
+            .position(|r| matches!(r, TreeRow::File { index: 0, .. }))
+            .expect("on_pr.rs is in the tree");
         mark_viewed(&mut st, &tx);
         let jobs: Vec<Job> = rx.try_iter().collect();
         assert!(
             jobs.iter().any(|j| matches!(j, Job::MarkViewed { path, .. } if path == "on_pr.rs")),
             "a file the PR has goes to the API as before"
         );
+    }
+
+    /// git decides what is staged, so the jump waits for the reload the stage
+    /// job sends back.
+    #[test]
+    fn staging_a_file_lands_on_the_next_unstaged_one() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_worktree = "/tmp/wt".into();
+        st.edit_files = vec![edit("a.rs"), edit("b.rs")];
+        crate::tree::rebuild_edits(&mut st);
+        st.edit_idx = st
+            .edit_tree
+            .iter()
+            .position(|r| matches!(r, TreeRow::File { index: 0, .. }))
+            .expect("a.rs is in the tree");
+
+        toggle_stage(&mut st, &tx);
+        assert!(st.stage_advance, "the cursor moves once git confirms");
+
+        let staged: crate::models::DiffMap =
+            [("a.rs".to_string(), vec!["@@".to_string()])].into_iter().collect();
+        apply_msg(
+            &mut st,
+            Msg::Edits(crate::api::Edits {
+                files: vec![edit("a.rs"), edit("b.rs")],
+                combined: Default::default(),
+                unstaged: Default::default(),
+                staged: (staged, Default::default()),
+            }),
+            &tx,
+        );
+        assert!(!st.stage_advance);
+        assert!(
+            matches!(st.edit_tree.get(st.edit_idx), Some(TreeRow::File { index: 1, .. })),
+            "b.rs is what is left to stage"
+        );
+    }
+
+    /// Unstaging says "not done after all", so the cursor stays put.
+    #[test]
+    fn unstaging_a_file_keeps_the_cursor_where_it_is() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_worktree = "/tmp/wt".into();
+        st.edit_files = vec![edit("a.rs"), edit("b.rs")];
+        st.staged_diff_by_file.insert("a.rs".into(), vec!["@@".into()]);
+        crate::tree::rebuild_edits(&mut st);
+        st.edit_idx = st
+            .edit_tree
+            .iter()
+            .position(|r| matches!(r, TreeRow::File { index: 0, .. }))
+            .expect("a.rs is in the tree");
+
+        toggle_stage(&mut st, &tx);
+        assert!(!st.stage_advance);
+    }
+
+    /// `space` reads as "done with this one": the cursor moves on the way `z`
+    /// does, so a review walks the list with one key.
+    #[test]
+    fn marking_a_file_viewed_lands_on_the_next_unviewed_one() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.files = vec![
+            FileEntry { path: "a.rs".into(), viewed: false },
+            FileEntry { path: "b.rs".into(), viewed: true },
+            FileEntry { path: "c.rs".into(), viewed: false },
+        ];
+        st.tree = vec![
+            TreeRow::File { index: 0, depth: 0, name: "a.rs".into() },
+            TreeRow::File { index: 1, depth: 0, name: "b.rs".into() },
+            TreeRow::File { index: 2, depth: 0, name: "c.rs".into() },
+        ];
+
+        st.file_idx = 0;
+        mark_viewed(&mut st, &tx);
+        assert!(st.files[0].viewed);
+        assert_eq!(st.file_idx, 2, "b.rs is already viewed, so it is skipped");
+    }
+
+    /// Unmarking says "not done after all", so the cursor stays on the file.
+    #[test]
+    fn unmarking_a_file_keeps_the_cursor_where_it_is() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.files = vec![
+            FileEntry { path: "a.rs".into(), viewed: true },
+            FileEntry { path: "b.rs".into(), viewed: false },
+        ];
+        st.tree = vec![
+            TreeRow::File { index: 0, depth: 0, name: "a.rs".into() },
+            TreeRow::File { index: 1, depth: 0, name: "b.rs".into() },
+        ];
+
+        st.file_idx = 0;
+        mark_viewed(&mut st, &tx);
+        assert!(!st.files[0].viewed);
+        assert_eq!(st.file_idx, 0);
     }
 
     fn edit(path: &str) -> crate::models::EditEntry {
