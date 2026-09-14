@@ -312,7 +312,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('C') => checkout_local(st, tx),
-            KeyCode::Char('o') => open_pr_browser(st),
+            KeyCode::Char('g') => open_pr_browser(st),
             _ => {}
         },
         Focus::Commits => match k.code {
