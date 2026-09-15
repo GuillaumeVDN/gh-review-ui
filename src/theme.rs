@@ -1,14 +1,81 @@
 //! Colors and diff/highlight styling (ratatui `Style`s).
 
+use std::sync::OnceLock;
+
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::markdown::Kind;
 
-// Highlighted-hunk band: dark fixed fg on a light cyan bg so +/- text stays
-// readable regardless of how the terminal theme remaps the base green/red.
-const HL_BG: Color = Color::Indexed(152); // light cyan
-const HL_ADD: Color = Color::Indexed(22); // dark green
-const HL_DEL: Color = Color::Indexed(88); // dark red
+/// Whether the terminal paints on a dark or a light ground.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Appearance {
+    Dark,
+    Light,
+}
+
+/// The diff backgrounds, one set per terminal appearance.
+///
+/// Added and deleted lines carry the diff meaning in the background, so the
+/// code on them keeps its syntax colors. The focused change block takes the
+/// brighter pair of the same two hues.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub add_bg: Color,
+    pub del_bg: Color,
+    pub add_bg_current: Color,
+    pub del_bg_current: Color,
+}
+
+const DARK: Palette = Palette {
+    add_bg: Color::Indexed(22),
+    del_bg: Color::Indexed(52),
+    add_bg_current: Color::Indexed(28),
+    del_bg_current: Color::Indexed(88),
+};
+
+const LIGHT: Palette = Palette {
+    add_bg: Color::Indexed(194),
+    del_bg: Color::Indexed(224),
+    add_bg_current: Color::Indexed(157),
+    del_bg_current: Color::Indexed(217),
+};
+
+/// The terminal appearance, from `GH_REVIEW_UI_THEME` or `COLORFGBG`.
+///
+/// `COLORFGBG` holds `fg;bg`, and some terminals put a third field between the
+/// two. The background index is the last field.
+pub fn detect_appearance(forced: Option<&str>, colorfgbg: Option<&str>) -> Appearance {
+    match forced.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("light") => return Appearance::Light,
+        Some("dark") => return Appearance::Dark,
+        _ => {}
+    }
+    let bg = colorfgbg
+        .and_then(|v| v.rsplit(';').next())
+        .and_then(|v| v.trim().parse::<u8>().ok());
+    match bg {
+        Some(0..=6) | Some(8) => Appearance::Dark,
+        Some(7) | Some(15) => Appearance::Light,
+        _ => Appearance::Dark,
+    }
+}
+
+pub fn appearance() -> Appearance {
+    static FOUND: OnceLock<Appearance> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        detect_appearance(
+            std::env::var("GH_REVIEW_UI_THEME").ok().as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        )
+    })
+}
+
+pub fn palette() -> &'static Palette {
+    match appearance() {
+        Appearance::Dark => &DARK,
+        Appearance::Light => &LIGHT,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiffKind {
@@ -37,19 +104,45 @@ pub fn classify_diff_line(line: &str) -> DiffKind {
     }
 }
 
-/// Style for a diff line. In the focused hunk only actual changed (+/-) lines
-/// get the background band; context/header keep normal styling.
+/// The background a diff row sits on: a tint for a changed line, nothing for
+/// context and headers. The focused change block takes the brighter tint.
+pub fn diff_row_style(kind: DiffKind, current: bool) -> Style {
+    let p = palette();
+    match (kind, current) {
+        (DiffKind::Add, false) => Style::default().bg(p.add_bg),
+        (DiffKind::Add, true) => Style::default().bg(p.add_bg_current),
+        (DiffKind::Del, false) => Style::default().bg(p.del_bg),
+        (DiffKind::Del, true) => Style::default().bg(p.del_bg_current),
+        _ => Style::default(),
+    }
+}
+
+/// The `+` / `-` of a changed line, in the gutter.
+pub fn diff_marker_style(kind: DiffKind, current: bool) -> Style {
+    let fg = match kind {
+        DiffKind::Add => Color::Green,
+        DiffKind::Del => Color::Red,
+        _ => return diff_row_style(kind, current),
+    };
+    diff_row_style(kind, current).fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// The line numbers of a diff row: the change color for a changed line, dim
+/// for everything else.
+pub fn diff_number_style(kind: DiffKind, current: bool) -> Style {
+    match kind {
+        DiffKind::Add => diff_row_style(kind, current).fg(Color::Green),
+        DiffKind::Del => diff_row_style(kind, current).fg(Color::Red),
+        _ => dim(),
+    }
+}
+
+/// Style for a whole diff line, code included. The panes that color the code
+/// itself use [`diff_row_style`] and the syntax colors instead.
 pub fn diff_line_style(line: &str, current: bool) -> Style {
     let k = classify_diff_line(line);
-    if current && matches!(k, DiffKind::Add | DiffKind::Del) {
-        return match k {
-            DiffKind::Add => Style::default().fg(HL_ADD).bg(HL_BG),
-            _ => Style::default().fg(HL_DEL).bg(HL_BG),
-        };
-    }
     match k {
-        DiffKind::Add => Style::default().fg(Color::Green),
-        DiffKind::Del => Style::default().fg(Color::Red),
+        DiffKind::Add | DiffKind::Del => diff_marker_style(k, current),
         DiffKind::Hunk => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         DiffKind::Meta => Style::default().add_modifier(Modifier::BOLD),
         DiffKind::Context => Style::default(),
@@ -177,6 +270,38 @@ mod tests {
         assert_eq!(classify_diff_line("-gone"), DiffKind::Del);
         assert_eq!(classify_diff_line("@@ -1 +1 @@"), DiffKind::Hunk);
         assert_eq!(classify_diff_line(" ctx"), DiffKind::Context);
+    }
+
+    #[test]
+    fn the_env_var_wins_over_colorfgbg() {
+        assert_eq!(detect_appearance(Some("light"), Some("0;15")), Appearance::Light);
+        assert_eq!(detect_appearance(Some("Dark"), Some("0;15")), Appearance::Dark);
+        assert_eq!(detect_appearance(Some("nonsense"), Some("15;0")), Appearance::Dark);
+    }
+
+    #[test]
+    fn colorfgbg_reads_the_background_field() {
+        assert_eq!(detect_appearance(None, Some("15;0")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, Some("15;8")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, Some("0;15")), Appearance::Light);
+        assert_eq!(detect_appearance(None, Some("0;7")), Appearance::Light);
+        // Some terminals write a third field between the two colors.
+        assert_eq!(detect_appearance(None, Some("0;default;15")), Appearance::Light);
+        assert_eq!(detect_appearance(None, Some("12;default;0")), Appearance::Dark);
+        // Anything unreadable falls back to dark.
+        assert_eq!(detect_appearance(None, Some("")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, Some("0;12")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None), Appearance::Dark);
+    }
+
+    #[test]
+    fn the_focused_block_keeps_its_own_tint() {
+        for kind in [DiffKind::Add, DiffKind::Del] {
+            let (plain, current) = (diff_row_style(kind, false), diff_row_style(kind, true));
+            assert!(plain.bg.is_some() && current.bg.is_some());
+            assert_ne!(plain.bg, current.bg);
+        }
+        assert!(diff_row_style(DiffKind::Context, true).bg.is_none());
     }
 
     #[test]
