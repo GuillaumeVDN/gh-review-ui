@@ -147,6 +147,25 @@ Every diff carries a line-number gutter, dimmed on the left of the code: the old
 number then the new one inline, and one number per column side by side. A pane
 too narrow to hold both the numbers and the code drops the gutter.
 
+### Colors
+
+The code in a diff wears syntax colors, for every language
+[syntect](https://github.com/trishume/syntect) ships a syntax for. The language
+comes from the file extension, then from the first line; a file neither answers
+for stays plain. Each file is parsed twice, once per side of the diff, so a
+deleted line and the line that replaces it each read as their own text.
+
+Green and red are left to the diff itself. The `+` / `-` marker and the line
+numbers wear them, and the changed line sits on a green or a red background. The
+focused change block takes the brighter pair of the same two hues, next to the
+`▌` side-bar.
+
+Those backgrounds come in a dark and a light set:
+
+- `GH_REVIEW_UI_THEME=dark` or `GH_REVIEW_UI_THEME=light` picks one;
+- else the app reads `COLORFGBG` (`fg;bg`), which most terminals export;
+- else it takes the dark set.
+
 `s` draws the review diff side by side: the old side on the left, the new side
 on the right, and the left panes shrink to make room. Each deletion sits across
 from the addition that replaces it; an unpaired change leaves the other column
@@ -261,6 +280,7 @@ The crate (`src/`) is split so almost all logic is UI-free and unit-tested:
 | `tree` | file-tree building and folding |
 | `navigation` | cursor / hunk / selection logic over `State` |
 | `theme` | ratatui `Style`s + diff/highlight helpers |
+| `syntax` | syntect parsing of diff code, cached per file |
 | `textbuffer` | modal text editor + soft-wrapping |
 | `worker` | background thread running blocking `gh`/`git` jobs |
 | `controller` | state transitions + job orchestration |

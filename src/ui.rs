@@ -17,8 +17,10 @@ use crate::navigation::{
     current_hunk_range, diff_path, hunk_for_comment, is_local_diff, is_split, source_maps,
     stage_state,
 };
+use crate::syntax::StyledLine;
 use crate::textbuffer;
 use crate::theme;
+use crate::theme::DiffKind;
 
 /// Rectangles of the five left panes + the right pane (for mouse hit-testing).
 pub struct PaneRects {
@@ -153,6 +155,105 @@ fn wrap_hard(s: &str, width: usize) -> Vec<String> {
         return vec![String::new()];
     }
     chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
+
+/// Hard-wrap styled pieces into rows of at most `width` columns, splitting a
+/// piece that straddles a row edge. Empty input yields one empty row.
+fn wrap_styled_hard(spans: &[(Style, String)], width: usize) -> Vec<Vec<(Style, String)>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<(Style, String)>> = vec![Vec::new()];
+    let mut col = 0usize;
+    for (style, text) in spans {
+        let mut chars = text.chars().peekable();
+        while chars.peek().is_some() {
+            if col == width {
+                rows.push(Vec::new());
+                col = 0;
+            }
+            let piece: String = chars.by_ref().take(width - col).collect();
+            col += piece.chars().count();
+            match rows.last_mut().expect("one row is always open").last_mut() {
+                Some((s, t)) if s == style => t.push_str(&piece),
+                _ => rows.last_mut().expect("one row is always open").push((*style, piece)),
+            }
+        }
+    }
+    rows
+}
+
+/// The pieces of one diff row's text column: the `+`/`-`/` ` marker, then the
+/// code with its syntax colors (plain when the language is unknown).
+fn code_spans(line: &str, hl: Option<&StyledLine>, current: bool) -> Vec<(Style, String)> {
+    let kind = theme::classify_diff_line(line);
+    if !matches!(kind, DiffKind::Add | DiffKind::Del | DiffKind::Context) {
+        return vec![(theme::diff_line_style(line, false), line.replace('\t', "    "))];
+    }
+    let (marker, rest) = match line.chars().next() {
+        Some(c @ ('+' | '-' | ' ')) => (c, &line[1..]),
+        _ => (' ', line),
+    };
+    let mut out = vec![(theme::diff_marker_style(kind, current), marker.to_string())];
+    match hl {
+        Some(h) if !h.is_empty() => out.extend(h.iter().cloned()),
+        _ => out.push((Style::default(), rest.replace('\t', "    "))),
+    }
+    out
+}
+
+/// One diff line to draw: its text, its syntax colors and what it is to the
+/// reader right now (focused block, comment picker, locally deleted).
+struct DiffRow<'a> {
+    line: &'a str,
+    hl: Option<&'a StyledLine>,
+    nos: &'a [Option<i64>],
+    current: bool,
+    selected: bool,
+    local_del: bool,
+}
+
+/// Emit the display rows of one diff line: the marker column, the line-number
+/// gutter, then the code wrapped to `tw`. The background carries the `+`/`-`
+/// meaning, so the code keeps its syntax colors.
+fn push_diff_rows(out: &mut Vec<Line<'static>>, vh: usize, row: &DiffRow, nw: usize, tw: usize, with_marker: bool) {
+    let kind = theme::classify_diff_line(row.line);
+    let bg = theme::diff_row_style(kind, row.current);
+    let text_style = if row.selected { bg.add_modifier(Modifier::REVERSED) } else { bg };
+    let spans = if row.local_del {
+        vec![(theme::local_del(), row.line.replace('\t', "    "))]
+    } else {
+        code_spans(row.line, row.hl, row.current)
+    };
+    let (marker, m_style) = if row.selected {
+        ("▶", theme::focus())
+    } else if row.local_del {
+        ("▎", theme::local_marker())
+    } else if row.current {
+        ("▌", theme::hunk_marker())
+    } else {
+        (" ", Style::default())
+    };
+    let num_style = if row.local_del { theme::local_marker() } else { theme::diff_number_style(kind, row.current) };
+    let g = gutter(row.nos, nw);
+    let gw = g.chars().count();
+    for (k, chunk) in wrap_styled_hard(&spans, tw.max(1)).into_iter().enumerate() {
+        if out.len() >= vh {
+            return;
+        }
+        let mut parts: Vec<Span<'static>> = Vec::new();
+        if with_marker {
+            parts.push(Span::styled(if k == 0 { marker } else { " " }, m_style.patch(bg)));
+        }
+        parts.push(Span::styled(if k == 0 { g.clone() } else { " ".repeat(gw) }, num_style.patch(bg)));
+        let mut used = 0usize;
+        for (style, text) in chunk {
+            used += text.chars().count();
+            parts.push(Span::styled(text, style.patch(text_style)));
+        }
+        if used < tw {
+            parts.push(Span::styled(" ".repeat(tw - used), text_style));
+        }
+        out.push(Line::from(parts));
+    }
 }
 
 /// Columns one line number takes in a diff gutter, from the file's largest one.
@@ -601,12 +702,12 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
 fn diff_column_rows(
     lines: &[String],
     info: Option<&Vec<LineInfo>>,
-    scroll: usize,
-    vh: usize,
-    tw: usize,
+    hl: &[StyledLine],
+    view: (usize, usize, usize),
     cur: Option<(usize, usize)>,
     sel: (usize, usize),
 ) -> Vec<Line<'static>> {
+    let (scroll, vh, tw) = view;
     // The column is narrow, so it carries the new-side number alone.
     let nw = fit_num_width(num_width(info), 1, tw, 12);
     let gw = if nw == 0 { 0 } else { nw + 1 };
@@ -614,41 +715,16 @@ fn diff_column_rows(
     let mut out: Vec<Line> = Vec::new();
     let mut i = scroll;
     while out.len() < vh && i < lines.len() {
-        let ln = &lines[i];
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
-        let g = gutter(&[new.or(old)], nw);
-        let current = cur.map_or(false, |(s, e)| s <= i && i < e);
-        let selected = sel.0 <= i && i <= sel.1;
-        let mut style = theme::diff_line_style(ln, current);
-        if selected {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        let base_marker = if selected {
-            "▶"
-        } else if current {
-            "▌"
-        } else {
-            " "
+        let row = DiffRow {
+            line: &lines[i],
+            hl: hl.get(i),
+            nos: &[new.or(old)],
+            current: cur.map_or(false, |(s, e)| s <= i && i < e),
+            selected: sel.0 <= i && i <= sel.1,
+            local_del: false,
         };
-        let m_style = if selected {
-            theme::focus()
-        } else if current {
-            theme::hunk_marker()
-        } else {
-            Style::default()
-        };
-        for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw.max(1)).into_iter().enumerate() {
-            if out.len() >= vh {
-                break;
-            }
-            let marker = if k > 0 { " " } else { base_marker };
-            let g = if k > 0 { " ".repeat(gw) } else { g.clone() };
-            out.push(Line::from(vec![
-                Span::styled(marker, m_style),
-                Span::styled(g, theme::dim()),
-                Span::styled(pad(&chunk, tw), style),
-            ]));
-        }
+        push_diff_rows(&mut out, vh, &row, nw, tw, true);
         i += 1;
     }
     out
@@ -708,14 +784,14 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             Rect { height: 1, ..area },
         );
         let body = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+        let hl = st.highlight.file(path, lines);
         let scroll = if active { &mut st.diff_scroll } else { &mut st.alt_diff_view.0 };
         *scroll = (*scroll).min(lines.len().saturating_sub(1));
         let rows = diff_column_rows(
             lines,
             infos.get(path),
-            *scroll,
-            body.height as usize,
-            tw,
+            &hl,
+            (*scroll, body.height as usize, tw),
             if active { cur } else { None },
             if active { (sel_lo, sel_hi) } else { (1, 0) },
         );
@@ -731,8 +807,11 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
 /// overlay).
 struct SbsCell {
     gutter: String,
-    chunks: Vec<String>,
-    style: Style,
+    num_style: Style,
+    rows: Vec<Vec<(Style, String)>>,
+    /// Background of the whole cell (the `+`/`-` tint), plus the comment
+    /// picker's reverse video.
+    row_style: Style,
     marker: &'static str,
     m_style: Style,
 }
@@ -742,10 +821,23 @@ impl SbsCell {
     fn blank(nw: usize) -> Self {
         SbsCell {
             gutter: gutter(&[None], nw),
-            chunks: vec![String::new()],
-            style: Style::default(),
+            num_style: theme::dim(),
+            rows: vec![Vec::new()],
+            row_style: Style::default(),
             marker: " ",
             m_style: Style::default(),
+        }
+    }
+
+    /// One plain-text column, in a single style (a local worktree edit).
+    fn plain(gutter: String, text: &str, width: usize, style: Style, marker: &'static str, m_style: Style) -> Self {
+        SbsCell {
+            gutter,
+            num_style: m_style,
+            rows: wrap_styled_hard(&[(style, text.to_string())], width.max(1)),
+            row_style: Style::default(),
+            marker,
+            m_style,
         }
     }
 }
@@ -754,26 +846,28 @@ impl SbsCell {
 /// the shorter column pads out to the taller one's height.
 fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: SbsCell, r: SbsCell) {
     let blank = " ".repeat(l.gutter.chars().count());
-    for k in 0..l.chunks.len().max(r.chunks.len()) {
+    let cell = |k: usize, c: &SbsCell, width: usize, parts: &mut Vec<Span<'static>>| {
+        parts.push(Span::styled(if k == 0 { c.marker } else { " " }, c.m_style));
+        let g = if k == 0 { c.gutter.clone() } else { blank.clone() };
+        parts.push(Span::styled(g, c.num_style));
+        let mut used = 0usize;
+        for (style, text) in c.rows.get(k).into_iter().flatten() {
+            used += text.chars().count();
+            parts.push(Span::styled(text.clone(), style.patch(c.row_style)));
+        }
+        if used < width {
+            parts.push(Span::styled(" ".repeat(width - used), c.row_style));
+        }
+    };
+    for k in 0..l.rows.len().max(r.rows.len()) {
         if out.len() >= vh {
             return;
         }
-        let lc = l.chunks.get(k).map(String::as_str).unwrap_or("");
-        let rc = r.chunks.get(k).map(String::as_str).unwrap_or("");
-        let (lg, rg) = if k == 0 {
-            (l.gutter.clone(), r.gutter.clone())
-        } else {
-            (blank.clone(), blank.clone())
-        };
-        out.push(Line::from(vec![
-            Span::styled(if k == 0 { l.marker } else { " " }, l.m_style),
-            Span::styled(lg, theme::dim()),
-            Span::styled(pad(lc, w.0), l.style),
-            Span::styled("│", theme::dim()),
-            Span::styled(if k == 0 { r.marker } else { " " }, r.m_style),
-            Span::styled(rg, theme::dim()),
-            Span::styled(pad(rc, w.1), r.style),
-        ]));
+        let mut parts: Vec<Span<'static>> = Vec::new();
+        cell(k, &l, w.0, &mut parts);
+        parts.push(Span::styled("│", theme::dim()));
+        cell(k, &r, w.1, &mut parts);
+        out.push(Line::from(parts));
     }
 }
 
@@ -826,6 +920,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
 
     let pending_here: Vec<&PendingComment> = st.pending.iter().filter(|c| c.path == path).collect();
     let info_here = st.info_by_file.get(path);
+    let hl = st.highlight.file(path, diff_lines);
     let overlay = match (st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
         (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
         _ => None,
@@ -858,21 +953,25 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
                 .as_ref()
                 .zip(new_side(i))
                 .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
-        let mut style = theme::diff_line_style(ln, current);
+        let kind = theme::classify_diff_line(ln);
+        let bg = theme::diff_row_style(kind, current);
         if local_del {
-            style = theme::local_del();
-        }
-        if selected {
-            style = style.add_modifier(Modifier::REVERSED);
+            return SbsCell::plain(
+                gutter(&[if is_new { new } else { old }], nw),
+                &ln.replace('\t', "    "),
+                tw,
+                theme::local_del(),
+                "▎",
+                theme::local_marker(),
+            );
         }
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
-            chunks: wrap_hard(&ln.replace('\t', "    "), tw.max(1)),
-            style,
+            num_style: theme::diff_number_style(kind, current).patch(bg),
+            rows: wrap_styled_hard(&code_spans(ln, hl.get(i), current), tw.max(1)),
+            row_style: if selected { bg.add_modifier(Modifier::REVERSED) } else { bg },
             marker: if selected {
                 "▶"
-            } else if local_del {
-                "▎"
             } else if current {
                 "▌"
             } else {
@@ -880,25 +979,24 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             },
             m_style: if selected {
                 theme::focus()
-            } else if local_del {
-                theme::local_marker()
             } else if current {
-                theme::hunk_marker()
+                theme::hunk_marker().patch(bg)
             } else {
-                Style::default()
+                bg
             },
         }
     };
     // Local additions belong to the new side, so they fill the right column.
     let local_cell = |add: &str| -> SbsCell {
         let prefix = if pr_deleted.contains(add) { ' ' } else { '+' };
-        SbsCell {
-            gutter: gutter(&[None], nw), // the worktree has not numbered it yet
-            chunks: wrap_hard(&format!("{prefix}{}", add.replace('\t', "    ")), rtw.max(1)),
-            style: theme::local_add(),
-            marker: "▎",
-            m_style: theme::local_marker(),
-        }
+        SbsCell::plain(
+            gutter(&[None], nw), // the worktree has not numbered it yet
+            &format!("{prefix}{}", add.replace('\t', "    ")),
+            rtw,
+            theme::local_add(),
+            "▎",
+            theme::local_marker(),
+        )
     };
 
     let mut out: Vec<Line> = Vec::new();
@@ -1074,6 +1172,9 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         .map(|l| &l[1..])
         .collect();
 
+    let colors = path.as_ref().map(|p| st.highlight.file(p, diff_lines));
+    let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
+
     // The gutter carries both line numbers, old then new; the text column takes
     // what is left after the marker.
     let nw = fit_num_width(num_width(info_here), 2, iw.saturating_sub(1), 16);
@@ -1124,38 +1225,17 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
             }
         }
 
-        let mut style = theme::diff_line_style(ln, current);
-        if local_del {
-            style = theme::local_del();
-        }
-        if selected {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        let base_marker = if selected { "▶" } else if local_del { "▎" } else if current { "▌" } else { " " };
-        let m_style = if selected {
-            theme::focus()
-        } else if local_del {
-            theme::local_marker()
-        } else if current {
-            theme::hunk_marker()
-        } else {
-            Style::default()
-        };
-        // Wrap long lines onto continuation rows so nothing is cut off.
+        // Long lines wrap onto continuation rows so nothing is cut off.
         let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
-        let g = gutter(&[nos.0, nos.1], nw);
-        for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw).into_iter().enumerate() {
-            if out.len() >= vh {
-                break;
-            }
-            let marker = if k > 0 { " " } else { base_marker };
-            let g = if k > 0 { blank.clone() } else { g.clone() };
-            out.push(Line::from(vec![
-                Span::styled(marker, m_style),
-                Span::styled(g, theme::dim()),
-                Span::styled(pad(&chunk, tw), style),
-            ]));
-        }
+        let row = DiffRow {
+            line: ln,
+            hl: hl.get(i),
+            nos: &[nos.0, nos.1],
+            current,
+            selected,
+            local_del,
+        };
+        push_diff_rows(&mut out, vh, &row, nw, tw, true);
         // Local additions inserted after this head line (orange).
         if let (Some(ov), Some(l)) = (&overlay, new_side) {
             if let Some(adds) = ov.adds_after.get(&l) {
@@ -1302,24 +1382,22 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let nw = fit_num_width(num_width(info), 2, iw, 16);
     let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
     let tw = iw.saturating_sub(gw);
+    let colors = path.as_ref().map(|p| st.highlight.file(p, lines_vec));
+    let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
     st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
     let mut out: Vec<Line> = Vec::new();
     let mut i = st.edit_diff_scroll;
     while out.len() < vh && i < lines_vec.len() {
-        let ln = &lines_vec[i];
-        let style = theme::diff_line_style(ln, false);
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
-        let g = gutter(&[old, new], nw);
-        for (k, chunk) in wrap_hard(&ln.replace('\t', "    "), tw.max(1)).into_iter().enumerate() {
-            if out.len() >= vh {
-                break;
-            }
-            let g = if k > 0 { " ".repeat(gw) } else { g.clone() };
-            out.push(Line::from(vec![
-                Span::styled(g, theme::dim()),
-                Span::styled(pad(&chunk, tw), style),
-            ]));
-        }
+        let row = DiffRow {
+            line: &lines_vec[i],
+            hl: hl.get(i),
+            nos: &[old, new],
+            current: false,
+            selected: false,
+            local_del: false,
+        };
+        push_diff_rows(&mut out, vh, &row, nw, tw, false);
         i += 1;
     }
     f.render_widget(Paragraph::new(out), inner);
@@ -1535,6 +1613,47 @@ mod tests {
         assert_eq!(wrap_hard("abcdefg", 3), ["abc", "def", "g"]);
         assert_eq!(wrap_hard("abc", 3), ["abc"]);
         assert_eq!(wrap_hard("", 5), [""]);
+    }
+
+    #[test]
+    fn wrap_styled_hard_splits_a_span_across_rows() {
+        use ratatui::style::Color;
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let rows = wrap_styled_hard(&[(red, "abcd".into()), (blue, "efgh".into())], 3);
+        let shown: Vec<Vec<(Option<Color>, &str)>> = rows
+            .iter()
+            .map(|r| r.iter().map(|(s, t)| (s.fg, t.as_str())).collect())
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                vec![(Some(Color::Red), "abc")],
+                vec![(Some(Color::Red), "d"), (Some(Color::Blue), "ef")],
+                vec![(Some(Color::Blue), "gh")],
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_styled_hard_matches_the_plain_wrap() {
+        let s = Style::default();
+        for (text, width) in [("abcdefg", 3), ("abc", 3), ("", 5), ("aé😀b", 2)] {
+            let rows = wrap_styled_hard(&[(s, text.to_string())], width);
+            let joined: Vec<String> =
+                rows.iter().map(|r| r.iter().map(|(_, t)| t.as_str()).collect()).collect();
+            assert_eq!(joined, wrap_hard(text, width), "{text:?} at {width}");
+        }
+    }
+
+    #[test]
+    fn a_changed_line_colors_the_marker_apart_from_the_code() {
+        let spans = code_spans("+let x = 1;", None, false);
+        assert_eq!(spans[0].1, "+");
+        assert_eq!(spans[0].0, theme::diff_marker_style(DiffKind::Add, false));
+        assert_eq!(spans[1].1, "let x = 1;");
+        // A header line stays one span, in its own style.
+        assert_eq!(code_spans("@@ -1 +1 @@", None, false).len(), 1);
     }
 
     #[test]

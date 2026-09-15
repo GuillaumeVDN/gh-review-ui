@@ -5,7 +5,7 @@
 //!
 //! - [`diff`], [`markdown`], [`tree`], [`navigation`] — pure review logic
 //! - [`models`] — data types + the central [`models::State`]
-//! - [`theme`] — colors and diff/highlight styling
+//! - [`theme`], [`syntax`] — colors, diff styling and syntax highlighting
 //! - [`gh`], [`api`] — `gh` CLI / GraphQL and the GitHub domain calls
 //! - [`worker`] — the background thread running blocking `gh` jobs
 //! - [`editor`] — external-editor integration
@@ -22,6 +22,7 @@ pub mod ipc;
 pub mod markdown;
 pub mod models;
 pub mod navigation;
+pub mod syntax;
 pub mod textbuffer;
 pub mod theme;
 pub mod tree;
