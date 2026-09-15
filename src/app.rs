@@ -77,6 +77,7 @@ fn event_loop(
 
     let mut prev_pr = usize::MAX;
     let mut prev_focus: Option<Focus> = None;
+    let mut theme_watch = theme::Watch::default();
     let mut graceful = false;
     loop {
         while let Ok(msg) = msg_rx.try_recv() {
@@ -122,6 +123,9 @@ fn event_loop(
 
         // Detect a closed per-worktree editor; ungroup once the last one is gone.
         poll_worktree_editors(&mut st);
+        // The next draw paints the new theme; the highlight cache holds roles,
+        // so nothing is parsed again.
+        theme_watch.poll();
 
         // A draw/read error means the terminal went away (window closed) — leave
         // the loop so cleanup still runs.

@@ -11,15 +11,16 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use ratatui::style::{Color, Modifier, Style};
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
-use crate::theme::{classify_diff_line, DiffKind};
+use crate::theme::{classify_diff_line, DiffKind, Token};
 
-/// One diff line's code, split into syntax-colored pieces. The `+`/`-` marker
-/// is not part of it: the gutter and the background carry the diff semantics.
-/// An empty list means "no colors", and the caller draws the line plain.
-pub type StyledLine = Vec<(Style, String)>;
+/// One diff line's code, split into pieces and what each piece is. The `+`/`-`
+/// marker is not part of it: the gutter and the background carry the diff
+/// semantics. An empty list means "not parsed", and the caller draws the line
+/// plain. The palette turns the roles into colors at render time, so a theme
+/// switch costs nothing.
+pub type StyledLine = Vec<(Token, String)>;
 
 /// A line longer than this is drawn plain and is not parsed. The matchers run
 /// on the whole line, and one long quoted string costs more than a screenful
@@ -36,41 +37,84 @@ fn syntaxes() -> &'static SyntaxSet {
 
 struct Rule {
     scope: Scope,
-    style: Style,
+    token: Token,
 }
 
-/// Scope prefixes, most specific first, and the color each one gets.
-///
-/// Green and red are left out on purpose: they mean added and deleted here.
+/// Scope prefixes, most specific first, and what each one means.
 fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let scope = |name: &str| Scope::new(name).expect("static scope name");
-        let plain = |c: Color| Style::default().fg(c);
-        let bold = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+        let rule = |name: &str, token: Token| Rule {
+            scope: Scope::new(name).expect("static scope name"),
+            token,
+        };
         vec![
-            Rule { scope: scope("comment"), style: plain(Color::DarkGray) },
-            Rule { scope: scope("string"), style: plain(Color::Yellow) },
-            Rule { scope: scope("constant"), style: plain(Color::Magenta) },
-            Rule { scope: scope("keyword"), style: bold(Color::Blue) },
-            Rule { scope: scope("storage"), style: bold(Color::Blue) },
-            Rule { scope: scope("entity.name.function"), style: plain(Color::Cyan) },
-            Rule { scope: scope("support.function"), style: plain(Color::Cyan) },
-            Rule { scope: scope("entity.name"), style: plain(Color::LightCyan) },
-            Rule { scope: scope("support.type"), style: plain(Color::LightCyan) },
-            Rule { scope: scope("support.class"), style: plain(Color::LightCyan) },
+            rule("comment", Token::Comment),
+            rule("constant.character.escape", Token::StringEscape),
+            rule("constant.other.placeholder", Token::StringEscape),
+            rule("string", Token::Str),
+            rule("constant.numeric", Token::Number),
+            rule("constant.language", Token::Boolean),
+            rule("keyword.control.import", Token::Import),
+            rule("keyword.other.import", Token::Import),
+            rule("keyword.control.at-rule.include", Token::Import),
+            rule("keyword.operator", Token::KeywordOperator),
+            rule("storage.type.primitive", Token::TypeBuiltin),
+            rule("storage.type", Token::Keyword),
+            rule("storage.modifier", Token::Keyword),
+            rule("keyword", Token::Keyword),
+            rule("entity.name.function", Token::FunctionDef),
+            rule("variable.function", Token::FunctionCall),
+            rule("support.function", Token::FunctionBuiltin),
+            rule("entity.name.type", Token::Type),
+            rule("entity.name.class", Token::Type),
+            rule("support.class", Token::Type),
+            rule("support.type", Token::TypeBuiltin),
+            rule("variable.parameter", Token::Parameter),
+            rule("variable.language", Token::VariableBuiltin),
+            rule("variable.other.member", Token::Property),
+            rule("variable.other.property", Token::Property),
+            rule("meta.attribute", Token::Property),
+            rule("entity.name.tag", Token::Tag),
+            rule("entity.other.attribute-name", Token::Property),
+            rule("punctuation", Token::Punctuation),
+            rule("invalid", Token::Invalid),
+            rule("constant", Token::Number),
         ]
     })
 }
 
-/// The color of a token, from the innermost scope that a rule matches.
-pub fn scope_style(stack: &ScopeStack) -> Style {
+/// What a piece of code is, from the innermost scope a rule matches.
+///
+/// A quote or a `#` opens the string or the comment it belongs to, so it takes
+/// that color rather than the punctuation color.
+pub fn scope_token(stack: &ScopeStack, text: &str) -> Token {
+    let mut punctuation = false;
     for scope in stack.scopes.iter().rev() {
-        if let Some(rule) = rules().iter().find(|r| r.scope.is_prefix_of(*scope)) {
-            return rule.style;
+        let Some(rule) = rules().iter().find(|r| r.scope.is_prefix_of(*scope)) else { continue };
+        // `and` reads as a word, `+=` as a mark between two values.
+        let worded = text.trim().starts_with(char::is_alphabetic);
+        let token = match rule.token {
+            Token::KeywordOperator if !worded => Token::Operator,
+            found => found,
+        };
+        if token == Token::Punctuation {
+            punctuation = true;
+            continue;
         }
+        if punctuation {
+            return match token {
+                Token::Comment | Token::Str => token,
+                _ => Token::Punctuation,
+            };
+        }
+        return token;
     }
-    Style::default()
+    if punctuation {
+        Token::Punctuation
+    } else {
+        Token::Plain
+    }
 }
 
 /// The code of a diff row, tabs expanded, or `None` for a header row.
@@ -117,7 +161,7 @@ impl Stream {
         for (at, op) in ops {
             let at = at.min(end);
             if at > last {
-                push(&mut out, scope_style(&self.stack), &line[last..at]);
+                push(&mut out, &self.stack, &line[last..at]);
                 last = at;
             }
             if self.stack.apply(&op).is_err() {
@@ -125,16 +169,17 @@ impl Stream {
             }
         }
         if last < end {
-            push(&mut out, scope_style(&self.stack), &line[last..end]);
+            push(&mut out, &self.stack, &line[last..end]);
         }
         out
     }
 }
 
-fn push(out: &mut StyledLine, style: Style, text: &str) {
+fn push(out: &mut StyledLine, stack: &ScopeStack, text: &str) {
+    let token = scope_token(stack, text);
     match out.last_mut() {
-        Some((s, t)) if *s == style => t.push_str(text),
-        _ => out.push((style, text.to_string())),
+        Some((t, held)) if *t == token => held.push_str(text),
+        _ => out.push((token, text.to_string())),
     }
 }
 
@@ -242,36 +287,72 @@ impl Highlighter {
 mod tests {
     use super::*;
 
-    fn stack(names: &[&str]) -> ScopeStack {
-        let mut s = ScopeStack::new();
-        for n in names {
-            s.scopes.push(Scope::new(n).unwrap());
-        }
-        s
+    fn roles(path: &str, code: &[&str]) -> Vec<Vec<(Token, String)>> {
+        let mut lines = vec!["@@ -1,9 +1,9 @@".to_string()];
+        lines.extend(code.iter().map(|l| format!("+{l}")));
+        highlight_diff(path, &lines).split_off(1)
+    }
+
+    fn role_of<'a>(line: &'a [(Token, String)], text: &str) -> Option<&'a Token> {
+        line.iter().find(|(_, held)| held.trim() == text).map(|(token, _)| token)
     }
 
     #[test]
-    fn scopes_map_to_terminal_colors() {
-        assert_eq!(scope_style(&stack(&["source.rs", "comment.line.rust"])).fg, Some(Color::DarkGray));
-        assert_eq!(scope_style(&stack(&["source.rs", "string.quoted.double"])).fg, Some(Color::Yellow));
-        assert_eq!(scope_style(&stack(&["source.rs", "constant.numeric"])).fg, Some(Color::Magenta));
-        assert_eq!(scope_style(&stack(&["source.rs", "keyword.control"])).fg, Some(Color::Blue));
-        assert_eq!(scope_style(&stack(&["source.rs", "storage.type"])).fg, Some(Color::Blue));
-        assert_eq!(scope_style(&stack(&["source.rs", "entity.name.function"])).fg, Some(Color::Cyan));
-        assert_eq!(scope_style(&stack(&["source.rs", "entity.name.class"])).fg, Some(Color::LightCyan));
-        assert_eq!(scope_style(&stack(&["source.rs", "variable.parameter"])).fg, None);
-        assert_eq!(scope_style(&stack(&["source.rs"])).fg, None);
+    fn python_reads_like_the_editor() {
+        let out = roles(
+            "a.py",
+            &[
+                "import os",
+                "@decorator",
+                "class Foo(Base):",
+                "    def method(self, count: int = 3) -> str:",
+                "        value = self.name + \"a\\nb\"  # note",
+                "        if count is None and value in items:",
+            ],
+        );
+        assert_eq!(role_of(&out[0], "import"), Some(&Token::Import));
+        assert_eq!(role_of(&out[2], "class"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[2], "Foo"), Some(&Token::Type));
+        assert_eq!(role_of(&out[3], "def"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[3], "method"), Some(&Token::FunctionDef));
+        assert_eq!(role_of(&out[3], "count"), Some(&Token::Parameter));
+        assert_eq!(role_of(&out[3], "int"), Some(&Token::TypeBuiltin));
+        assert_eq!(role_of(&out[3], "3"), Some(&Token::Number));
+        assert_eq!(role_of(&out[4], "self"), Some(&Token::VariableBuiltin));
+        assert!(held(&out[4], Token::Str).iter().any(|t| t.contains('a')));
+        assert_eq!(role_of(&out[4], "\\n"), Some(&Token::StringEscape));
+        assert_eq!(role_of(&out[4], "# note"), Some(&Token::Comment));
+        assert_eq!(role_of(&out[5], "is"), Some(&Token::KeywordOperator));
+        assert_eq!(role_of(&out[5], "and"), Some(&Token::KeywordOperator));
+        assert_eq!(role_of(&out[5], "None"), Some(&Token::Boolean));
+        // The quotes belong to the string they open.
+        assert!(held(&out[4], Token::Str).iter().any(|t| t.starts_with('"')), "{:?}", out[4]);
     }
 
     #[test]
-    fn syntax_tokens_never_wear_the_diff_colors() {
-        for rule in rules() {
-            assert!(!matches!(rule.style.fg, Some(Color::Green) | Some(Color::Red)));
-        }
+    fn rust_reads_like_the_editor() {
+        let out = roles(
+            "a.rs",
+            &[
+                "use crate::theme;",
+                "pub fn run(&self, name: &str) -> u32 {",
+                "    let ok = true; // why",
+                "    self.total += 1;",
+            ],
+        );
+        assert_eq!(role_of(&out[1], "fn"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[1], "run"), Some(&Token::FunctionDef));
+        assert_eq!(role_of(&out[1], "name"), Some(&Token::Parameter));
+        assert_eq!(role_of(&out[2], "let"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[2], "true"), Some(&Token::Boolean));
+        assert_eq!(role_of(&out[2], "// why"), Some(&Token::Comment));
+        assert_eq!(role_of(&out[3], "self"), Some(&Token::VariableBuiltin));
+        assert_eq!(role_of(&out[3], "+="), Some(&Token::Operator));
+        assert_eq!(role_of(&out[3], "1"), Some(&Token::Number));
     }
 
     #[test]
-    fn an_unknown_language_gets_no_colors() {
+    fn an_unknown_language_gets_no_roles() {
         let lines = vec!["@@ -1 +1 @@".to_string(), "+whatever".to_string()];
         assert!(highlight_diff("notes.unknownext", &lines).is_empty());
     }
@@ -280,8 +361,8 @@ mod tests {
         line.iter().map(|(_, t)| t.as_str()).collect()
     }
 
-    fn colored(line: &StyledLine, want: Color) -> Vec<&str> {
-        line.iter().filter(|(s, _)| s.fg == Some(want)).map(|(_, t)| t.as_str()).collect()
+    fn held(line: &StyledLine, want: Token) -> Vec<&str> {
+        line.iter().filter(|(t, _)| *t == want).map(|(_, held)| held.as_str()).collect()
     }
 
     #[test]
@@ -305,26 +386,22 @@ mod tests {
         assert_eq!(text_of(&hl[3]), "    let x = \"old\";");
         assert_eq!(text_of(&hl[4]), "    let y = 42;");
 
-        assert!(colored(&hl[2], Color::Blue).contains(&"fn"), "{:?}", hl[2]);
+        assert!(held(&hl[2], Token::Keyword).contains(&"fn"), "{:?}", hl[2]);
         // The deleted line's string stays on the old side, the added line's
         // number on the new side: neither stream sees the other's text.
-        assert!(colored(&hl[3], Color::Yellow).iter().any(|t| t.contains("old")), "{:?}", hl[3]);
-        assert!(colored(&hl[4], Color::Magenta).contains(&"42"), "{:?}", hl[4]);
+        assert!(held(&hl[3], Token::Str).iter().any(|t| t.contains("old")), "{:?}", hl[3]);
+        assert!(held(&hl[4], Token::Number).contains(&"42"), "{:?}", hl[4]);
     }
 
     #[test]
     fn a_comment_on_one_side_does_not_color_the_other() {
-        let lines: Vec<String> = [
-            "@@ -1,2 +1,2 @@",
-            "-// gone",
-            "+let kept = 1;",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let lines: Vec<String> = ["@@ -1,2 +1,2 @@", "-// gone", "+let kept = 1;"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let hl = highlight_diff("f.rs", &lines);
-        assert!(colored(&hl[1], Color::DarkGray).iter().any(|t| t.contains("gone")));
-        assert!(colored(&hl[2], Color::DarkGray).is_empty(), "{:?}", hl[2]);
+        assert!(held(&hl[1], Token::Comment).iter().any(|t| t.contains("gone")));
+        assert!(held(&hl[2], Token::Comment).is_empty(), "{:?}", hl[2]);
     }
 
     #[test]

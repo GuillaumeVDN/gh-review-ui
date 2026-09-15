@@ -149,24 +149,34 @@ too narrow to hold both the numbers and the code drops the gutter.
 
 ### Colors
 
-The code in a diff wears syntax colors, for every language
+The app wears the active [Omarchy](https://omarchy.org) theme, so a diff reads
+like the Neovim next to it: comments in `dark_foreground` italic, strings in
+`green`, keywords in `magenta` bold, types in `yellow` bold, `self` in `red`
+italic. It reads `~/.local/state/omarchy/current/theme/colors.toml`
+(`$XDG_STATE_HOME` when that is set), and follows a theme switch within a
+second, with no restart.
+
+The code itself carries syntax colors, for every language
 [syntect](https://github.com/trishume/syntect) ships a syntax for. The language
 comes from the file extension, then from the first line; a file neither answers
 for stays plain. Each file is parsed twice, once per side of the diff, so a
 deleted line and the line that replaces it each read as their own text.
 
-Green and red are left to the diff itself. The `+` / `-` marker and the line
-numbers wear them, and the changed line sits on a green or a red background. The
-focused change block takes the brighter pair of the same two hues, next to the
-`▌` side-bar.
+The diff meaning lives in the gutter and the background. The `+` / `-` marker
+and the line numbers wear the theme's green and red, and the changed line sits
+on that same hue blended into the background: about a fifth of it for a changed
+line, a third for the focused change block, next to the `▌` side-bar. A theme
+of low contrast of its own gets a fainter tint, so the code on it keeps reading.
 
 A file is colored as far down as you have scrolled, and a line over 600
 characters stays plain: the matchers run on the whole line, and one long quoted
 string costs more than a screenful of ordinary code.
 
-Those backgrounds come in a dark and a light set:
+Without an Omarchy theme the app keeps its own ANSI colors, in a dark and a
+light set:
 
-- `GH_REVIEW_UI_THEME=dark` or `GH_REVIEW_UI_THEME=light` picks one;
+- `GH_REVIEW_UI_THEME=dark` or `GH_REVIEW_UI_THEME=light` picks one, and names
+  the mode of an Omarchy theme too;
 - else the app asks the terminal for its own background color (OSC 11) and
   reads the luminance of the answer. The terminal has 150 ms to answer, and the
   question is asked before the first key is read;
@@ -289,6 +299,7 @@ The crate (`src/`) is split so almost all logic is UI-free and unit-tested:
 | `theme` | ratatui `Style`s + diff/highlight helpers |
 | `syntax` | syntect parsing of diff code, cached per file |
 | `term` | tty queries the terminal answers itself |
+| `omarchy` | the active Omarchy theme palette |
 | `textbuffer` | modal text editor + soft-wrapping |
 | `worker` | background thread running blocking `gh`/`git` jobs |
 | `controller` | state transitions + job orchestration |

@@ -194,7 +194,10 @@ fn code_spans(line: &str, hl: Option<&StyledLine>, current: bool) -> Vec<(Style,
     };
     let mut out = vec![(theme::diff_marker_style(kind, current), marker.to_string())];
     match hl {
-        Some(h) if !h.is_empty() => out.extend(h.iter().cloned()),
+        Some(h) if !h.is_empty() => {
+            let p = theme::palette();
+            out.extend(h.iter().map(|(token, text)| (p.token(*token), text.clone())));
+        }
         _ => out.push((Style::default(), rest.replace('\t', "    "))),
     }
     out
@@ -217,7 +220,7 @@ struct DiffRow<'a> {
 fn push_diff_rows(out: &mut Vec<Line<'static>>, vh: usize, row: &DiffRow, nw: usize, tw: usize, with_marker: bool) {
     let kind = theme::classify_diff_line(row.line);
     let bg = theme::diff_row_style(kind, row.current);
-    let text_style = if row.selected { bg.add_modifier(Modifier::REVERSED) } else { bg };
+    let text_style = if row.selected { bg.patch(theme::picked()) } else { bg };
     let spans = if row.local_del {
         vec![(theme::local_del(), row.line.replace('\t', "    "))]
     } else {
@@ -974,7 +977,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
             rows: wrap_styled_hard(&code_spans(ln, hl.get(i), current), tw.max(1)),
-            row_style: if selected { bg.add_modifier(Modifier::REVERSED) } else { bg },
+            row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
             } else if current {
