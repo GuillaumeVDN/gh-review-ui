@@ -160,6 +160,10 @@ numbers wear them, and the changed line sits on a green or a red background. The
 focused change block takes the brighter pair of the same two hues, next to the
 `▌` side-bar.
 
+A file is colored as far down as you have scrolled, and a line over 600
+characters stays plain: the matchers run on the whole line, and one long quoted
+string costs more than a screenful of ordinary code.
+
 Those backgrounds come in a dark and a light set:
 
 - `GH_REVIEW_UI_THEME=dark` or `GH_REVIEW_UI_THEME=light` picks one;

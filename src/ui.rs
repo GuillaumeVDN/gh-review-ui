@@ -784,14 +784,16 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             Rect { height: 1, ..area },
         );
         let body = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
-        let hl = st.highlight.file(path, lines);
+        let vh = body.height as usize;
         let scroll = if active { &mut st.diff_scroll } else { &mut st.alt_diff_view.0 };
         *scroll = (*scroll).min(lines.len().saturating_sub(1));
+        let scroll = *scroll;
+        let hl = st.highlight.rows(path, lines, scroll + vh);
         let rows = diff_column_rows(
             lines,
             infos.get(path),
             &hl,
-            (*scroll, body.height as usize, tw),
+            (scroll, vh, tw),
             if active { cur } else { None },
             if active { (sel_lo, sel_hi) } else { (1, 0) },
         );
@@ -920,7 +922,10 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
 
     let pending_here: Vec<&PendingComment> = st.pending.iter().filter(|c| c.path == path).collect();
     let info_here = st.info_by_file.get(path);
-    let hl = st.highlight.file(path, diff_lines);
+    // The visible rows name the diff lines to color; a wrapped row shows fewer.
+    let seen = rows.iter().skip(st.diff_scroll).take(vh);
+    let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
+    let hl = st.highlight.rows(path, diff_lines, upto);
     let overlay = match (st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
         (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
         _ => None,
@@ -1172,7 +1177,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         .map(|l| &l[1..])
         .collect();
 
-    let colors = path.as_ref().map(|p| st.highlight.file(p, diff_lines));
+    let colors = path.as_ref().map(|p| st.highlight.rows(p, diff_lines, st.diff_scroll + vh));
     let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
 
     // The gutter carries both line numbers, old then new; the text column takes
@@ -1382,7 +1387,8 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let nw = fit_num_width(num_width(info), 2, iw, 16);
     let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
     let tw = iw.saturating_sub(gw);
-    let colors = path.as_ref().map(|p| st.highlight.file(p, lines_vec));
+    let colors =
+        path.as_ref().map(|p| st.highlight.rows(p, lines_vec, st.edit_diff_scroll + vh));
     let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
     st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
     let mut out: Vec<Line> = Vec::new();

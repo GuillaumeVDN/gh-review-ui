@@ -21,9 +21,10 @@ use crate::theme::{classify_diff_line, DiffKind};
 /// An empty list means "no colors", and the caller draws the line plain.
 pub type StyledLine = Vec<(Style, String)>;
 
-/// A diff longer than this keeps its plain colors. A parse costs about a tenth
-/// of a second per thousand lines, and a file that big is skimmed, not read.
-const MAX_LINES: usize = 4_000;
+/// A line longer than this is drawn plain and is not parsed. The matchers run
+/// on the whole line, and one long quoted string costs more than a screenful
+/// of ordinary code.
+const MAX_LINE: usize = 600;
 
 /// Files kept in the cache before it is dropped and rebuilt on demand.
 const MAX_CACHED: usize = 64;
@@ -137,37 +138,68 @@ fn push(out: &mut StyledLine, style: Style, text: &str) {
     }
 }
 
-/// Color every code row of one file's diff, indexed like `lines`.
-pub fn highlight_diff(path: &str, lines: &[String]) -> Vec<StyledLine> {
-    if lines.len() > MAX_LINES {
-        return Vec::new();
-    }
-    let set = syntaxes();
-    let first = lines.iter().find_map(|l| content_of(l));
-    let Some(syntax) = syntax_for(set, path, first.as_deref()) else {
-        return Vec::new();
-    };
-    let mut out = vec![StyledLine::new(); lines.len()];
-    let mut old = Stream::new(syntax);
-    let mut new = Stream::new(syntax);
-    for (i, line) in lines.iter().enumerate() {
-        let kind = classify_diff_line(line);
-        if kind == DiffKind::Hunk {
-            old = Stream::new(syntax);
-            new = Stream::new(syntax);
-            continue;
+/// One file's diff, parsed as far as the screen has asked for.
+struct Parsed {
+    syntax: Option<&'static SyntaxReference>,
+    old: Stream,
+    new: Stream,
+    rows: Rc<Vec<StyledLine>>,
+    /// The first line no stream has seen yet.
+    next: usize,
+}
+
+impl Parsed {
+    fn new(path: &str, lines: &[String]) -> Self {
+        let set = syntaxes();
+        let first = lines.iter().find_map(|l| content_of(l));
+        let syntax = syntax_for(set, path, first.as_deref());
+        let start = syntax.unwrap_or_else(|| set.find_syntax_plain_text());
+        Parsed {
+            syntax,
+            old: Stream::new(start),
+            new: Stream::new(start),
+            rows: Rc::new(Vec::new()),
+            next: 0,
         }
-        let Some(text) = content_of(line) else { continue };
-        out[i] = match kind {
-            DiffKind::Add => new.feed(&text),
-            DiffKind::Del => old.feed(&text),
-            _ => {
-                old.feed(&text);
-                new.feed(&text)
-            }
-        };
     }
-    out
+
+    /// Parse up to line `upto`, from wherever the last call stopped.
+    fn extend(&mut self, lines: &[String], upto: usize) {
+        let Some(syntax) = self.syntax else { return };
+        let upto = upto.min(lines.len());
+        if self.next >= upto {
+            return;
+        }
+        let rows = Rc::make_mut(&mut self.rows);
+        while self.next < upto {
+            let line = &lines[self.next];
+            let kind = classify_diff_line(line);
+            if kind == DiffKind::Hunk {
+                // The lines between two hunks are missing, so neither side can
+                // carry its state across the gap.
+                self.old = Stream::new(syntax);
+                self.new = Stream::new(syntax);
+            }
+            let text = content_of(line).filter(|t| t.len() <= MAX_LINE);
+            rows.push(match (kind, text) {
+                (DiffKind::Add, Some(t)) => self.new.feed(&t),
+                (DiffKind::Del, Some(t)) => self.old.feed(&t),
+                (DiffKind::Context, Some(t)) => {
+                    self.old.feed(&t);
+                    self.new.feed(&t)
+                }
+                _ => StyledLine::new(),
+            });
+            self.next += 1;
+        }
+    }
+}
+
+/// Color one file's diff in one pass, for the callers that want all of it.
+pub fn highlight_diff(path: &str, lines: &[String]) -> Vec<StyledLine> {
+    let mut parsed = Parsed::new(path, lines);
+    parsed.extend(lines, lines.len());
+    (*parsed.rows).clone()
 }
 
 fn fingerprint(lines: &[String]) -> u64 {
@@ -179,9 +211,10 @@ fn fingerprint(lines: &[String]) -> u64 {
     h.finish()
 }
 
-type Cache = HashMap<(String, u64), Rc<Vec<StyledLine>>>;
+type Cache = HashMap<(String, u64), Parsed>;
 
-/// Per-file highlight cache, so a redraw never parses anything.
+/// Per-file highlight cache, so a redraw parses nothing and a first draw parses
+/// only what the viewport shows.
 ///
 /// The key holds the diff text's fingerprint, so a reloaded file is parsed
 /// again and the two columns of a split diff each keep their own colors.
@@ -191,18 +224,17 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    pub fn file(&self, path: &str, lines: &[String]) -> Rc<Vec<StyledLine>> {
+    /// The colors of `path`, parsed as far as line `upto`. Rows past what has
+    /// been parsed are absent, and the caller draws those lines plain.
+    pub fn rows(&self, path: &str, lines: &[String], upto: usize) -> Rc<Vec<StyledLine>> {
         let key = (path.to_string(), fingerprint(lines));
-        if let Some(hit) = self.cache.borrow().get(&key) {
-            return hit.clone();
-        }
-        let built = Rc::new(highlight_diff(path, lines));
         let mut cache = self.cache.borrow_mut();
-        if cache.len() >= MAX_CACHED {
+        if cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
             cache.clear();
         }
-        cache.insert(key, built.clone());
-        built
+        let parsed = cache.entry(key).or_insert_with(|| Parsed::new(path, lines));
+        parsed.extend(lines, upto);
+        parsed.rows.clone()
     }
 }
 
@@ -299,10 +331,40 @@ mod tests {
     fn the_cache_returns_the_same_parse_twice() {
         let hl = Highlighter::default();
         let lines = vec!["@@ -1 +1 @@".to_string(), "+let x = 1;".to_string()];
-        let a = hl.file("f.rs", &lines);
-        let b = hl.file("f.rs", &lines);
+        let a = hl.rows("f.rs", &lines, lines.len());
+        let b = hl.rows("f.rs", &lines, lines.len());
         assert!(Rc::ptr_eq(&a, &b));
         let other = vec!["@@ -1 +1 @@".to_string(), "+let y = 2;".to_string()];
-        assert!(!Rc::ptr_eq(&a, &hl.file("f.rs", &other)));
+        assert!(!Rc::ptr_eq(&a, &hl.rows("f.rs", &other, other.len())));
+    }
+
+    fn rust_diff(n: usize) -> Vec<String> {
+        let mut lines = vec!["diff --git a/f.rs b/f.rs".to_string(), "@@ -1,1 +1,1 @@".to_string()];
+        for i in 0..n {
+            lines.push(format!("+    let x{i} = \"value {i}\"; // note {i}"));
+        }
+        lines
+    }
+
+    #[test]
+    fn a_parse_picks_up_where_it_stopped() {
+        let lines = rust_diff(300);
+        let hl = Highlighter::default();
+        let near = hl.rows("f.rs", &lines, 50);
+        assert_eq!(near.len(), 50);
+        let far = hl.rows("f.rs", &lines, 200);
+        assert_eq!(far.len(), 200);
+        let whole = highlight_diff("f.rs", &lines);
+        assert_eq!(&far[..], &whole[..200]);
+        assert_eq!(&near[..], &whole[..50]);
+    }
+
+    #[test]
+    fn a_very_long_line_is_left_plain() {
+        let long = format!("+    query: '{}'", "select 1, ".repeat(200));
+        let lines = vec!["@@ -1 +1 @@".to_string(), long, "+    name: short".to_string()];
+        let hl = highlight_diff("f.yml", &lines);
+        assert!(hl[1].is_empty(), "the long line is not parsed");
+        assert!(!hl[2].is_empty(), "the next line still is");
     }
 }
