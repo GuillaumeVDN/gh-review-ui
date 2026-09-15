@@ -10,6 +10,7 @@
 //! - [`worker`] — the background thread running blocking `gh` jobs
 //! - [`editor`] — external-editor integration
 //! - [`controller`] — state transitions + job orchestration
+//! - [`term`] — tty queries the terminal answers itself
 //! - [`ui`], [`app`] — ratatui rendering and the event loop
 
 pub mod api;
@@ -23,6 +24,7 @@ pub mod markdown;
 pub mod models;
 pub mod navigation;
 pub mod syntax;
+pub mod term;
 pub mod textbuffer;
 pub mod theme;
 pub mod tree;

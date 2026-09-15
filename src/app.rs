@@ -18,9 +18,14 @@ use crate::models::{Category, CommitKind, Focus, Overlay, State, TreeRow, SUBMIT
 use crate::navigation as nav;
 use crate::textbuffer::TextArea;
 use crate::worker::{Job, Msg};
-use crate::{api, controller, editor, ui, worker};
+use crate::{api, controller, editor, theme, ui, worker};
 
 pub fn run(open_file: Option<String>, open_commit: Option<Vec<String>>, open_edits: bool) -> Result<()> {
+    // Ask the terminal for its background before anything else reads the tty.
+    theme::init_appearance(match theme::forced_appearance() {
+        Some(_) => None,
+        None => crate::term::background(),
+    });
     let mut terminal = ratatui::init();
     // Best-effort: distinct Shift/Ctrl+Enter, Alt+Backspace on supporting terminals.
     let _ = execute!(

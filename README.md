@@ -163,7 +163,10 @@ focused change block takes the brighter pair of the same two hues, next to the
 Those backgrounds come in a dark and a light set:
 
 - `GH_REVIEW_UI_THEME=dark` or `GH_REVIEW_UI_THEME=light` picks one;
-- else the app reads `COLORFGBG` (`fg;bg`), which most terminals export;
+- else the app asks the terminal for its own background color (OSC 11) and
+  reads the luminance of the answer. The terminal has 150 ms to answer, and the
+  question is asked before the first key is read;
+- else it reads `COLORFGBG` (`fg;bg`), which some terminals export;
 - else it takes the dark set.
 
 `s` draws the review diff side by side: the old side on the left, the new side
@@ -281,6 +284,7 @@ The crate (`src/`) is split so almost all logic is UI-free and unit-tested:
 | `navigation` | cursor / hunk / selection logic over `State` |
 | `theme` | ratatui `Style`s + diff/highlight helpers |
 | `syntax` | syntect parsing of diff code, cached per file |
+| `term` | tty queries the terminal answers itself |
 | `textbuffer` | modal text editor + soft-wrapping |
 | `worker` | background thread running blocking `gh`/`git` jobs |
 | `controller` | state transitions + job orchestration |

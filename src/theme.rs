@@ -36,37 +36,79 @@ const DARK: Palette = Palette {
 const LIGHT: Palette = Palette {
     add_bg: Color::Indexed(194),
     del_bg: Color::Indexed(224),
-    add_bg_current: Color::Indexed(157),
+    add_bg_current: Color::Indexed(151),
     del_bg_current: Color::Indexed(217),
 };
 
-/// The terminal appearance, from `GH_REVIEW_UI_THEME` or `COLORFGBG`.
+/// `GH_REVIEW_UI_THEME`, when it names an appearance.
+pub fn forced_appearance() -> Option<Appearance> {
+    match std::env::var("GH_REVIEW_UI_THEME").ok()?.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(Appearance::Light),
+        "dark" => Some(Appearance::Dark),
+        _ => None,
+    }
+}
+
+/// The appearance in an OSC 11 reply: `\x1b]11;rgb:rrrr/gggg/bbbb` closed by
+/// `\x1b\\` or BEL. Components carry one to four hex digits.
+pub fn parse_osc11(reply: &str) -> Option<Appearance> {
+    let body = reply.split("]11;").nth(1)?;
+    let body = body.split(['\x07', '\x1b']).next()?;
+    let spec = body.trim().strip_prefix("rgb:")?;
+    let mut parts = spec.split('/').map(channel);
+    let (r, g, b) = (parts.next()??, parts.next()??, parts.next()??);
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    Some(if luminance > 0.5 { Appearance::Light } else { Appearance::Dark })
+}
+
+/// One hex component of an X11 color, as a fraction of its own full scale.
+fn channel(part: &str) -> Option<f32> {
+    let digits = part.len();
+    if digits == 0 || digits > 4 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let full = (1u32 << (4 * digits)) - 1;
+    Some(u32::from_str_radix(part, 16).ok()? as f32 / full as f32)
+}
+
+/// The terminal appearance: `GH_REVIEW_UI_THEME`, then what the terminal
+/// answered about its background, then `COLORFGBG`, then dark.
 ///
 /// `COLORFGBG` holds `fg;bg`, and some terminals put a third field between the
 /// two. The background index is the last field.
-pub fn detect_appearance(forced: Option<&str>, colorfgbg: Option<&str>) -> Appearance {
-    match forced.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("light") => return Appearance::Light,
-        Some("dark") => return Appearance::Dark,
-        _ => {}
+pub fn detect_appearance(
+    forced: Option<Appearance>,
+    queried: Option<Appearance>,
+    colorfgbg: Option<&str>,
+) -> Appearance {
+    if let Some(a) = forced.or(queried) {
+        return a;
     }
     let bg = colorfgbg
         .and_then(|v| v.rsplit(';').next())
         .and_then(|v| v.trim().parse::<u8>().ok());
     match bg {
-        Some(0..=6) | Some(8) => Appearance::Dark,
         Some(7) | Some(15) => Appearance::Light,
         _ => Appearance::Dark,
     }
 }
 
+static FOUND: OnceLock<Appearance> = OnceLock::new();
+
+/// Settle the appearance, with what the terminal answered about its
+/// background. The first caller wins, so a later read gets the same answer.
+pub fn init_appearance(queried: Option<Appearance>) {
+    let found = detect_appearance(
+        forced_appearance(),
+        queried,
+        std::env::var("COLORFGBG").ok().as_deref(),
+    );
+    let _ = FOUND.set(found);
+}
+
 pub fn appearance() -> Appearance {
-    static FOUND: OnceLock<Appearance> = OnceLock::new();
     *FOUND.get_or_init(|| {
-        detect_appearance(
-            std::env::var("GH_REVIEW_UI_THEME").ok().as_deref(),
-            std::env::var("COLORFGBG").ok().as_deref(),
-        )
+        detect_appearance(forced_appearance(), None, std::env::var("COLORFGBG").ok().as_deref())
     })
 }
 
@@ -273,25 +315,56 @@ mod tests {
     }
 
     #[test]
-    fn the_env_var_wins_over_colorfgbg() {
-        assert_eq!(detect_appearance(Some("light"), Some("0;15")), Appearance::Light);
-        assert_eq!(detect_appearance(Some("Dark"), Some("0;15")), Appearance::Dark);
-        assert_eq!(detect_appearance(Some("nonsense"), Some("15;0")), Appearance::Dark);
+    fn the_answers_come_in_order() {
+        let (dark, light) = (Some(Appearance::Dark), Some(Appearance::Light));
+        // The env var wins over everything.
+        assert_eq!(detect_appearance(light, dark, Some("15;0")), Appearance::Light);
+        assert_eq!(detect_appearance(dark, light, Some("0;15")), Appearance::Dark);
+        // Then what the terminal answered.
+        assert_eq!(detect_appearance(None, light, Some("15;0")), Appearance::Light);
+        assert_eq!(detect_appearance(None, dark, Some("0;15")), Appearance::Dark);
+        // Then COLORFGBG, then dark.
+        assert_eq!(detect_appearance(None, None, Some("0;15")), Appearance::Light);
+        assert_eq!(detect_appearance(None, None, None), Appearance::Dark);
     }
 
     #[test]
     fn colorfgbg_reads_the_background_field() {
-        assert_eq!(detect_appearance(None, Some("15;0")), Appearance::Dark);
-        assert_eq!(detect_appearance(None, Some("15;8")), Appearance::Dark);
-        assert_eq!(detect_appearance(None, Some("0;15")), Appearance::Light);
-        assert_eq!(detect_appearance(None, Some("0;7")), Appearance::Light);
+        assert_eq!(detect_appearance(None, None, Some("15;0")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None, Some("15;8")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None, Some("0;15")), Appearance::Light);
+        assert_eq!(detect_appearance(None, None, Some("0;7")), Appearance::Light);
         // Some terminals write a third field between the two colors.
-        assert_eq!(detect_appearance(None, Some("0;default;15")), Appearance::Light);
-        assert_eq!(detect_appearance(None, Some("12;default;0")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None, Some("0;default;15")), Appearance::Light);
+        assert_eq!(detect_appearance(None, None, Some("12;default;0")), Appearance::Dark);
         // Anything unreadable falls back to dark.
-        assert_eq!(detect_appearance(None, Some("")), Appearance::Dark);
-        assert_eq!(detect_appearance(None, Some("0;12")), Appearance::Dark);
-        assert_eq!(detect_appearance(None, None), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None, Some("")), Appearance::Dark);
+        assert_eq!(detect_appearance(None, None, Some("0;12")), Appearance::Dark);
+    }
+
+    #[test]
+    fn an_osc11_reply_gives_the_appearance() {
+        // Both terminators, and components of any width.
+        assert_eq!(parse_osc11("\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), Some(Appearance::Light));
+        assert_eq!(parse_osc11("\x1b]11;rgb:0000/0000/0000\x07"), Some(Appearance::Dark));
+        assert_eq!(parse_osc11("\x1b]11;rgb:fa/f8/ef\x07"), Some(Appearance::Light));
+        assert_eq!(parse_osc11("\x1b]11;rgb:1d/1f/21\x1b\\"), Some(Appearance::Dark));
+        assert_eq!(parse_osc11("\x1b]11;rgb:f/f/f\x07"), Some(Appearance::Light));
+        // Green carries most of the luminance.
+        assert_eq!(parse_osc11("\x1b]11;rgb:0000/ffff/0000\x07"), Some(Appearance::Light));
+        assert_eq!(parse_osc11("\x1b]11;rgb:ffff/0000/0000\x07"), Some(Appearance::Dark));
+    }
+
+    #[test]
+    fn a_reply_that_says_nothing_is_no_answer() {
+        assert_eq!(parse_osc11(""), None);
+        assert_eq!(parse_osc11("\x1b]11;"), None);
+        assert_eq!(parse_osc11("\x1b]11;rgb:1d/1f\x07"), None);
+        assert_eq!(parse_osc11("\x1b]11;rgb:zz/1f/21\x07"), None);
+        assert_eq!(parse_osc11("\x1b]11;rgb:11111/1f/21\x07"), None);
+        assert_eq!(parse_osc11("\x1b]11;#1d1f21\x07"), None);
+        assert_eq!(parse_osc11("\x1b]10;rgb:0000/0000/0000\x07"), None);
+        assert_eq!(parse_osc11("some key presses"), None);
     }
 
     #[test]
