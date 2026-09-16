@@ -408,17 +408,27 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Diff => match k.code {
-            KeyCode::Down | KeyCode::Char('j') => nav::jump_hunk(st, 1),
-            KeyCode::Up | KeyCode::Char('k') => nav::jump_hunk(st, -1),
+            KeyCode::Down | KeyCode::Char('j') => nav::jump_stop(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => nav::jump_stop(st, -1),
             KeyCode::Left | KeyCode::Char('h') => controller::switch_stage_side(st, false),
             KeyCode::Right | KeyCode::Char('l') => controller::switch_stage_side(st, true),
             KeyCode::Char(' ') => controller::toggle_stage_hunk(st, tx),
-            KeyCode::Char('d') => controller::begin_discard_hunk(st),
+            KeyCode::Char('d') => {
+                if !controller::discard_focused_comment(st, tx) {
+                    controller::begin_discard_hunk(st);
+                }
+            }
+            KeyCode::Enter => controller::enter_focused_stop(st),
+            KeyCode::Char('o') => controller::open_focused_thread(st),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Char('c') => controller::enter_comment_mode(st),
             KeyCode::Char('a') => controller::begin_ask(st),
-            KeyCode::Char('e') => editor::open_current_in_editor(st, false),
+            KeyCode::Char('e') => {
+                if !controller::edit_focused_comment(st) {
+                    editor::open_current_in_editor(st, false);
+                }
+            }
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Esc => {
                 if st.local_diff_path.take().is_some() {
@@ -639,6 +649,7 @@ fn set_file_idx(st: &mut State, idx: usize) {
     st.file_idx = idx.min(st.tree.len().saturating_sub(1));
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.diff_stop_idx = 0;
     st.local_diff_path = None; // back to the PR diff for the selected file
 }
 
@@ -654,6 +665,7 @@ fn jump_file(st: &mut State, direction: i64) {
             st.file_idx = i as usize;
             st.diff_scroll = 0;
             st.diff_hunk_idx = 0;
+            st.diff_stop_idx = 0;
             st.local_diff_path = None;
             return;
         }
@@ -725,6 +737,7 @@ fn open_file_or_dir(st: &mut State) {
             st.focus = Focus::Diff;
             st.diff_scroll = 0;
             st.diff_hunk_idx = 0;
+            st.diff_stop_idx = 0;
             st.diff_reveal_pending = true;
             st.local_diff_path = None;
         }

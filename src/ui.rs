@@ -10,12 +10,12 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    CommitKind, Focus, LineInfo, Overlay, PendingComment, StageState, State, TreeRow,
+    CommitKind, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State, TreeRow,
     SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    current_hunk_range, diff_path, hunk_for_comment, is_local_diff, is_split, source_maps,
-    stage_state,
+    current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff, is_split,
+    source_maps, stage_state, stop_reveal, thread_anchor, Stop,
 };
 use crate::syntax::{Painted, StyledLine};
 use crate::textbuffer;
@@ -438,7 +438,15 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · Space: stage hunk · d: revert hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
         }
-        Focus::Diff => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Diff => match focused_stop(st) {
+            Some(Stop::Pending(_)) => {
+                format!("j/k: stop · Enter/e: edit comment · d: discard · c: comment · s: side by side · Esc: back · {common}")
+            }
+            Some(Stop::Thread(_)) => {
+                format!("j/k: stop · Enter: answer · o: open in browser · c: comment · s: side by side · Esc: back · {common}")
+            }
+            _ => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        },
     }
 }
 
@@ -890,12 +898,19 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         crate::diff::sbs_row_by_line(&rows, st.diff_by_file.get(path).map_or(0, Vec::len));
 
     let focused = st.focus == Focus::Diff;
-    let cur_hr = if focused { current_hunk_range(st, path) } else { None };
+    let sel = if focused && !st.comment_mode { focused_stop(st) } else { None };
+    let on_comment = matches!(sel, Some(Stop::Pending(_) | Stop::Thread(_)));
+    let cur_hr = match focused && !on_comment {
+        true => current_hunk_range(st, path),
+        false => None,
+    };
     if st.diff_reveal_pending {
         let target = if st.comment_mode {
             Some((st.comment_line, st.comment_line))
+        } else if focused {
+            stop_reveal(st, path).map(|(s, e)| (s, e.saturating_sub(1)))
         } else {
-            cur_hr.map(|(s, e)| (s, e.saturating_sub(1)))
+            None
         };
         if let Some((s, e)) = target {
             let lo = row_by_line.get(s).copied().unwrap_or(0);
@@ -923,7 +938,12 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         (1usize, 0usize) // empty
     };
 
-    let pending_here: Vec<&PendingComment> = st.pending.iter().filter(|c| c.path == path).collect();
+    let pending_here: Vec<(usize, &PendingComment)> =
+        st.pending.iter().enumerate().filter(|(_, c)| c.path == path).collect();
+    let threads_here: Vec<(usize, &ReviewThread)> =
+        st.threads.iter().enumerate().filter(|(_, t)| t.path == path).collect();
+    let top = top_threads(st, path);
+    let now = now_epoch();
     let info_here = st.info_by_file.get(path);
     // The visible rows name the diff lines to color; a wrapped row shows fewer.
     let seen = rows.iter().skip(st.diff_scroll).take(vh);
@@ -1009,6 +1029,12 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
 
     let mut out: Vec<Line> = Vec::new();
     let mut top_done = false;
+    // A thread the diff cannot anchor any more reads at the top of the file.
+    if scroll == 0 {
+        for (ti, t) in &top {
+            push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+        }
+    }
     for row in rows.iter().skip(scroll) {
         if out.len() >= vh {
             break;
@@ -1052,7 +1078,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
                 push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
             }
         }
-        // Pending comments anchored to either side, spanning both columns.
+        // Comments anchored to either side, spanning both columns.
         let mut seen = None;
         for i in [row.left, row.right].into_iter().flatten() {
             if seen == Some(i) {
@@ -1060,28 +1086,180 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             }
             seen = Some(i);
             let Some(&(old, new)) = info_here.and_then(|inf| inf.get(i)) else { continue };
-            for c in &pending_here {
-                let hit = if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) };
-                if !hit {
-                    continue;
+            let hit = |line: Option<i64>, side: &str| match side {
+                "LEFT" => old == line,
+                _ => new == line,
+            };
+            for (ci, c) in &pending_here {
+                if hit(Some(c.line), &c.side) {
+                    push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
                 }
-                let range_tag = match c.start_line {
-                    Some(s) => format!("[{}-{}] ", s.min(c.line), s.max(c.line)),
-                    None => String::new(),
-                };
-                for (bi, bl) in c.body.lines().enumerate() {
-                    if out.len() >= vh {
-                        break;
-                    }
-                    let gutter = if bi == 0 { "▏💬 " } else { "▏   " };
-                    let tag = if bi == 0 { range_tag.as_str() } else { "" };
-                    let text = format!("{gutter}{tag}{}", bl.replace('\t', "    "));
-                    out.push(Line::from(Span::styled(pad(&text, iw), theme::comment_inline())));
+            }
+            for (ti, t) in &threads_here {
+                if t.line.is_some() && hit(t.line, &t.side) {
+                    push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
                 }
             }
         }
     }
     f.render_widget(Paragraph::new(out), inner);
+}
+
+/// Body rows an unfocused review thread keeps, before it folds.
+const THREAD_FOLD: usize = 12;
+
+/// Now, in seconds since the epoch.
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Days from 1970-01-01 to `y-m-d`, by Howard Hinnant's civil-calendar formula.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Seconds since the epoch of an ISO-8601 UTC stamp (`2024-05-01T12:34:56Z`).
+fn epoch_seconds(iso: &str) -> Option<i64> {
+    let (date, rest) = iso.split_once('T')?;
+    let mut d = date.split('-');
+    let next = |d: &mut std::str::Split<char>| d.next()?.parse::<i64>().ok();
+    let (y, m, day) = (next(&mut d)?, next(&mut d)?, next(&mut d)?);
+    let mut t = rest.trim_end_matches('Z').split(':');
+    let (h, min) = (next(&mut t)?, next(&mut t)?);
+    let s: i64 = t.next().and_then(|v| v.split('.').next()?.parse().ok()).unwrap_or(0);
+    Some(days_from_civil(y, m, day) * 86_400 + h * 3600 + min * 60 + s)
+}
+
+/// How old a timestamp is, in one short word.
+pub fn relative_time(iso: &str, now: i64) -> String {
+    let Some(then) = epoch_seconds(iso) else { return String::new() };
+    let d = (now - then).max(0);
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", d / 60),
+        3_600..=86_399 => format!("{}h ago", d / 3_600),
+        86_400..=2_591_999 => format!("{}d ago", d / 86_400),
+        2_592_000..=31_535_999 => format!("{}mo ago", d / 2_592_000),
+        _ => format!("{}y ago", d / 31_536_000),
+    }
+}
+
+/// Fold a thread's rows: the header always shows, and the rest gives way to a
+/// count once it passes `max`. Returns the rows kept and how many are hidden.
+fn fold_thread<T>(mut rows: Vec<T>, max: usize) -> (Vec<T>, usize) {
+    if rows.len() <= max + 1 {
+        return (rows, 0);
+    }
+    let hidden = rows.len() - max - 1;
+    rows.truncate(max + 1);
+    (rows, hidden)
+}
+
+/// One row of an inline note: a marker column carrying the focus, then the text
+/// across the rest of the pane.
+fn note_row(text: &str, iw: usize, style: Style, focused: bool) -> Line<'static> {
+    let style = if focused { style.patch(theme::picked()) } else { style };
+    let (marker, m_style) =
+        if focused { ("▌", style.patch(theme::focus())) } else { (" ", style) };
+    Line::from(vec![
+        Span::styled(marker, m_style),
+        Span::styled(pad(text, iw.saturating_sub(1)), style),
+    ])
+}
+
+/// The rows a pending comment of ours adds under the line it anchors to.
+fn pending_rows(c: &PendingComment, iw: usize, focused: bool) -> Vec<Line<'static>> {
+    let tag = match c.start_line {
+        Some(s) => format!("[{}-{}] ", s.min(c.line), s.max(c.line)),
+        None => String::new(),
+    };
+    c.body
+        .lines()
+        .enumerate()
+        .map(|(i, bl)| {
+            let gutter = if i == 0 { "▏💬 " } else { "▏   " };
+            let tag = if i == 0 { tag.as_str() } else { "" };
+            let text = format!("{gutter}{tag}{}", bl.replace('\t', "    "));
+            note_row(&text, iw, theme::comment_inline(), focused)
+        })
+        .collect()
+}
+
+/// The markdown body of a thread comment, wrapped and indented under its header.
+fn thread_body_rows(body: &str, indent: &str, width: usize) -> Vec<(String, Style)> {
+    let avail = width.saturating_sub(indent.chars().count()).max(4);
+    wrap_styled(crate::markdown::markdown_lines(body), avail)
+        .into_iter()
+        .map(|(text, kind)| {
+            (format!("{indent}{}", text.replace('\t', "    ")), theme::thread_body().patch(theme::kind_style(kind)))
+        })
+        .collect()
+}
+
+/// The rows an unresolved review thread adds under the line it anchors to.
+///
+/// The header names the author and the age; a reply hangs under it. A thread
+/// the cursor is not on folds, so a long discussion never buries the code.
+fn thread_rows(t: &ReviewThread, iw: usize, focused: bool, now: i64) -> Vec<Line<'static>> {
+    let tw = iw.saturating_sub(1);
+    let mut rows: Vec<(String, Style)> = Vec::new();
+    for (i, c) in t.comments.iter().enumerate() {
+        let age = relative_time(&c.created_at, now);
+        let (head, indent) = if i == 0 {
+            (format!("▏● @{} · {age}{}", c.author, thread_tag(t)), "▏  ")
+        } else {
+            (format!("▏  ↳ @{} · {age}", c.author), "▏    ")
+        };
+        rows.push((head, theme::thread_header()));
+        rows.extend(thread_body_rows(&c.body, indent, tw));
+    }
+    let (mut rows, hidden) = fold_thread(rows, if focused { usize::MAX - 1 } else { THREAD_FOLD });
+    if hidden > 0 {
+        rows.push((format!("▏  … {hidden} more lines"), theme::thread_header()));
+    }
+    rows.iter().map(|(text, style)| note_row(text, iw, *style, focused)).collect()
+}
+
+/// What a thread header says about a thread the diff has moved past.
+fn thread_tag(t: &ReviewThread) -> String {
+    let mut tag = String::new();
+    if t.outdated {
+        tag.push_str(" (outdated)");
+    }
+    if t.line.is_none() {
+        if let Some(l) = t.original_line {
+            tag.push_str(&format!(" · was line {l}"));
+        }
+    }
+    tag
+}
+
+/// Push as many of `rows` as the pane still has room for.
+fn push_rows(out: &mut Vec<Line<'static>>, vh: usize, rows: Vec<Line<'static>>) {
+    for row in rows {
+        if out.len() >= vh {
+            return;
+        }
+        out.push(row);
+    }
+}
+
+/// The threads of `path` the current diff cannot place, which show at the top
+/// of the file instead.
+fn top_threads<'a>(st: &'a State, path: &str) -> Vec<(usize, &'a ReviewThread)> {
+    st.threads
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.path == path && thread_anchor(st, path, t).is_none())
+        .collect()
 }
 
 fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
@@ -1092,11 +1270,18 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let sbs = !local && st.side_by_side && path.is_some();
     let title = match (&path, local) {
         (Some(p), true) => format!("[0] Local diff — {p}{}", if split { "  · unstaged | staged" } else { "" }),
-        (Some(p), false) => format!(
-            "[0] Diff — {p}{}{}",
-            if sbs { "  · old | new" } else { "" },
-            if has_overlay { "  · +local edits" } else { "" }
-        ),
+        (Some(p), false) => {
+            let threads = st.threads.iter().filter(|t| &t.path == p).count();
+            format!(
+                "[0] Diff — {p}{}{}{}",
+                if sbs { "  · old | new" } else { "" },
+                if has_overlay { "  · +local edits" } else { "" },
+                match threads {
+                    0 => String::new(),
+                    n => format!("  · {n} thread{}", if n == 1 { "" } else { "s" }),
+                }
+            )
+        }
         (None, _) => "[0] Diff".to_string(),
     };
     let b = block(&title, st.focus == Focus::Diff, false);
@@ -1120,12 +1305,18 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     }
 
     let focused = st.focus == Focus::Diff;
-    let cur_hr = if focused { path.as_ref().and_then(|p| current_hunk_range(st, p)) } else { None };
+    // The picker runs inside the selected block, so the block keeps the band.
+    let sel = if focused && !st.comment_mode { focused_stop(st) } else { None };
+    let on_comment = matches!(sel, Some(Stop::Pending(_) | Stop::Thread(_)));
+    let cur_hr = match focused && !on_comment {
+        true => path.as_ref().and_then(|p| current_hunk_range(st, p)),
+        false => None,
+    };
     // Only recenter after a keyboard navigation; mouse/PgUp/Dn scroll freely.
     if st.diff_reveal_pending {
         if st.comment_mode {
             st.diff_scroll = reveal_scroll(st.diff_scroll, st.comment_line, st.comment_line + 1, vh);
-        } else if let Some((s, e)) = cur_hr {
+        } else if let Some((s, e)) = path.as_ref().filter(|_| focused).and_then(|p| stop_reveal(st, p)) {
             st.diff_scroll = reveal_scroll(st.diff_scroll, s, e, vh);
         }
         st.diff_reveal_pending = false;
@@ -1152,11 +1343,21 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (1usize, 0usize) // empty
     };
 
-    // Pending comments to show inline (matched to the shown diff via info_here).
-    let pending_here: Vec<&PendingComment> = match &path {
-        Some(p) => st.pending.iter().filter(|c| &c.path == p).collect(),
-        None => Vec::new(),
+    // Comments to show inline (matched to the shown diff via info_here).
+    let inline_notes = !local;
+    let pending_here: Vec<(usize, &PendingComment)> = match &path {
+        Some(p) if inline_notes => st.pending.iter().enumerate().filter(|(_, c)| &c.path == p).collect(),
+        _ => Vec::new(),
     };
+    let threads_here: Vec<(usize, &ReviewThread)> = match &path {
+        Some(p) if inline_notes => st.threads.iter().enumerate().filter(|(_, t)| &t.path == p).collect(),
+        _ => Vec::new(),
+    };
+    let top = match &path {
+        Some(p) if inline_notes => top_threads(st, p),
+        _ => Vec::new(),
+    };
+    let now = now_epoch();
     let info_here = path.as_ref().and_then(|p| source_maps(st, p).1.get(p));
 
     // Local (uncommitted) worktree edits to overlay in orange on the PR diff. The
@@ -1216,6 +1417,12 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let mut out: Vec<Line> = Vec::new();
     let mut top_done = false;
     let mut i = st.diff_scroll;
+    // A thread the diff cannot anchor any more reads at the top of the file.
+    if i == 0 {
+        for (ti, t) in &top {
+            push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+        }
+    }
     while out.len() < vh && i < diff_lines.len() {
         let ln = &diff_lines[i];
         let new_side = info_here.and_then(|info| info.get(i)).and_then(|&(_, n)| n);
@@ -1252,25 +1459,20 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
                 push_adds(&mut out, adds);
             }
         }
-        // Inline any pending comment anchored to this line.
+        // Inline any comment or thread anchored to this line.
         if let Some(&(old, new)) = info_here.and_then(|info| info.get(i)) {
-            for c in &pending_here {
-                let hit = if c.side == "LEFT" { old == Some(c.line) } else { new == Some(c.line) };
-                if !hit {
-                    continue;
+            let hit = |line: Option<i64>, side: &str| match side {
+                "LEFT" => old == line,
+                _ => new == line,
+            };
+            for (ci, c) in &pending_here {
+                if hit(Some(c.line), &c.side) {
+                    push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
                 }
-                let range_tag = match c.start_line {
-                    Some(s) => format!("[{}-{}] ", s.min(c.line), s.max(c.line)),
-                    None => String::new(),
-                };
-                for (bi, bl) in c.body.lines().enumerate() {
-                    if out.len() >= vh {
-                        break;
-                    }
-                    let gutter = if bi == 0 { "▏💬 " } else { "▏   " };
-                    let tag = if bi == 0 { range_tag.as_str() } else { "" };
-                    let text = format!("{gutter}{tag}{}", bl.replace('\t', "    "));
-                    out.push(Line::from(Span::styled(pad(&text, iw), theme::comment_inline())));
+            }
+            for (ti, t) in &threads_here {
+                if t.line.is_some() && hit(t.line, &t.side) {
+                    push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
                 }
             }
         }
@@ -1591,6 +1793,42 @@ fn render_overlay(f: &mut Frame, st: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_age_of_a_comment_reads_in_one_word() {
+        let t0 = epoch_seconds("2024-05-01T12:00:00Z").unwrap();
+        assert_eq!(t0, 1_714_564_800);
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 30), "just now");
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 5 * 60), "5m ago");
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 2 * 3600), "2h ago");
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 3 * 86_400), "3d ago");
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 70 * 86_400), "2mo ago");
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 + 800 * 86_400), "2y ago");
+        // A clock that is behind the server does not read as the future.
+        assert_eq!(relative_time("2024-05-01T12:00:00Z", t0 - 500), "just now");
+        // Fractional seconds and a stamp we cannot read.
+        assert_eq!(relative_time("2024-05-01T12:00:00.250Z", t0 + 60), "1m ago");
+        assert_eq!(relative_time("yesterday", t0), "");
+    }
+
+    #[test]
+    fn a_long_thread_folds_to_a_count() {
+        let rows: Vec<String> = (0..20).map(|i| format!("row {i}")).collect();
+        let (kept, hidden) = fold_thread(rows.clone(), 12);
+        assert_eq!(kept.len(), 13, "the header plus twelve rows");
+        assert_eq!(kept[0], "row 0");
+        assert_eq!(hidden, 7);
+
+        // A thread that fits shows whole.
+        let (kept, hidden) = fold_thread(rows[..5].to_vec(), 12);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(hidden, 0);
+
+        // The focused stop asks for everything.
+        let (kept, hidden) = fold_thread(rows.clone(), usize::MAX - 1);
+        assert_eq!(kept.len(), 20);
+        assert_eq!(hidden, 0);
+    }
 
     #[test]
     fn clamp_keeps_selection_visible() {

@@ -15,12 +15,12 @@ Five panes (left column stacked, right side full-height):
 - **Pending** — review comments queued locally, waiting to be submitted.
 - **Right** — PR description + timeline when the PRs pane is focused,
   selected commit's message when the Commits pane is focused,
-  diff of the highlighted / opened file otherwise. The current hunk is
-  marked with a green side-bar.
+  diff of the highlighted / opened file otherwise. The current stop — a change
+  block, a pending comment or a review thread — is marked with a green side-bar.
 
 Written in **Rust** with [ratatui](https://ratatui.rs) + crossterm. Backed by the
 `gh` CLI (auth, PR list, diff) and `git` worktrees (checkout), plus GitHub's
-GraphQL API for `viewedState` mutations and pending reviews.
+GraphQL API for `viewedState` mutations, pending reviews and review threads.
 
 ## Requirements
 
@@ -133,12 +133,19 @@ While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.
 
 Diff pane:
-- `j` / `k` / arrows — jump to next / previous change block
+- `j` / `k` / arrows — jump to next / previous **stop**: the change blocks and
+  the comments drawn inline, in the order they read
 - `PgDn` / `PgUp` — page down / up
-- `c` — start the comment line picker (see below)
+- `c` — start the comment line picker on the enclosing block (see below)
 - `s` — switch the review diff between inline and side by side
 - `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
+- on a **pending comment** of yours:
+  - `Enter` / `e` — edit it (the same editor the Pending pane opens)
+  - `d` — discard it, from the draft review on GitHub too
+- on an **unresolved review thread** (read-only):
+  - `Enter` — answer it: a new comment of yours, on the same line
+  - `o` — open the thread on github.com
 - on a **local** diff (opened with `Enter` from the pending-edits pane):
   - `Space` — stage / unstage the selected change block (lazygit-style)
   - `h` / `l` — move between the two columns of a partly-staged file
@@ -193,7 +200,7 @@ light set:
 `s` draws the review diff side by side: the old side on the left, the new side
 on the right, and the left panes shrink to make room. Each deletion sits across
 from the addition that replaces it; an unpaired change leaves the other column
-empty. File headers, `@@` headers and pending comments span both columns, and
+empty. File headers, `@@` headers and inline comments span both columns, and
 local worktree edits stay on the new side. Everything else carries over from the
 inline view: the change-block band, the comment picker, `j`/`k`, and the scroll
 keeps its place across the switch. A local diff from the pending-edits pane
@@ -209,6 +216,31 @@ A "hunk" here is a **change block** — a contiguous run of `+`/`-` lines. Conte
 separated by an unchanged line are two separate blocks you can navigate and
 comment on independently. The focused block is highlighted with a cyan band plus
 a green side-bar (only while the diff pane is focused).
+
+### Stops, and the threads under the code
+
+`j`/`k` in the diff pane walk the **stops**: the change blocks plus every
+comment drawn under a line. A comment you stop on wears the same side-bar and
+the same focused band as a block, so what the next key acts on is always the
+thing that looks selected. `c` still picks a line in the enclosing block.
+
+Under their anchored line the diff shows:
+
+- your own **pending comments**, in cyan, which `Enter`/`e` edits and `d`
+  discards;
+- every **unresolved review thread** of the PR, from any author, read-only, on
+  a faint band of the theme's selection color: a `● @author · 2h ago` header,
+  the body as markdown, then each reply as `↳ @author · time`.
+
+A resolved thread is gone. An outdated one stays, marked `(outdated)`; one the
+current diff has no line for reads at the top of the file, with the line it was
+written on. The comments of your own unsubmitted review are not repeated there:
+they are the pending ones, which you can still edit. A thread you are not
+stopped on folds to 12 rows plus a `… N more lines` count.
+
+`Enter` on a thread answers it the only way this tool writes: one more comment
+of your pending review, on the same line. Nothing is posted until you finish the
+review. The threads load with the PR and reload with `r`.
 
 ### Commenting (`c` in diff pane)
 

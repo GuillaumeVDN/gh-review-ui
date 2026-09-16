@@ -4,7 +4,9 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use ghreview::diff::{compute_hunks, parse_diff};
-use ghreview::models::{FileEntry, Focus, PendingComment, State, TreeRow};
+use ghreview::models::{
+    FileEntry, Focus, PendingComment, ReviewThread, State, ThreadComment, TreeRow,
+};
 use ghreview::ui;
 
 fn review_state() -> State {
@@ -131,6 +133,97 @@ fn side_by_side_keeps_the_inline_pending_comment() {
     let out = screen(&mut st, 160, 30);
     let row = row_with(&out, "needs a test");
     assert!(row.contains("💬"), "inline under its line: {row}");
+}
+
+fn pending_on_9() -> PendingComment {
+    PendingComment {
+        path: "f.txt".into(),
+        body: "needs a test".into(),
+        line: 9,
+        side: "RIGHT".into(),
+        comment_id: "local-1".into(),
+        start_line: None,
+        start_side: "RIGHT".into(),
+    }
+}
+
+fn thread_on(line: Option<i64>, bodies: &[&str]) -> ReviewThread {
+    ReviewThread {
+        id: "t1".into(),
+        path: "f.txt".into(),
+        line,
+        start_line: None,
+        side: "RIGHT".into(),
+        start_side: "RIGHT".into(),
+        outdated: line.is_none(),
+        original_line: Some(42),
+        comments: bodies
+            .iter()
+            .map(|b| ThreadComment {
+                author: "bob".into(),
+                body: (*b).into(),
+                created_at: "2024-05-01T12:00:00Z".into(),
+                url: "https://github.com/o/r/pull/1#discussion_r1".into(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn an_unresolved_thread_reads_under_its_line_in_both_views() {
+    let mut st = review_state();
+    st.threads = vec![thread_on(Some(9), &["please rework this"])];
+    let out = screen(&mut st, 160, 30);
+    assert!(row_with(&out, "@bob").contains("●"), "the header names the author: {out}");
+    assert!(out.contains("please rework this"), "{out}");
+    assert!(out.contains("1 thread"), "the title counts them: {out}");
+
+    st.side_by_side = true;
+    let out = screen(&mut st, 160, 30);
+    assert!(out.contains("please rework this"), "{out}");
+}
+
+/// An outdated thread the diff cannot place reads at the top of the file, with
+/// the line it was written on.
+#[test]
+fn a_thread_without_a_line_reads_at_the_top() {
+    let mut st = review_state();
+    st.threads = vec![thread_on(None, &["long gone"])];
+    let out = screen(&mut st, 160, 30);
+    let row = row_with(&out, "@bob");
+    assert!(row.contains("(outdated)"), "{row}");
+    assert!(row.contains("was line 42"), "{row}");
+}
+
+#[test]
+fn the_focused_comment_stop_wears_the_side_bar() {
+    let mut st = review_state();
+    st.focus = Focus::Diff;
+    st.pending = vec![pending_on_9()];
+    // The block first, then the comment hanging under its last line.
+    let out = screen(&mut st, 160, 30);
+    assert!(row_with(&out, "needs a test").contains(" ▏💬"), "unfocused: {out}");
+
+    st.diff_stop_idx = 1;
+    let out = screen(&mut st, 160, 30);
+    assert!(row_with(&out, "needs a test").contains("▌▏💬"), "focused: {out}");
+}
+
+/// A long thread gives way to a count, and the focused one shows whole.
+#[test]
+fn a_long_thread_folds_until_it_is_the_stop() {
+    let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    let mut st = review_state();
+    st.focus = Focus::Diff;
+    st.threads = vec![thread_on(Some(9), &[&body])];
+    let out = screen(&mut st, 160, 40);
+    assert!(out.contains("more lines"), "folded: {out}");
+    assert!(!out.contains("line 19"), "folded: {out}");
+
+    st.diff_stop_idx = 1;
+    let out = screen(&mut st, 160, 40);
+    assert!(!out.contains("more lines"), "the stop shows whole: {out}");
+    assert!(out.contains("line 19"), "{out}");
 }
 
 #[test]
