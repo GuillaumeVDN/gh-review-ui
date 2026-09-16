@@ -30,9 +30,13 @@ const MAX_LINE: usize = 600;
 /// Files kept in the cache before it is dropped and rebuilt on demand.
 const MAX_CACHED: usize = 64;
 
-fn syntaxes() -> &'static SyntaxSet {
+/// syntect's own syntaxes plus the ones vendored in `assets/syntaxes`, baked
+/// into the binary by the build script.
+pub fn syntaxes() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    SET.get_or_init(|| {
+        syntect::dumps::from_binary(include_bytes!(concat!(env!("OUT_DIR"), "/syntaxes.bin")))
+    })
 }
 
 struct Rule {
@@ -129,12 +133,18 @@ fn content_of(line: &str) -> Option<String> {
     }
 }
 
+/// Extensions no syntax names, and the one that reads the same language.
+const ALIASES: [(&str, &str); 5] =
+    [("jsx", "tsx"), ("mjs", "js"), ("cjs", "js"), ("hcl", "tf"), ("tfvars", "tf")];
+
 fn syntax_for<'a>(set: &'a SyntaxSet, path: &str, first: Option<&str>) -> Option<&'a SyntaxReference> {
     let file = std::path::Path::new(path);
     let ext = file.extension().and_then(|e| e.to_str());
     let name = file.file_name().and_then(|e| e.to_str());
+    let alias = ext.and_then(|e| ALIASES.iter().find(|(from, _)| *from == e).map(|(_, to)| *to));
     ext.and_then(|e| set.find_syntax_by_extension(e))
         .or_else(|| name.and_then(|n| set.find_syntax_by_extension(n)))
+        .or_else(|| alias.and_then(|a| set.find_syntax_by_extension(a)))
         .or_else(|| first.and_then(|l| set.find_syntax_by_first_line(l)))
 }
 
@@ -349,6 +359,68 @@ mod tests {
         assert_eq!(role_of(&out[3], "self"), Some(&Token::VariableBuiltin));
         assert_eq!(role_of(&out[3], "+="), Some(&Token::Operator));
         assert_eq!(role_of(&out[3], "1"), Some(&Token::Number));
+    }
+
+    #[test]
+    fn typescript_and_tsx_read_like_the_editor() {
+        let out = roles(
+            "app.tsx",
+            &[
+                "import { useState } from \"react\";",
+                "// a note",
+                "export function Card<T>(props: Props<T>): JSX.Element {",
+                "  const [open, setOpen] = useState<boolean>(false);",
+                "  return <div className=\"card\" onClick={() => setOpen(!open)}>{`n=${props.id}`}</div>;",
+            ],
+        );
+        assert_eq!(role_of(&out[0], "import"), Some(&Token::Import));
+        assert!(held(&out[0], Token::Str).iter().any(|t| t.contains("react")));
+        assert_eq!(role_of(&out[1], "// a note"), Some(&Token::Comment));
+        assert_eq!(role_of(&out[2], "function"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[2], "Card"), Some(&Token::FunctionDef));
+        assert_eq!(role_of(&out[3], "const"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[3], "false"), Some(&Token::Boolean));
+        assert_eq!(role_of(&out[4], "return"), Some(&Token::Keyword));
+        assert_eq!(role_of(&out[4], "div"), Some(&Token::Tag));
+        assert_eq!(role_of(&out[4], "className"), Some(&Token::Property));
+        assert!(held(&out[4], Token::Str).iter().any(|t| t.contains("card")));
+
+        // `.ts` and `.jsx` answer too, and a plain `.ts` line still reads.
+        let ts = roles("lib.ts", &["export const answer: number = 42;"]);
+        assert_eq!(role_of(&ts[0], "42"), Some(&Token::Number));
+        // A `.jsx` file reads with the TSX syntax, where a component is a type
+        // and a plain element is a tag.
+        let jsx = roles("app.jsx", &["const el = <Box title=\"hi\" />;"]);
+        assert_eq!(role_of(&jsx[0], "Box"), Some(&Token::Type));
+        assert_eq!(role_of(&jsx[0], "title"), Some(&Token::Property));
+    }
+
+    #[test]
+    fn the_vendored_syntaxes_answer_for_their_files() {
+        let set = syntaxes();
+        for (ext, name) in [
+            ("ts", "TypeScript"),
+            ("tsx", "TypeScriptReact"),
+            ("jsx", "TypeScriptReact"),
+            ("mjs", "JavaScript"),
+            ("toml", "TOML"),
+            ("kt", "Kotlin"),
+            ("swift", "Swift"),
+            ("dart", "Dart"),
+            ("graphql", "GraphQL"),
+            ("tf", "Terraform"),
+            ("hcl", "Terraform"),
+            ("vue", "Vue Component"),
+            ("ex", "Elixir"),
+            ("zig", "Zig"),
+            ("proto", "Protocol Buffer"),
+            ("nix", "Nix"),
+            ("fish", "Fish"),
+        ] {
+            let found = syntax_for(set, &format!("a.{ext}"), None).map(|s| s.name.as_str());
+            assert_eq!(found, Some(name), "{ext}");
+        }
+        assert_eq!(syntax_for(set, "Dockerfile", None).map(|s| s.name.as_str()), Some("Dockerfile"));
     }
 
     #[test]

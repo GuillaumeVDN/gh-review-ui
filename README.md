@@ -156,11 +156,18 @@ italic. It reads `~/.local/state/omarchy/current/theme/colors.toml`
 (`$XDG_STATE_HOME` when that is set), and follows a theme switch within a
 second, with no restart.
 
-The code itself carries syntax colors, for every language
-[syntect](https://github.com/trishume/syntect) ships a syntax for. The language
-comes from the file extension, then from the first line; a file neither answers
-for stays plain. Each file is parsed twice, once per side of the diff, so a
-deleted line and the line that replaces it each read as their own text.
+The code itself carries syntax colors. The language comes from the file
+extension, then from the first line; a file neither answers for stays plain.
+Each file is parsed twice, once per side of the diff, so a deleted line and the
+line that replaces it each read as their own text.
+
+The syntaxes are [syntect](https://github.com/trishume/syntect)'s own set plus
+the ones under `assets/syntaxes`, which cover TypeScript, TSX, JSX, TOML,
+Dockerfile, Kotlin, Swift, Dart, GraphQL, Terraform, Vue, Elixir, Zig,
+Protobuf, Nix, fish, nginx and `.env`. To add one, drop a Sublime Text
+`.sublime-syntax` file (the v1 format, not a `version: 2` one) and its upstream
+LICENSE in `assets/syntaxes/<Name>/` and build: `build.rs` bakes the whole set
+into the binary, and skips with a warning any file syntect cannot read.
 
 The diff meaning lives in the gutter and the background. The `+` / `-` marker
 and the line numbers wear the theme's green and red, and the changed line sits
