@@ -56,6 +56,8 @@ const ADD_DEL_TINT: f32 = 0.18;
 const CURRENT_TINT: f32 = 0.32;
 const TINT_FLOOR: f32 = 5.5;
 const CURRENT_FLOOR: f32 = 4.5;
+/// How far a review thread's band carries the selection color.
+const THREAD_TINT: f32 = 0.30;
 
 fn channel(c: u8) -> f32 {
     let c = c as f32 / 255.0;
@@ -105,6 +107,7 @@ pub struct Palette {
     del_bg: Color,
     add_bg_current: Color,
     del_bg_current: Color,
+    thread_bg: Color,
 }
 
 impl Palette {
@@ -121,6 +124,10 @@ impl Palette {
             del_bg: Color::Indexed(del),
             add_bg_current: Color::Indexed(add_cur),
             del_bg_current: Color::Indexed(del_cur),
+            thread_bg: Color::Indexed(match appearance {
+                Appearance::Dark => 236,
+                Appearance::Light => 254,
+            }),
         }
     }
 
@@ -138,6 +145,7 @@ impl Palette {
             del_bg: band(c.red, ADD_DEL_TINT, TINT_FLOOR),
             add_bg_current: band(c.green, CURRENT_TINT, CURRENT_FLOOR),
             del_bg_current: band(c.red, CURRENT_TINT, CURRENT_FLOOR),
+            thread_bg: band(c.selection, THREAD_TINT, TINT_FLOOR),
             theme: Some(c),
         }
     }
@@ -191,6 +199,17 @@ impl Palette {
             DiffKind::Del => self.row(kind, current).fg(self.color(|c| c.red, Color::Red)),
             _ => dim_of(self),
         }
+    }
+
+    /// The body of a review thread: the theme's own text on a faint band of
+    /// the selection color, which keeps it apart from our cyan drafts.
+    pub fn thread_row(&self) -> Style {
+        Style::default().bg(self.thread_bg).fg(self.color(|c| c.foreground, Color::Reset))
+    }
+
+    /// The `● @author · 2h ago` line of a review thread.
+    pub fn thread_head(&self) -> Style {
+        self.thread_row().fg(self.color(|c| c.dark_foreground, Color::DarkGray))
     }
 
     /// The line the comment picker points at.
@@ -466,6 +485,16 @@ pub fn comment_marker() -> Style {
 /// Inline pending-comment body shown under a diff line.
 pub fn comment_inline() -> Style {
     palette().fg(|c| c.cyan, Color::Cyan)
+}
+
+/// The body of an unresolved review thread, drawn inline.
+pub fn thread_body() -> Style {
+    palette().thread_row()
+}
+
+/// The author/age line of an unresolved review thread.
+pub fn thread_header() -> Style {
+    palette().thread_head()
 }
 
 /// Local (uncommitted worktree) edits overlaid on the PR diff, in orange.

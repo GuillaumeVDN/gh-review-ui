@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 
 use crate::diff::parse_diff;
 use crate::gh::{gh_graphql, gh_json, sh, sh_cwd, Var};
-use crate::models::{Category, Commit, CommitKind, FileEntry, LineInfo, Pr, PendingComment};
+use crate::models::{
+    Category, Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr, ReviewThread,
+    ThreadComment,
+};
 
 /// Lines of context around each hunk (git's default is 3).
 pub const DIFF_CONTEXT: usize = 8;
@@ -949,6 +952,104 @@ pub fn load_pending_comments(owner: &str, name: &str, number: i64, login: &str) 
     Ok(out)
 }
 
+// ---- review threads ----
+
+const REVIEW_THREADS_QUERY: &str = r#"
+    query($owner:String!, $name:String!, $number:Int!, $after:String) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$number) {
+          reviewThreads(first:100, after:$after) {
+            nodes {
+              id isResolved isOutdated path line startLine originalLine
+              diffSide startDiffSide
+              comments(first:50) {
+                nodes {
+                  id author { login } body createdAt state url
+                  pullRequestReview { id state }
+                }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }"#;
+
+/// Every unresolved review thread of the PR, from any author, paginated.
+pub fn load_review_threads(owner: &str, name: &str, number: i64, login: &str) -> Result<Vec<ReviewThread>> {
+    let mut out = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut vars: Vec<(&str, Var)> = vec![
+            ("owner", owner.into()),
+            ("name", name.into()),
+            ("number", number.into()),
+        ];
+        if let Some(a) = &after {
+            vars.push(("after", a.clone().into()));
+        }
+        let data = gh_graphql(REVIEW_THREADS_QUERY, &vars)?;
+        let page = &data["data"]["repository"]["pullRequest"]["reviewThreads"];
+        out.extend(parse_review_threads(page, login));
+        if page["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+            break;
+        }
+        after = page["pageInfo"]["endCursor"].as_str().map(str::to_string);
+    }
+    Ok(out)
+}
+
+/// The threads of one `reviewThreads` page.
+///
+/// A resolved thread is done with. The viewer's own pending comments are the
+/// draft review, which the Pending pane already owns and can edit, so they are
+/// dropped here and a thread left empty by that goes with them.
+pub fn parse_review_threads(page: &Value, login: &str) -> Vec<ReviewThread> {
+    let Some(nodes) = page["nodes"].as_array() else { return Vec::new() };
+    let mut out = Vec::new();
+    for n in nodes {
+        if n["isResolved"].as_bool() == Some(true) {
+            continue;
+        }
+        let comments: Vec<ThreadComment> = n["comments"]["nodes"]
+            .as_array()
+            .map(|cs| cs.iter().filter(|c| !own_draft(c, login)).map(thread_comment).collect())
+            .unwrap_or_default();
+        if comments.is_empty() {
+            continue;
+        }
+        let side = n["diffSide"].as_str().unwrap_or("RIGHT").to_string();
+        out.push(ReviewThread {
+            id: n["id"].as_str().unwrap_or("").to_string(),
+            path: n["path"].as_str().unwrap_or("").to_string(),
+            line: n["line"].as_i64(),
+            start_line: n["startLine"].as_i64(),
+            start_side: n["startDiffSide"].as_str().unwrap_or(&side).to_string(),
+            side,
+            outdated: n["isOutdated"].as_bool() == Some(true),
+            original_line: n["originalLine"].as_i64(),
+            comments,
+        });
+    }
+    out
+}
+
+/// Whether a thread comment belongs to the viewer's own unsubmitted review.
+fn own_draft(c: &Value, login: &str) -> bool {
+    !login.is_empty()
+        && c["pullRequestReview"]["state"].as_str() == Some("PENDING")
+        && c["author"]["login"].as_str() == Some(login)
+}
+
+fn thread_comment(c: &Value) -> ThreadComment {
+    ThreadComment {
+        author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+        body: c["body"].as_str().unwrap_or("").to_string(),
+        created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+        url: c["url"].as_str().unwrap_or("").to_string(),
+    }
+}
+
 /// Add a pending review comment. Returns `false` when GitHub couldn't place it
 /// (the line isn't part of the diff): `addPullRequestReviewThread` then returns
 /// `thread: null` with **no** GraphQL error, so success can't be assumed.
@@ -1088,6 +1189,128 @@ mod tests {
 
     fn diff_of(entries: &[(&str, &str)]) -> Diff {
         entries.iter().map(|(p, d)| (p.to_string(), d.lines().map(String::from).collect())).collect()
+    }
+
+    /// One `reviewThreads` page, in the shape the query asks GitHub for.
+    fn threads_page(nodes: Value, next: Option<&str>) -> Value {
+        json!({
+            "nodes": nodes,
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+        })
+    }
+
+    fn comment_node(author: &str, body: &str, review_state: &str) -> Value {
+        json!({
+            "id": "c1",
+            "author": { "login": author },
+            "body": body,
+            "createdAt": "2024-05-01T12:00:00Z",
+            "state": "SUBMITTED",
+            "url": "https://github.com/o/r/pull/1#discussion_r1",
+            "pullRequestReview": { "id": "r1", "state": review_state },
+        })
+    }
+
+    fn thread_node(id: &str, resolved: bool, outdated: bool, line: Value, comments: Value) -> Value {
+        json!({
+            "id": id,
+            "isResolved": resolved,
+            "isOutdated": outdated,
+            "path": "a.rs",
+            "line": line,
+            "startLine": null,
+            "originalLine": 42,
+            "diffSide": "RIGHT",
+            "startDiffSide": "RIGHT",
+            "comments": { "nodes": comments },
+        })
+    }
+
+    /// A resolved thread is done with, and our own draft is the Pending pane's.
+    #[test]
+    fn the_parser_keeps_only_what_is_still_open_and_not_ours() {
+        let page = threads_page(
+            json!([
+                thread_node("open", false, false, json!(7), json!([comment_node("bob", "why?", "APPROVED")])),
+                thread_node("done", true, false, json!(7), json!([comment_node("bob", "ok", "APPROVED")])),
+                thread_node("mine", false, false, json!(7), json!([comment_node("me", "draft", "PENDING")])),
+            ]),
+            None,
+        );
+        let out = parse_review_threads(&page, "me");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "open");
+        assert_eq!(out[0].line, Some(7));
+        assert_eq!(out[0].comments[0].author, "bob");
+        assert_eq!(out[0].url(), "https://github.com/o/r/pull/1#discussion_r1");
+    }
+
+    /// Someone else's pending comment is not ours to edit, and a thread we
+    /// answered keeps the answer.
+    #[test]
+    fn another_authors_draft_and_our_answers_stay() {
+        let page = threads_page(
+            json!([
+                thread_node("theirs", false, false, json!(7), json!([comment_node("bob", "hmm", "PENDING")])),
+                thread_node(
+                    "answered",
+                    false,
+                    false,
+                    json!(7),
+                    json!([comment_node("bob", "why?", "APPROVED"), comment_node("me", "because", "COMMENTED")]),
+                ),
+            ]),
+            None,
+        );
+        let out = parse_review_threads(&page, "me");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].comments.len(), 2);
+    }
+
+    /// An outdated thread stays, and one the diff cannot place any more keeps
+    /// the line it was written on.
+    #[test]
+    fn an_outdated_thread_keeps_its_original_line() {
+        let page = threads_page(
+            json!([thread_node("old", false, true, json!(null), json!([comment_node("bob", "stale", "APPROVED")]))]),
+            None,
+        );
+        let out = parse_review_threads(&page, "me");
+        assert!(out[0].outdated);
+        assert_eq!(out[0].line, None);
+        assert_eq!(out[0].original_line, Some(42));
+    }
+
+    /// Pagination: every page adds to the list, in the order GitHub serves it.
+    #[test]
+    fn the_pages_add_up() {
+        let first = threads_page(
+            json!([thread_node("t1", false, false, json!(1), json!([comment_node("bob", "a", "APPROVED")]))]),
+            Some("cursor"),
+        );
+        let second = threads_page(
+            json!([thread_node("t2", false, false, json!(2), json!([comment_node("ann", "b", "APPROVED")]))]),
+            None,
+        );
+        assert_eq!(first["pageInfo"]["hasNextPage"], json!(true));
+        assert_eq!(first["pageInfo"]["endCursor"], json!("cursor"));
+        let mut all = parse_review_threads(&first, "me");
+        all.extend(parse_review_threads(&second, "me"));
+        let ids: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t2"]);
+        assert_eq!(second["pageInfo"]["hasNextPage"], json!(false));
+    }
+
+    /// A thread with nothing left to read is not a thread.
+    #[test]
+    fn a_thread_of_our_own_draft_alone_disappears() {
+        let page = threads_page(
+            json!([thread_node("mine", false, false, json!(7), json!([comment_node("me", "draft", "PENDING")]))]),
+            None,
+        );
+        assert!(parse_review_threads(&page, "me").is_empty());
+        // Without a login there is no draft of ours to take out.
+        assert_eq!(parse_review_threads(&page, "").len(), 1);
     }
 
     /// A rebase rewrites every commit and every blob sha, and we ask git for

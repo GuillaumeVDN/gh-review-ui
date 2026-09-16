@@ -115,6 +115,39 @@ pub struct PendingComment {
     pub start_side: String,
 }
 
+/// One comment inside a GitHub review thread.
+#[derive(Clone, Debug)]
+pub struct ThreadComment {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+}
+
+/// An unresolved review thread on the active PR, shown read-only in the diff.
+#[derive(Clone, Debug)]
+pub struct ReviewThread {
+    pub id: String,
+    pub path: String,
+    /// Where the thread anchors on the current diff. `None` for an outdated
+    /// thread the diff no longer holds a line for.
+    pub line: Option<i64>,
+    pub start_line: Option<i64>,
+    pub side: String, // "RIGHT" | "LEFT"
+    pub start_side: String,
+    pub outdated: bool,
+    /// The line the thread was written on, for a thread with no anchor.
+    pub original_line: Option<i64>,
+    pub comments: Vec<ThreadComment>,
+}
+
+impl ReviewThread {
+    /// The web page of the thread: its first comment's own URL.
+    pub fn url(&self) -> &str {
+        self.comments.first().map_or("", |c| c.url.as_str())
+    }
+}
+
 /// A tree row for the Files pane.
 #[derive(Clone, Debug)]
 pub enum TreeRow {
@@ -338,6 +371,9 @@ pub struct State {
     pub hunks_by_file: HunkMap,
     pub diff_scroll: usize,
     pub diff_hunk_idx: usize,
+    /// Which navigation stop the diff pane sits on: the change blocks and the
+    /// comments drawn inline, in diff order.
+    pub diff_stop_idx: usize,
     /// Set when a keyboard action should scroll the selected hunk/comment into
     /// view on the next render; free scrolling (mouse/PgUp/Dn) leaves it unset.
     pub diff_reveal_pending: bool,
@@ -363,6 +399,9 @@ pub struct State {
     pub pending: Vec<PendingComment>,
     pub pending_idx: usize,
     pub pending_offset: usize,
+
+    /// Unresolved review threads of the active PR, from any author.
+    pub threads: Vec<ReviewThread>,
 
     pub focus: Focus,
     pub status: String,

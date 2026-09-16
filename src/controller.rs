@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::navigation::{
     cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
-    hunk_unstages, is_local_diff, is_split, line_target, stage_state,
+    hunk_unstages, is_local_diff, is_split, line_target, stage_state, Stop,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -32,6 +32,7 @@ fn set_diff(
     st.info_by_file = info;
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.diff_stop_idx = 0;
     st.diff_reveal_pending = true;
     st.comment_mode = false;
     st.comment_start = None;
@@ -71,6 +72,7 @@ fn reset_review_panels(st: &mut State) {
     st.pending.clear();
     st.pending_idx = 0;
     st.pending_offset = 0;
+    st.threads.clear();
     st.edit_files.clear();
     st.edit_tree.clear();
     st.edit_diff_by_file.clear();
@@ -172,10 +174,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                 a.head = h;
             }
         }
-        Msg::Active { number, pr_id, files, diff, info, pending, commits, stale_viewed } => {
+        Msg::Active { number, pr_id, files, diff, info, pending, threads, commits, stale_viewed } => {
             let here = cur_file_path(st);
             st.busy.remove("active");
             st.pending = pending;
+            st.threads = threads;
             if st.pending_idx >= st.pending.len() {
                 st.pending_idx = st.pending.len().saturating_sub(1);
             }
@@ -803,6 +806,83 @@ pub fn confirm_edit(st: &mut State, tx: &Sender<Job>) {
     st.status = format!("Updating comment on {path}:{line}…");
 }
 
+// ---- the stop the diff pane sits on ----
+
+/// The pending comment the diff pane's cursor sits on.
+fn focused_pending(st: &State) -> Option<usize> {
+    match crate::navigation::focused_stop(st) {
+        Some(Stop::Pending(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// The review thread the diff pane's cursor sits on.
+fn focused_thread(st: &State) -> Option<usize> {
+    match crate::navigation::focused_stop(st) {
+        Some(Stop::Thread(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// `e` in [0]: edit the pending comment under the cursor. Says whether it did,
+/// so the key falls through to the editor on a change block.
+pub fn edit_focused_comment(st: &mut State) -> bool {
+    let Some(i) = focused_pending(st) else { return false };
+    st.pending_idx = i;
+    begin_edit_pending(st);
+    true
+}
+
+/// `d` in [0]: discard the pending comment under the cursor.
+pub fn discard_focused_comment(st: &mut State, tx: &Sender<Job>) -> bool {
+    let Some(i) = focused_pending(st) else { return false };
+    st.pending_idx = i;
+    discard_selected_comment(st, tx);
+    true
+}
+
+/// `Enter` in [0]: edit our own comment, or answer a thread.
+pub fn enter_focused_stop(st: &mut State) {
+    if edit_focused_comment(st) {
+        return;
+    }
+    answer_focused_thread(st);
+}
+
+/// `o` in [0]: read the focused thread on github.com.
+pub fn open_focused_thread(st: &mut State) {
+    let Some(i) = focused_thread(st) else { return };
+    let url = st.threads[i].url().to_string();
+    if url.is_empty() {
+        st.status = "That thread has no page to open.".into();
+        return;
+    }
+    editor::open_url(&url);
+    st.status = "Opening the thread in the browser…".into();
+}
+
+/// Answer the focused thread with a comment of our own on the same line.
+///
+/// The tool never posts to a thread: an answer is one more comment of the
+/// pending review, which stays private until the review is submitted.
+fn answer_focused_thread(st: &mut State) {
+    let Some(i) = focused_thread(st) else { return };
+    let t = st.threads[i].clone();
+    let Some(line) = t.line else {
+        st.status = "That thread has no line on this diff to answer on.".into();
+        return;
+    };
+    let draft = st.comment_drafts.get(&t.path).cloned().unwrap_or_default();
+    st.overlay = Overlay::Comment {
+        ta: TextArea::new(&draft),
+        path: t.path,
+        line,
+        side: t.side,
+        start_line: None,
+        start_side: String::new(),
+    };
+}
+
 /// Discard the selected pending comment (the `d` key in [5]).
 pub fn discard_selected_comment(st: &mut State, tx: &Sender<Job>) {
     if st.pending_idx >= st.pending.len() || st.busy.contains("pending") || st.active_pr.is_none() {
@@ -1108,6 +1188,7 @@ pub fn fold_viewed(st: &mut State) {
         st.file_idx = ti;
         st.diff_scroll = 0;
         st.diff_hunk_idx = 0;
+        st.diff_stop_idx = 0;
     }
     st.status = format!(
         "Folded {folded} viewed folder{}{}",
@@ -1288,6 +1369,7 @@ pub fn switch_stage_side(st: &mut State, staged: bool) {
     let cur = (st.diff_scroll, st.diff_hunk_idx);
     (st.diff_scroll, st.diff_hunk_idx) = st.alt_diff_view;
     st.alt_diff_view = cur;
+    st.diff_stop_idx = st.diff_hunk_idx; // a local diff has blocks and nothing else
     st.comment_mode = false;
     st.diff_reveal_pending = true;
 }
@@ -1340,6 +1422,7 @@ pub fn enter_local_diff(st: &mut State) {
     st.focus = Focus::Diff;
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
+    st.diff_stop_idx = 0;
     st.staged_side = false; // a split opens on the unstaged (left) column
     st.alt_diff_view = (0, 0);
     st.diff_reveal_pending = true;

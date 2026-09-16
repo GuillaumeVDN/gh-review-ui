@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use serde_json::Value;
 
 use crate::api;
-use crate::models::{Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr};
+use crate::models::{Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr, ReviewThread};
 
 type Diff = HashMap<String, Vec<String>>;
 type Info = HashMap<String, Vec<LineInfo>>;
@@ -69,6 +69,8 @@ pub enum Msg {
         diff: Diff,
         info: Info,
         pending: Vec<PendingComment>,
+        /// Unresolved review threads, from any author.
+        threads: Vec<ReviewThread>,
         commits: Vec<Commit>,
         /// Paths GitHub's viewed state can no longer speak for, because a
         /// commit it does not have changes them.
@@ -125,6 +127,7 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 diff: HashMap::new(),
                 info: HashMap::new(),
                 pending: vec![],
+                threads: vec![],
                 commits: vec![],
                 stale_viewed: HashSet::new(),
             },
@@ -152,6 +155,9 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 } else {
                     api::load_pending_comments(owner, name, *n, login).unwrap_or_default()
                 };
+                // The threads of a local review still come from the PR: they
+                // are what other people said, not our own draft.
+                let threads = api::load_review_threads(owner, name, *n, login).unwrap_or_default();
                 Msg::Active {
                     number: Some(*n),
                     pr_id,
@@ -159,6 +165,7 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                     diff,
                     info,
                     pending,
+                    threads,
                     commits,
                     stale_viewed,
                 }
