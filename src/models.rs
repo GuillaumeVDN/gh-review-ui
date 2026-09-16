@@ -332,6 +332,9 @@ pub struct State {
     pub info_by_file: InfoMap,
     /// Syntax colors of the diffs on screen, parsed once per file.
     pub highlight: crate::syntax::Highlighter,
+    /// File contents by blob hash, so a diff is colored against the whole file
+    /// instead of the fragment a hunk shows.
+    pub blobs: HashMap<String, String>,
     pub hunks_by_file: HunkMap,
     pub diff_scroll: usize,
     pub diff_hunk_idx: usize,

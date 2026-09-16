@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
@@ -178,6 +179,68 @@ pub fn load_files(owner: &str, name: &str, number: i64) -> Result<(String, Vec<F
 pub fn load_diff(number: i64) -> Result<(Diff, Info)> {
     let raw = sh(&["gh", "pr", "diff", &number.to_string()])?;
     Ok(parse_diff(&raw))
+}
+
+/// A blob bigger than this is left to the hunk-local parse. Colors are worth
+/// less than the memory and the parse a generated file of that size costs.
+const MAX_BLOB: usize = 4 * 1024 * 1024;
+
+/// Read blobs by hash, in one `git cat-file --batch`.
+///
+/// The map is keyed by the hash as asked for, which is what the diff's `index`
+/// line holds: git answers with the full object name, and abbreviated ones
+/// would not match it.
+pub fn load_blobs(wt: &str, hashes: &[String]) -> Result<HashMap<String, String>> {
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut cmd = Command::new("git");
+    cmd.args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if !wt.is_empty() {
+        cmd.current_dir(wt);
+    }
+    let mut child = cmd.spawn()?;
+    let input = hashes.join("\n") + "\n";
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("git cat-file: no stdin"))?
+        .write_all(input.as_bytes())?;
+    let out = child.wait_with_output()?;
+    Ok(parse_cat_file_batch(&out.stdout, hashes))
+}
+
+/// Pair `git cat-file --batch` output with the hashes it answers, in order.
+///
+/// One request makes one answer: `<name> missing`, or a header naming the type
+/// and the byte count, then that many bytes and a newline.
+pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    let mut at = 0usize;
+    for hash in asked {
+        let Some(end) = out[at..].iter().position(|&b| b == b'\n') else { break };
+        let header = String::from_utf8_lossy(&out[at..at + end]).to_string();
+        at += end + 1;
+        let mut parts = header.split_whitespace();
+        let (_name, kind, size) = (parts.next(), parts.next(), parts.next());
+        // "<name> missing" carries no body, so nothing else to step over.
+        let Some(size) = size.and_then(|s| s.parse::<usize>().ok()) else { continue };
+        if at + size > out.len() {
+            break; // a truncated answer places every later one wrong
+        }
+        let body = &out[at..at + size];
+        at += size + 1; // the newline git writes after the object
+        if kind != Some("blob") || size > MAX_BLOB {
+            continue;
+        }
+        if let Ok(text) = std::str::from_utf8(body) {
+            found.insert(hash.clone(), text.to_string());
+        }
+    }
+    found
 }
 
 /// The change `first_oid^..last_oid` makes, read from the checkout under
@@ -1259,6 +1322,43 @@ mod worktree_sharing_tests {
         std::fs::write(clone.join("a.txt"), "b\n").unwrap();
         git(&clone, &["commit", "-qam", "feat: local work"]);
         (root, clone)
+    }
+
+    #[test]
+    fn batch_output_pairs_with_what_was_asked() {
+        let asked: Vec<String> =
+            ["aaa1111", "bbb2222", "ccc3333", "ddd4444"].iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"aaa1111111111111111111111111111111111111 blob 6\nhello\n\n");
+        out.extend_from_slice(b"bbb2222 missing\n");
+        out.extend_from_slice(b"ccc3333333333333333333333333333333333333 tree 4\nnope\n");
+        out.extend_from_slice(b"ddd4444444444444444444444444444444444444 blob 3\nbye\n");
+        let found = parse_cat_file_batch(&out, &asked);
+        // The map is keyed by the abbreviated hash the diff named.
+        assert_eq!(found.get("aaa1111").map(String::as_str), Some("hello\n"));
+        assert_eq!(found.get("ddd4444").map(String::as_str), Some("bye"));
+        // A missing object and anything that is not a file are left out, and
+        // neither costs the objects after it their place.
+        assert!(!found.contains_key("bbb2222"));
+        assert!(!found.contains_key("ccc3333"));
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn batch_output_leaves_out_what_it_cannot_read() {
+        let asked = vec!["aaa1111".to_string(), "bbb2222".to_string()];
+        // Binary content is no use to a text highlighter.
+        let mut out = Vec::new();
+        out.extend_from_slice(b"aaa1111111111111111111111111111111111111 blob 3\n");
+        out.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        out.extend_from_slice(b"\nbbb2222222222222222222222222222222222222 blob 2\nok\n");
+        let found = parse_cat_file_batch(&out, &asked);
+        assert!(!found.contains_key("aaa1111"));
+        assert_eq!(found.get("bbb2222").map(String::as_str), Some("ok"));
+        // A truncated answer ends the reading instead of misplacing it.
+        let cut = b"aaa1111111111111111111111111111111111111 blob 90\nshort";
+        assert!(parse_cat_file_batch(cut, &asked).is_empty());
+        assert!(parse_cat_file_batch(b"", &asked).is_empty());
     }
 
     /// The panes describe the checkout the PR was opened in, which is not the

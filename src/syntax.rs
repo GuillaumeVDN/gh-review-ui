@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
+use crate::models::LineInfo;
 use crate::theme::{classify_diff_line, DiffKind, Token};
 
 /// One diff line's code, split into pieces and what each piece is. The `+`/`-`
@@ -250,6 +251,47 @@ impl Parsed {
     }
 }
 
+impl Parsed {
+    /// A whole file, to be parsed from its first line.
+    fn for_blob(path: &str, text: &str) -> Self {
+        let set = syntaxes();
+        let syntax = syntax_for(set, path, text.lines().next());
+        let start = syntax.unwrap_or_else(|| set.find_syntax_plain_text());
+        Parsed {
+            syntax,
+            old: Stream::new(start),
+            new: Stream::new(start),
+            rows: Rc::new(Vec::new()),
+            next: 0,
+        }
+    }
+
+    /// Parse the file up to line `upto`, carrying the state across every line
+    /// as an editor does: a string or a comment that opens on one line is still
+    /// open on the next.
+    fn extend_blob(&mut self, text: &str, upto: usize) {
+        if self.syntax.is_none() || self.next >= upto {
+            return;
+        }
+        let rows = Rc::make_mut(&mut self.rows);
+        for line in text.lines().skip(self.next).take(upto - self.next) {
+            let line = line.replace('\t', "    ");
+            rows.push(match line.len() <= MAX_LINE {
+                true => self.new.feed(&line),
+                false => StyledLine::new(),
+            });
+            self.next += 1;
+        }
+    }
+}
+
+/// Color a whole file in one pass, for the callers that want all of it.
+pub fn highlight_blob(path: &str, text: &str, upto: usize) -> Vec<StyledLine> {
+    let mut parsed = Parsed::for_blob(path, text);
+    parsed.extend_blob(text, upto);
+    (*parsed.rows).clone()
+}
+
 /// Color one file's diff in one pass, for the callers that want all of it.
 pub fn highlight_diff(path: &str, lines: &[String]) -> Vec<StyledLine> {
     let mut parsed = Parsed::new(path, lines);
@@ -266,7 +308,63 @@ fn fingerprint(lines: &[String]) -> u64 {
     h.finish()
 }
 
+/// Where a diff row's colors come from.
+///
+/// With both blobs of a file in hand the colors are the file's own, so a hunk
+/// that opens inside a docstring reads like the rest of it. Without them each
+/// hunk is parsed on its own, from its first line.
+pub enum Painted {
+    Hunks(Rc<Vec<StyledLine>>),
+    Sides { old: Rc<Vec<StyledLine>>, new: Rc<Vec<StyledLine>> },
+}
+
+impl Painted {
+    /// The colors of diff row `i`, which is line `info` of the two sides.
+    pub fn row(&self, i: usize, info: Option<LineInfo>) -> Option<&StyledLine> {
+        match self {
+            Painted::Hunks(rows) => rows.get(i),
+            Painted::Sides { old, new } => match info? {
+                (_, Some(n)) => at(new, n),
+                (Some(o), None) => at(old, o),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+/// Row `no` of a side, counting from one as a diff does.
+fn at(rows: &[StyledLine], no: i64) -> Option<&StyledLine> {
+    rows.get(usize::try_from(no).ok()?.checked_sub(1)?)
+}
+
+/// Whether the diff's lines are the blobs' lines, so a row can take its colors
+/// from the file itself.
+fn sides_agree(lines: &[String], info: &[LineInfo], old: Option<&String>, new: Option<&String>) -> bool {
+    let split = |text: Option<&String>| {
+        text.map(|t| t.lines().map(|l| l.replace('\t', "    ")).collect::<Vec<_>>())
+    };
+    let (old, new) = (split(old), split(new));
+    let mut seen = false;
+    for (i, line) in lines.iter().enumerate() {
+        let Some(text) = content_of(line) else { continue };
+        let Some(&(o, n)) = info.get(i) else { continue };
+        for (side, no) in [(&old, o), (&new, n)] {
+            // A side with no blob says nothing; one that has it must match.
+            let (Some(side), Some(no)) = (side, no) else { continue };
+            let Some(held) = usize::try_from(no).ok().and_then(|no| side.get(no.checked_sub(1)?)) else {
+                return false;
+            };
+            if *held != text {
+                return false;
+            }
+            seen = true;
+        }
+    }
+    seen
+}
+
 type Cache = HashMap<(String, u64), Parsed>;
+type Blobs = HashMap<String, String>;
 
 /// Per-file highlight cache, so a redraw parses nothing and a first draw parses
 /// only what the viewport shows.
@@ -276,6 +374,9 @@ type Cache = HashMap<(String, u64), Parsed>;
 #[derive(Default)]
 pub struct Highlighter {
     cache: RefCell<Cache>,
+    blobs: RefCell<HashMap<String, Parsed>>,
+    /// Whether a file's diff matches the blobs it names.
+    agrees: RefCell<HashMap<(String, u64), bool>>,
 }
 
 impl Highlighter {
@@ -289,6 +390,61 @@ impl Highlighter {
         }
         let parsed = cache.entry(key).or_insert_with(|| Parsed::new(path, lines));
         parsed.extend(lines, upto);
+        parsed.rows.clone()
+    }
+
+    /// The colors of `path`, from its two blobs when the diff names them and
+    /// `blobs` holds them, and from the hunks themselves otherwise.
+    pub fn paint(
+        &self,
+        path: &str,
+        lines: &[String],
+        info: Option<&Vec<LineInfo>>,
+        blobs: &Blobs,
+        upto: usize,
+    ) -> Painted {
+        let hunks = || Painted::Hunks(self.rows(path, lines, upto));
+        let (Some(info), Some((old_hash, new_hash))) = (info, crate::diff::blob_hashes(lines)) else {
+            return hunks();
+        };
+        // Every side the diff shows needs its blob: painting one of them from
+        // the file and leaving the other plain reads worse than parsing the
+        // hunks. A worktree diff never has a blob for its new side, so it
+        // keeps the hunks.
+        let (old_text, new_text) = (blobs.get(&old_hash), blobs.get(&new_hash));
+        let shows = |side: fn(&LineInfo) -> Option<i64>| info.iter().any(|i| side(i).is_some());
+        if (shows(|i| i.0) && old_text.is_none()) || (shows(|i| i.1) && new_text.is_none()) {
+            return hunks();
+        }
+        let key = (path.to_string(), fingerprint(lines));
+        let mut agreed = self.agrees.borrow_mut();
+        if agreed.len() >= MAX_CACHED && !agreed.contains_key(&key) {
+            agreed.clear();
+        }
+        let agrees =
+            *agreed.entry(key).or_insert_with(|| sides_agree(lines, info, old_text, new_text));
+        drop(agreed);
+        if !agrees {
+            return hunks();
+        }
+        // The rows the viewport asks for name the file lines to parse.
+        let bound = |side: fn(&LineInfo) -> Option<i64>| {
+            info.iter().take(upto).filter_map(side).max().unwrap_or(0) as usize
+        };
+        Painted::Sides {
+            old: self.blob_rows(path, &old_hash, old_text, bound(|i| i.0)),
+            new: self.blob_rows(path, &new_hash, new_text, bound(|i| i.1)),
+        }
+    }
+
+    fn blob_rows(&self, path: &str, hash: &str, text: Option<&String>, upto: usize) -> Rc<Vec<StyledLine>> {
+        let Some(text) = text else { return Rc::new(Vec::new()) };
+        let mut blobs = self.blobs.borrow_mut();
+        if blobs.len() >= MAX_CACHED && !blobs.contains_key(hash) {
+            blobs.clear();
+        }
+        let parsed = blobs.entry(hash.to_string()).or_insert_with(|| Parsed::for_blob(path, text));
+        parsed.extend_blob(text, upto);
         parsed.rows.clone()
     }
 }
@@ -421,6 +577,96 @@ mod tests {
             assert_eq!(found, Some(name), "{ext}");
         }
         assert_eq!(syntax_for(set, "Dockerfile", None).map(|s| s.name.as_str()), Some("Dockerfile"));
+    }
+
+    const OLD_PY: &str = "import os\n\n\ndef alpha():\n    \"\"\"Docstring line 1\n    line 2\n    line 3\n    \"\"\"\n    return 1\n\n\ndef beta():\n    return 2\n";
+    const NEW_PY: &str = "import sys\n\n\ndef alpha():\n    \"\"\"Docstring line 1\n    line 2 changed\n    line 3\n    \"\"\"\n    return 1\n\n\ndef beta():\n    return 2\n";
+
+    /// A diff whose second hunk starts on the second line of a docstring.
+    const DOCSTRING_DIFF: &str = "diff --git a/m.py b/m.py\n\
+         index aaaaaaa..bbbbbbb 100644\n\
+         --- a/m.py\n\
+         +++ b/m.py\n\
+         @@ -1,1 +1,1 @@\n\
+         -import os\n\
+         +import sys\n\
+         @@ -6,4 +6,4 @@\n\
+         -    line 2\n\
+         +    line 2 changed\n\
+         \x20    line 3\n\
+         \x20    \"\"\"\n\
+         \x20    return 1\n";
+
+    fn docstring_case(blobs: Blobs) -> (Vec<String>, Vec<LineInfo>, Painted, usize) {
+        let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
+        let (lines, info) = (files["m.py"].clone(), infos["m.py"].clone());
+        let at = lines.iter().position(|l| l.contains("return 1")).unwrap();
+        let hl = Highlighter::default();
+        let painted = hl.paint("m.py", &lines, Some(&info), &blobs, lines.len());
+        (lines, info, painted, at)
+    }
+
+    fn blobs_of(old: &str, new: &str) -> Blobs {
+        [("aaaaaaa".to_string(), old.to_string()), ("bbbbbbb".to_string(), new.to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_hunk_inside_a_docstring_reads_from_the_file() {
+        let (_, info, painted, at) = docstring_case(blobs_of(OLD_PY, NEW_PY));
+        let row = painted.row(at, Some(info[at])).expect("the line is colored");
+        assert_eq!(role_of(row, "return"), Some(&Token::Keyword), "{row:?}");
+        assert!(held(row, Token::Comment).is_empty(), "{row:?}");
+        // The line the hunk opens on is still inside the docstring.
+        let inside = info.iter().position(|&(_, n)| n == Some(6)).unwrap();
+        let row = painted.row(inside, Some(info[inside])).unwrap();
+        assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
+    }
+
+    #[test]
+    fn without_the_file_the_hunk_is_parsed_on_its_own() {
+        // The closing quotes open a docstring of their own, and the rest of
+        // the hunk falls inside it.
+        let (_, info, painted, at) = docstring_case(Blobs::new());
+        let row = painted.row(at, Some(info[at])).unwrap();
+        assert_eq!(role_of(row, "return"), None, "{row:?}");
+        assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
+    }
+
+    #[test]
+    fn a_blob_that_is_not_the_diff_is_not_used() {
+        // A stale or wrong blob would paint the wrong lines, so the file falls
+        // back to its hunks.
+        let other = OLD_PY.replace("return 1", "return 99");
+        let (_, info, painted, at) = docstring_case(blobs_of(&other, NEW_PY));
+        assert!(matches!(painted, Painted::Hunks(_)));
+        let row = painted.row(at, Some(info[at])).unwrap();
+        assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
+    }
+
+    #[test]
+    fn a_side_the_diff_shows_needs_its_blob() {
+        // Half the file would paint half the diff, so one missing blob sends
+        // the file back to its hunks.
+        let blobs: Blobs = [("bbbbbbb".to_string(), NEW_PY.to_string())].into_iter().collect();
+        let (_, _, painted, _) = docstring_case(blobs);
+        assert!(matches!(painted, Painted::Hunks(_)));
+    }
+
+    #[test]
+    fn a_new_file_has_only_the_side_it_shows() {
+        let raw = "diff --git a/n.py b/n.py\nnew file mode 100644\nindex 0000000..bbbbbbb\n\
+                   --- /dev/null\n+++ b/n.py\n@@ -0,0 +1,2 @@\n+import os\n+x = 1\n";
+        let (files, infos) = crate::diff::parse_diff(raw);
+        let (lines, info) = (&files["n.py"], &infos["n.py"]);
+        let blobs: Blobs =
+            [("bbbbbbb".to_string(), "import os\nx = 1\n".to_string())].into_iter().collect();
+        let painted = Highlighter::default().paint("n.py", lines, Some(info), &blobs, lines.len());
+        assert!(matches!(painted, Painted::Sides { .. }));
+        let at = lines.iter().position(|l| l.contains("import")).unwrap();
+        let row = painted.row(at, Some(info[at])).unwrap();
+        assert_eq!(role_of(row, "import"), Some(&Token::Import), "{row:?}");
     }
 
     #[test]

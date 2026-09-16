@@ -19,6 +19,8 @@ pub enum Job {
     /// `wt` is the checkout under review: the worktree the PR was opened in.
     LoadActive { wt: String, owner: String, name: String, login: String, number: Option<i64>, local: bool },
     LoadCommitDiff { wt: String, first: String, last: String },
+    /// The file contents the diff's `index` lines name, for highlighting.
+    LoadBlobs { wt: String, hashes: Vec<String> },
     OpenPr { repo_root: String, owner: String, name: String, number: i64, head: String },
     MarkViewed { pr_id: String, path: String, viewed: bool },
     MarkViewedBulk { pr_id: String, paths: Vec<String>, viewed: bool },
@@ -73,6 +75,7 @@ pub enum Msg {
         stale_viewed: std::collections::HashSet<String>,
     },
     CommitDiff { diff: Diff, info: Info },
+    Blobs(HashMap<String, String>),
     PrOpened { number: i64, path: String },
     ViewedOk { paths: Vec<String>, viewed: bool },
     ViewedBulk { done: Vec<String>, viewed: bool, errs: usize },
@@ -96,6 +99,7 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::LoadPrs { .. } => "prs",
         Job::LoadActive { .. } => "active",
         Job::LoadCommitDiff { .. } => "commitdiff",
+        Job::LoadBlobs { .. } => "blobs",
         Job::OpenPr { .. } => "worktree",
         Job::MarkViewed { .. } | Job::MarkViewedBulk { .. } => "viewed",
         Job::LoadPrDetails(_) => "details",
@@ -160,6 +164,7 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 }
             }
         },
+        Job::LoadBlobs { wt, hashes } => Msg::Blobs(api::load_blobs(wt, hashes)?),
         Job::LoadCommitDiff { wt, first, last } => {
             let (diff, info) = api::load_diff_range(wt, first, last)?;
             Msg::CommitDiff { diff, info }

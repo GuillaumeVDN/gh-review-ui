@@ -36,6 +36,26 @@ fn set_diff(
     st.comment_mode = false;
     st.comment_start = None;
     st.last_comment = None; // line indices don't survive a new diff
+    st.blobs.clear();
+}
+
+/// Ask for the file contents the diff names, so every hunk is colored against
+/// the whole file. Until they arrive each hunk is colored on its own.
+fn request_blobs(st: &mut State, tx: &Sender<Job>) {
+    let mut hashes: Vec<String> = st
+        .diff_by_file
+        .values()
+        .filter_map(|lines| crate::diff::blob_hashes(lines))
+        .flat_map(|(old, new)| [old, new])
+        .filter(|h| !h.is_empty())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return;
+    }
+    let wt = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
+    submit(st, tx, Job::LoadBlobs { wt, hashes });
 }
 
 /// Wipe the previous PR's panels so they read "Loading…", and focus Files.
@@ -208,6 +228,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.commit_idx = 0;
                     st.commit_offset = 0;
                     set_diff(st, diff, info);
+                    request_blobs(st, tx);
                     st.status = format!(
                         "#{n} · {} file{} · {} commit{}{}",
                         st.files.len(),
@@ -228,6 +249,10 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.file_idx = here.and_then(|p| file_row(st, &p)).unwrap_or(0);
             reload_edits(st, tx);
         }
+        Msg::Blobs(blobs) => {
+            st.busy.remove("blobs");
+            st.blobs.extend(blobs);
+        }
         Msg::CommitDiff { diff, info } => {
             st.busy.remove("commitdiff");
             let mut paths: Vec<String> = diff.keys().cloned().collect();
@@ -238,6 +263,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                 .collect();
             st.pr_files = st.files.clone();
             set_diff(st, diff, info);
+            request_blobs(st, tx);
             st.file_idx = 0;
             st.file_offset = 0;
             tree::rebuild(st);

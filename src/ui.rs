@@ -17,7 +17,7 @@ use crate::navigation::{
     current_hunk_range, diff_path, hunk_for_comment, is_local_diff, is_split, source_maps,
     stage_state,
 };
-use crate::syntax::StyledLine;
+use crate::syntax::{Painted, StyledLine};
 use crate::textbuffer;
 use crate::theme;
 use crate::theme::DiffKind;
@@ -705,7 +705,7 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
 fn diff_column_rows(
     lines: &[String],
     info: Option<&Vec<LineInfo>>,
-    hl: &[StyledLine],
+    hl: &Painted,
     view: (usize, usize, usize),
     cur: Option<(usize, usize)>,
     sel: (usize, usize),
@@ -721,7 +721,7 @@ fn diff_column_rows(
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: &lines[i],
-            hl: hl.get(i),
+            hl: hl.row(i, info.and_then(|inf| inf.get(i)).copied()),
             nos: &[new.or(old)],
             current: cur.map_or(false, |(s, e)| s <= i && i < e),
             selected: sel.0 <= i && i <= sel.1,
@@ -791,7 +791,7 @@ fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         let scroll = if active { &mut st.diff_scroll } else { &mut st.alt_diff_view.0 };
         *scroll = (*scroll).min(lines.len().saturating_sub(1));
         let scroll = *scroll;
-        let hl = st.highlight.rows(path, lines, scroll + vh);
+        let hl = st.highlight.paint(path, lines, infos.get(path), &st.blobs, scroll + vh);
         let rows = diff_column_rows(
             lines,
             infos.get(path),
@@ -928,7 +928,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     // The visible rows name the diff lines to color; a wrapped row shows fewer.
     let seen = rows.iter().skip(st.diff_scroll).take(vh);
     let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
-    let hl = st.highlight.rows(path, diff_lines, upto);
+    let hl = st.highlight.paint(path, diff_lines, info_here, &st.blobs, upto);
     let overlay = match (st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
         (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
         _ => None,
@@ -976,7 +976,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
-            rows: wrap_styled_hard(&code_spans(ln, hl.get(i), current), tw.max(1)),
+            rows: wrap_styled_hard(&code_spans(ln, hl.row(i, Some((old, new))), current), tw.max(1)),
             row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
@@ -1180,8 +1180,10 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         .map(|l| &l[1..])
         .collect();
 
-    let colors = path.as_ref().map(|p| st.highlight.rows(p, diff_lines, st.diff_scroll + vh));
-    let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
+    let hl = match &path {
+        Some(p) => st.highlight.paint(p, diff_lines, info_here, &st.blobs, st.diff_scroll + vh),
+        None => Painted::Hunks(Default::default()),
+    };
 
     // The gutter carries both line numbers, old then new; the text column takes
     // what is left after the marker.
@@ -1237,7 +1239,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: ln,
-            hl: hl.get(i),
+            hl: hl.row(i, info_here.and_then(|inf| inf.get(i)).copied()),
             nos: &[nos.0, nos.1],
             current,
             selected,
@@ -1390,9 +1392,10 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let nw = fit_num_width(num_width(info), 2, iw, 16);
     let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
     let tw = iw.saturating_sub(gw);
-    let colors =
-        path.as_ref().map(|p| st.highlight.rows(p, lines_vec, st.edit_diff_scroll + vh));
-    let hl: &[StyledLine] = colors.as_deref().map_or(&[], Vec::as_slice);
+    let hl = match &path {
+        Some(p) => st.highlight.paint(p, lines_vec, info, &st.blobs, st.edit_diff_scroll + vh),
+        None => Painted::Hunks(Default::default()),
+    };
     st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
     let mut out: Vec<Line> = Vec::new();
     let mut i = st.edit_diff_scroll;
@@ -1400,7 +1403,7 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: &lines_vec[i],
-            hl: hl.get(i),
+            hl: hl.row(i, info.and_then(|inf| inf.get(i)).copied()),
             nos: &[old, new],
             current: false,
             selected: false,

@@ -97,6 +97,25 @@ pub fn parse_diff(raw: &str) -> (HashMap<String, Vec<String>>, HashMap<String, V
     (per_file, per_info)
 }
 
+/// The blob hashes of a file's two sides, from the `index <old>..<new>` line.
+///
+/// `0000000` stands for a side that does not exist, and a diff that carries no
+/// `index` line (a pure rename) names no blob at all.
+pub fn blob_hashes(diff_lines: &[String]) -> Option<(String, String)> {
+    let line = diff_lines.iter().take_while(|l| !l.starts_with("@@")).find_map(|l| l.strip_prefix("index "))?;
+    let (old, rest) = line.split_once("..")?;
+    let new = rest.split_whitespace().next()?;
+    let hash = |h: &str| {
+        let named = h.len() >= 4 && h.chars().all(|c| c.is_ascii_hexdigit()) && h.chars().any(|c| c != '0');
+        if named {
+            h.to_string()
+        } else {
+            String::new()
+        }
+    };
+    Some((hash(old.trim()), hash(new)))
+}
+
 /// Classify one file's diff block as added / deleted / modified from its
 /// `new file mode` / `deleted file mode` markers (else a content change).
 pub fn edit_kind(diff_lines: &[String]) -> EditKind {
@@ -436,6 +455,35 @@ mod tests {
          @@ -1 +1 @@\n\
          -old\n\
          +new\n"
+    }
+
+    #[test]
+    fn index_lines_name_the_two_blobs() {
+        let of = |raw: &str| {
+            let (f, _) = parse_diff(raw);
+            blob_hashes(f.values().next().unwrap())
+        };
+        assert_eq!(
+            of(modified_file()),
+            Some(("1111111".to_string(), "2222222".to_string()))
+        );
+        // A new file has no old side, a deleted one no new side.
+        assert_eq!(of(added_file()), Some((String::new(), "e69de29".to_string())));
+        assert_eq!(of(deleted_file()), Some(("e69de29".to_string(), String::new())));
+        // The mode is optional, and full hashes read the same.
+        let no_mode = "diff --git a/f b/f\nindex abc1234..def5678\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(of(no_mode), Some(("abc1234".to_string(), "def5678".to_string())));
+        let full = format!(
+            "diff --git a/f b/f\nindex {}..{} 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        assert_eq!(of(&full), Some(("a".repeat(40), "b".repeat(40))));
+        // A pure rename carries no index line.
+        let rename = "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n";
+        assert_eq!(of(rename), None);
+        // The `index` of a later file never leaks into this one.
+        assert_eq!(blob_hashes(&["diff --git a/f b/f".to_string(), "@@ -1 +1 @@".to_string(), "index 1..2".to_string()]), None);
     }
 
     #[test]
