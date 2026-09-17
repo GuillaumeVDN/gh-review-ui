@@ -182,9 +182,12 @@ on that same hue blended into the background: about a fifth of it for a changed
 line, a third for the focused change block, next to the `▌` side-bar. A theme
 of low contrast of its own gets a fainter tint, so the code on it keeps reading.
 
-A file is colored as far down as you have scrolled, and a line over 600
-characters stays plain: the matchers run on the whole line, and one long quoted
-string costs more than a screenful of ordinary code.
+Colors are parsed on a thread of its own, so drawing never waits for one: a
+file arrives plain on its diff tints and fills in from the top within a frame
+or two. A file is colored as far down as you have scrolled, a line over 600
+characters stays plain, and a file whose own parse would cost more than a
+second is colored hunk by hunk instead. The matchers run on the whole line, and
+one long quoted string costs more than a screenful of ordinary code.
 
 Without an Omarchy theme the app keeps its own ANSI colors, in a dark and a
 light set:

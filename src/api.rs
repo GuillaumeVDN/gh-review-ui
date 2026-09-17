@@ -184,18 +184,18 @@ pub fn load_diff(number: i64) -> Result<(Diff, Info)> {
     Ok(parse_diff(&raw))
 }
 
-/// A blob bigger than this is left to the hunk-local parse. Colors are worth
-/// less than the memory and the parse a generated file of that size costs.
-const MAX_BLOB: usize = 4 * 1024 * 1024;
+/// A blob bigger than this is left to the hunk-local parse. The parse runs off
+/// the drawing thread, so what a huge generated file costs is memory.
+const MAX_BLOB: usize = 16 * 1024 * 1024;
 
 /// Read blobs by hash, in one `git cat-file --batch`.
 ///
 /// The map is keyed by the hash as asked for, which is what the diff's `index`
 /// line holds: git answers with the full object name, and abbreviated ones
 /// would not match it.
-pub fn load_blobs(wt: &str, hashes: &[String]) -> Result<HashMap<String, String>> {
+pub fn load_blobs(wt: &str, hashes: &[String]) -> Result<crate::syntax::Blobs> {
     if hashes.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(crate::syntax::Blobs::new());
     }
     let mut cmd = Command::new("git");
     cmd.args(["cat-file", "--batch"])
@@ -220,7 +220,7 @@ pub fn load_blobs(wt: &str, hashes: &[String]) -> Result<HashMap<String, String>
 ///
 /// One request makes one answer: `<name> missing`, or a header naming the type
 /// and the byte count, then that many bytes and a newline.
-pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> HashMap<String, String> {
+pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> crate::syntax::Blobs {
     let mut found = HashMap::new();
     let mut at = 0usize;
     for hash in asked {
@@ -240,7 +240,7 @@ pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> HashMap<String, Str
             continue;
         }
         if let Ok(text) = std::str::from_utf8(body) {
-            found.insert(hash.clone(), text.to_string());
+            found.insert(hash.clone(), std::sync::Arc::from(text));
         }
     }
     found
@@ -1558,8 +1558,8 @@ mod worktree_sharing_tests {
         out.extend_from_slice(b"ddd4444444444444444444444444444444444444 blob 3\nbye\n");
         let found = parse_cat_file_batch(&out, &asked);
         // The map is keyed by the abbreviated hash the diff named.
-        assert_eq!(found.get("aaa1111").map(String::as_str), Some("hello\n"));
-        assert_eq!(found.get("ddd4444").map(String::as_str), Some("bye"));
+        assert_eq!(found.get("aaa1111").map(|t| &**t), Some("hello\n"));
+        assert_eq!(found.get("ddd4444").map(|t| &**t), Some("bye"));
         // A missing object and anything that is not a file are left out, and
         // neither costs the objects after it their place.
         assert!(!found.contains_key("bbb2222"));
@@ -1577,7 +1577,7 @@ mod worktree_sharing_tests {
         out.extend_from_slice(b"\nbbb2222222222222222222222222222222222222 blob 2\nok\n");
         let found = parse_cat_file_batch(&out, &asked);
         assert!(!found.contains_key("aaa1111"));
-        assert_eq!(found.get("bbb2222").map(String::as_str), Some("ok"));
+        assert_eq!(found.get("bbb2222").map(|t| &**t), Some("ok"));
         // A truncated answer ends the reading instead of misplacing it.
         let cut = b"aaa1111111111111111111111111111111111111 blob 90\nshort";
         assert!(parse_cat_file_batch(cut, &asked).is_empty());

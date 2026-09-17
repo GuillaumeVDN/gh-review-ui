@@ -38,6 +38,7 @@ fn set_diff(
     st.comment_start = None;
     st.last_comment = None; // line indices don't survive a new diff
     st.blobs.clear();
+    st.highlight.reset();
 }
 
 /// Ask for the file contents the diff names, so every hunk is colored against
@@ -256,6 +257,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove("blobs");
             st.blobs.extend(blobs);
         }
+        Msg::Painted(painting) => st.highlight.absorb(painting),
         Msg::CommitDiff { diff, info } => {
             st.busy.remove("commitdiff");
             let mut paths: Vec<String> = diff.keys().cloned().collect();

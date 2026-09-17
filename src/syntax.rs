@@ -8,13 +8,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::models::LineInfo;
 use crate::theme::{classify_diff_line, DiffKind, Token};
+
+/// File contents by blob hash.
+pub type Blobs = HashMap<String, Arc<str>>;
 
 /// One diff line's code, split into pieces and what each piece is. The `+`/`-`
 /// marker is not part of it: the gutter and the background carry the diff
@@ -194,39 +198,35 @@ fn push(out: &mut StyledLine, stack: &ScopeStack, text: &str) {
     }
 }
 
-/// One file's diff, parsed as far as the screen has asked for.
-struct Parsed {
+/// A diff parsed hunk by hunk, for a file whose blobs are out of reach.
+struct HunkParse {
     syntax: Option<&'static SyntaxReference>,
     old: Stream,
     new: Stream,
-    rows: Rc<Vec<StyledLine>>,
-    /// The first line no stream has seen yet.
+    /// The first diff line no stream has seen yet.
     next: usize,
 }
 
-impl Parsed {
+impl HunkParse {
     fn new(path: &str, lines: &[String]) -> Self {
         let set = syntaxes();
         let first = lines.iter().find_map(|l| content_of(l));
         let syntax = syntax_for(set, path, first.as_deref());
         let start = syntax.unwrap_or_else(|| set.find_syntax_plain_text());
-        Parsed {
-            syntax,
-            old: Stream::new(start),
-            new: Stream::new(start),
-            rows: Rc::new(Vec::new()),
-            next: 0,
-        }
+        HunkParse { syntax, old: Stream::new(start), new: Stream::new(start), next: 0 }
     }
 
-    /// Parse up to line `upto`, from wherever the last call stopped.
-    fn extend(&mut self, lines: &[String], upto: usize) {
-        let Some(syntax) = self.syntax else { return };
-        let upto = upto.min(lines.len());
-        if self.next >= upto {
-            return;
-        }
-        let rows = Rc::make_mut(&mut self.rows);
+    /// The rows from where the last call stopped up to `upto`, or as many as
+    /// `deadline` leaves room for.
+    fn extend(&mut self, lines: &[String], upto: usize, deadline: Instant) -> Vec<StyledLine> {
+        let mut out = Vec::new();
+        let Some(syntax) = self.syntax else {
+            while self.next < upto {
+                out.push(StyledLine::new());
+                self.next += 1;
+            }
+            return out;
+        };
         while self.next < upto {
             let line = &lines[self.next];
             let kind = classify_diff_line(line);
@@ -237,7 +237,7 @@ impl Parsed {
                 self.new = Stream::new(syntax);
             }
             let text = content_of(line).filter(|t| t.len() <= MAX_LINE);
-            rows.push(match (kind, text) {
+            out.push(match (kind, text) {
                 (DiffKind::Add, Some(t)) => self.new.feed(&t),
                 (DiffKind::Del, Some(t)) => self.old.feed(&t),
                 (DiffKind::Context, Some(t)) => {
@@ -247,56 +247,60 @@ impl Parsed {
                 _ => StyledLine::new(),
             });
             self.next += 1;
+            if Instant::now() >= deadline {
+                break;
+            }
         }
+        out
     }
 }
 
-impl Parsed {
-    /// A whole file, to be parsed from its first line.
-    fn for_blob(path: &str, text: &str) -> Self {
+/// One whole file, parsed from its first line as an editor reads it.
+struct FileParse {
+    syntax: Option<&'static SyntaxReference>,
+    stream: Stream,
+    rows: Vec<StyledLine>,
+    next: usize,
+}
+
+impl FileParse {
+    fn new(path: &str, text: &str) -> Self {
         let set = syntaxes();
         let syntax = syntax_for(set, path, text.lines().next());
         let start = syntax.unwrap_or_else(|| set.find_syntax_plain_text());
-        Parsed {
-            syntax,
-            old: Stream::new(start),
-            new: Stream::new(start),
-            rows: Rc::new(Vec::new()),
-            next: 0,
-        }
+        FileParse { syntax, stream: Stream::new(start), rows: Vec::new(), next: 0 }
     }
 
-    /// Parse the file up to line `upto`, carrying the state across every line
-    /// as an editor does: a string or a comment that opens on one line is still
-    /// open on the next.
-    fn extend_blob(&mut self, text: &str, upto: usize) {
+    fn extend(&mut self, text: &str, upto: usize, deadline: Instant) {
         if self.syntax.is_none() || self.next >= upto {
             return;
         }
-        let rows = Rc::make_mut(&mut self.rows);
         for line in text.lines().skip(self.next).take(upto - self.next) {
             let line = line.replace('\t', "    ");
-            rows.push(match line.len() <= MAX_LINE {
-                true => self.new.feed(&line),
+            self.rows.push(match line.len() <= MAX_LINE {
+                true => self.stream.feed(&line),
                 false => StyledLine::new(),
             });
             self.next += 1;
+            if Instant::now() >= deadline {
+                return;
+            }
         }
     }
-}
 
-/// Color a whole file in one pass, for the callers that want all of it.
-pub fn highlight_blob(path: &str, text: &str, upto: usize) -> Vec<StyledLine> {
-    let mut parsed = Parsed::for_blob(path, text);
-    parsed.extend_blob(text, upto);
-    (*parsed.rows).clone()
+    /// Row `no`, counting from one as a diff does.
+    fn row(&self, no: i64) -> Option<&StyledLine> {
+        self.rows.get(usize::try_from(no).ok()?.checked_sub(1)?)
+    }
 }
 
 /// Color one file's diff in one pass, for the callers that want all of it.
 pub fn highlight_diff(path: &str, lines: &[String]) -> Vec<StyledLine> {
-    let mut parsed = Parsed::new(path, lines);
-    parsed.extend(lines, lines.len());
-    (*parsed.rows).clone()
+    HunkParse::new(path, lines).extend(lines, lines.len(), far())
+}
+
+fn far() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
 }
 
 fn fingerprint(lines: &[String]) -> u64 {
@@ -308,39 +312,10 @@ fn fingerprint(lines: &[String]) -> u64 {
     h.finish()
 }
 
-/// Where a diff row's colors come from.
-///
-/// With both blobs of a file in hand the colors are the file's own, so a hunk
-/// that opens inside a docstring reads like the rest of it. Without them each
-/// hunk is parsed on its own, from its first line.
-pub enum Painted {
-    Hunks(Rc<Vec<StyledLine>>),
-    Sides { old: Rc<Vec<StyledLine>>, new: Rc<Vec<StyledLine>> },
-}
-
-impl Painted {
-    /// The colors of diff row `i`, which is line `info` of the two sides.
-    pub fn row(&self, i: usize, info: Option<LineInfo>) -> Option<&StyledLine> {
-        match self {
-            Painted::Hunks(rows) => rows.get(i),
-            Painted::Sides { old, new } => match info? {
-                (_, Some(n)) => at(new, n),
-                (Some(o), None) => at(old, o),
-                (None, None) => None,
-            },
-        }
-    }
-}
-
-/// Row `no` of a side, counting from one as a diff does.
-fn at(rows: &[StyledLine], no: i64) -> Option<&StyledLine> {
-    rows.get(usize::try_from(no).ok()?.checked_sub(1)?)
-}
-
 /// Whether the diff's lines are the blobs' lines, so a row can take its colors
 /// from the file itself.
-fn sides_agree(lines: &[String], info: &[LineInfo], old: Option<&String>, new: Option<&String>) -> bool {
-    let split = |text: Option<&String>| {
+fn sides_agree(lines: &[String], info: &[LineInfo], old: Option<&str>, new: Option<&str>) -> bool {
+    let split = |text: Option<&str>| {
         text.map(|t| t.lines().map(|l| l.replace('\t', "    ")).collect::<Vec<_>>())
     };
     let (old, new) = (split(old), split(new));
@@ -363,38 +338,221 @@ fn sides_agree(lines: &[String], info: &[LineInfo], old: Option<&String>, new: O
     seen
 }
 
-type Cache = HashMap<(String, u64), Parsed>;
-type Blobs = HashMap<String, String>;
+/// A file view: its path and the fingerprint of the diff it shows.
+pub type Key = (String, u64);
 
-/// Per-file highlight cache, so a redraw parses nothing and a first draw parses
-/// only what the viewport shows.
+/// What one file view needs colored, and everything the work takes.
+pub struct Request {
+    pub key: Key,
+    path: String,
+    lines: Arc<Vec<String>>,
+    info: Arc<Vec<LineInfo>>,
+    old: Option<Arc<str>>,
+    new: Option<Arc<str>>,
+    upto: usize,
+}
+
+/// What the highlighter asks of its thread.
+pub enum Ask {
+    Paint(Request),
+    /// The diffs on screen are gone: drop everything.
+    Forget,
+}
+
+/// Rows `from..` of a file view, colored.
+pub struct Painting {
+    pub key: Key,
+    pub from: usize,
+    pub rows: Vec<StyledLine>,
+}
+
+/// How long one slice of work runs before it publishes what it has.
+const SLICE: Duration = Duration::from_millis(16);
+/// How long a file's own colors may take before its hunks answer instead.
+const WHOLE_FILE_BUDGET: Duration = Duration::from_millis(750);
+/// The measurement that says how fast a file parses.
+const PROBE: Duration = Duration::from_millis(30);
+const PROBE_LINES: usize = 24;
+/// A file the diff barely reads into is worth no measurement.
+const PROBE_FREE: usize = 64;
+
+/// Where a file view's colors come from.
 ///
-/// The key holds the diff text's fingerprint, so a reloaded file is parsed
-/// again and the two columns of a split diff each keep their own colors.
+/// With both blobs of a file in hand the colors are the file's own, so a hunk
+/// that opens inside a docstring reads like the rest of it. Without them each
+/// hunk is parsed on its own, from its first line.
+enum Mode {
+    Hunks(HunkParse),
+    Sides { old: FileParse, new: FileParse },
+}
+
+struct Job {
+    mode: Mode,
+    /// Rows already handed to the front end.
+    rows: usize,
+}
+
+/// A file parsed as far as the diff needs it, and how long the rest will take.
+///
+/// One line of a generated YAML costs what a screenful of code costs, and the
+/// hunk of such a file sits thousands of lines down. The first lines say which
+/// kind of file this is, at the price of a glance.
+fn probe(path: &str, text: &str, deepest: usize) -> (FileParse, bool) {
+    let mut parse = FileParse::new(path, text);
+    if deepest <= PROBE_FREE {
+        return (parse, true);
+    }
+    // The first line of a language pays for its matchers, once per run.
+    parse.extend(text, 1, far());
+    let start = Instant::now();
+    parse.extend(text, PROBE_LINES.min(deepest), start + PROBE);
+    let read = parse.next.saturating_sub(1).max(1) as f64;
+    let whole = start.elapsed().as_secs_f64() / read * deepest as f64;
+    (parse, whole <= WHOLE_FILE_BUDGET.as_secs_f64())
+}
+
+impl Job {
+    fn new(req: &Request) -> Job {
+        let (old, new) = (req.old.as_deref(), req.new.as_deref());
+        // Every side the diff shows needs its blob: painting one of them from
+        // the file and leaving the other plain reads worse than parsing the
+        // hunks. A worktree diff never has a blob for its new side.
+        let shows = |side: fn(&LineInfo) -> Option<i64>| req.info.iter().any(|i| side(i).is_some());
+        let deepest =
+            |side: fn(&LineInfo) -> Option<i64>| req.info.iter().filter_map(side).max().unwrap_or(0) as usize;
+        let named = (!shows(|i| i.0) || old.is_some()) && (!shows(|i| i.1) || new.is_some());
+        let mode = match named && sides_agree(&req.lines, &req.info, old, new) {
+            true => {
+                let (old, old_ok) = probe(&req.path, old.unwrap_or_default(), deepest(|i| i.0));
+                let (new, new_ok) = probe(&req.path, new.unwrap_or_default(), deepest(|i| i.1));
+                match old_ok && new_ok {
+                    true => Mode::Sides { old, new },
+                    false => Mode::Hunks(HunkParse::new(&req.path, &req.lines)),
+                }
+            }
+            false => Mode::Hunks(HunkParse::new(&req.path, &req.lines)),
+        };
+        Job { mode, rows: 0 }
+    }
+}
+
+/// The work itself: it owns the parsers and hands back rows as they come.
 #[derive(Default)]
+pub struct Painter {
+    jobs: HashMap<Key, Job>,
+    order: Vec<Key>,
+}
+
+impl Painter {
+    /// Color what `req` asks for, stopping at `deadline`. The answer is the
+    /// next rows of the view, and whether the request is finished.
+    pub fn work(&mut self, req: &Request, deadline: Instant) -> (Painting, bool) {
+        if !self.jobs.contains_key(&req.key) {
+            if self.order.len() >= MAX_CACHED {
+                let oldest = self.order.remove(0);
+                self.jobs.remove(&oldest);
+            }
+            self.order.push(req.key.clone());
+            self.jobs.insert(req.key.clone(), Job::new(req));
+        }
+        let job = self.jobs.get_mut(&req.key).expect("just inserted");
+        let upto = req.upto.min(req.lines.len());
+        let from = job.rows;
+        let mut out = Vec::new();
+        while job.rows < upto {
+            match &mut job.mode {
+                Mode::Hunks(parse) => {
+                    let tail = parse.extend(&req.lines, upto, deadline);
+                    job.rows += tail.len();
+                    out.extend(tail);
+                }
+                Mode::Sides { old, new } => {
+                    let (o, n) = req.info.get(job.rows).copied().unwrap_or((None, None));
+                    let side = match (o, n) {
+                        (_, Some(no)) => Some((new, req.new.as_deref(), no)),
+                        (Some(no), None) => Some((old, req.old.as_deref(), no)),
+                        (None, None) => None,
+                    };
+                    let row = match side {
+                        None => Some(StyledLine::new()),
+                        Some((parse, text, no)) => {
+                            let text = text.unwrap_or_default();
+                            parse.extend(text, no.max(0) as usize, deadline);
+                            parse.row(no).cloned().or_else(|| (parse.next >= no.max(0) as usize).then(StyledLine::new))
+                        }
+                    };
+                    let Some(row) = row else { break }; // the file is not read that far yet
+                    out.push(row);
+                    job.rows += 1;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        (Painting { key: req.key.clone(), from, rows: out }, job.rows >= upto)
+    }
+
+    fn forget(&mut self) {
+        self.jobs.clear();
+        self.order.clear();
+    }
+}
+
+/// The colors a file view has so far, indexed by diff row. A row nobody has
+/// colored yet is absent, and the caller draws that line plain.
+#[derive(Default)]
+pub struct Painted(Arc<Vec<StyledLine>>);
+
+impl Painted {
+    pub fn row(&self, i: usize) -> Option<&StyledLine> {
+        self.0.get(i)
+    }
+}
+
+enum Engine {
+    /// The app: a thread of its own, answering through the event loop.
+    Thread(Sender<Ask>),
+    /// Tests and one-off callers: the work runs where it is asked for.
+    Inline(RefCell<Painter>),
+}
+
+#[derive(Default)]
+struct Front {
+    rows: HashMap<Key, Arc<Vec<StyledLine>>>,
+    /// The highest row count asked for, so no range is asked for twice.
+    asked: HashMap<Key, usize>,
+}
+
+/// The rendering side of highlighting: it holds what is colored and asks for
+/// the rest. It never parses anything itself.
 pub struct Highlighter {
-    cache: RefCell<Cache>,
-    blobs: RefCell<HashMap<String, Parsed>>,
-    /// Whether a file's diff matches the blobs it names.
-    agrees: RefCell<HashMap<(String, u64), bool>>,
+    front: RefCell<Front>,
+    engine: Engine,
+}
+
+impl Default for Highlighter {
+    fn default() -> Highlighter {
+        Highlighter { front: RefCell::default(), engine: Engine::Inline(RefCell::default()) }
+    }
 }
 
 impl Highlighter {
-    /// The colors of `path`, parsed as far as line `upto`. Rows past what has
-    /// been parsed are absent, and the caller draws those lines plain.
-    pub fn rows(&self, path: &str, lines: &[String], upto: usize) -> Rc<Vec<StyledLine>> {
-        let key = (path.to_string(), fingerprint(lines));
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
-            cache.clear();
-        }
-        let parsed = cache.entry(key).or_insert_with(|| Parsed::new(path, lines));
-        parsed.extend(lines, upto);
-        parsed.rows.clone()
+    /// A highlighter whose work runs on a thread of its own and lands back in
+    /// the event loop as [`crate::worker::Msg::Painted`].
+    pub fn threaded(results: Sender<crate::worker::Msg>) -> Highlighter {
+        let (tx, rx) = std::sync::mpsc::channel::<Ask>();
+        std::thread::spawn(move || paint_loop(rx, results));
+        Highlighter { front: RefCell::default(), engine: Engine::Thread(tx) }
     }
 
-    /// The colors of `path`, from its two blobs when the diff names them and
-    /// `blobs` holds them, and from the hunks themselves otherwise.
+    /// A highlighter that sends its requests to `tx` and nowhere else.
+    pub fn sending(tx: Sender<Ask>) -> Highlighter {
+        Highlighter { front: RefCell::default(), engine: Engine::Thread(tx) }
+    }
+
+    /// The colors of `path` as far as they are known, and a request for the
+    /// rows up to `upto` that are still missing.
     pub fn paint(
         &self,
         path: &str,
@@ -403,49 +561,103 @@ impl Highlighter {
         blobs: &Blobs,
         upto: usize,
     ) -> Painted {
-        let hunks = || Painted::Hunks(self.rows(path, lines, upto));
-        let (Some(info), Some((old_hash, new_hash))) = (info, crate::diff::blob_hashes(lines)) else {
-            return hunks();
-        };
-        // Every side the diff shows needs its blob: painting one of them from
-        // the file and leaving the other plain reads worse than parsing the
-        // hunks. A worktree diff never has a blob for its new side, so it
-        // keeps the hunks.
-        let (old_text, new_text) = (blobs.get(&old_hash), blobs.get(&new_hash));
-        let shows = |side: fn(&LineInfo) -> Option<i64>| info.iter().any(|i| side(i).is_some());
-        if (shows(|i| i.0) && old_text.is_none()) || (shows(|i| i.1) && new_text.is_none()) {
-            return hunks();
-        }
         let key = (path.to_string(), fingerprint(lines));
-        let mut agreed = self.agrees.borrow_mut();
-        if agreed.len() >= MAX_CACHED && !agreed.contains_key(&key) {
-            agreed.clear();
+        let upto = upto.min(lines.len());
+        let mut front = self.front.borrow_mut();
+        let held = front.rows.entry(key.clone()).or_default().len();
+        let asked = front.asked.get(&key).copied().unwrap_or(0);
+        let wanted = upto > held && upto > asked;
+        if wanted {
+            front.asked.insert(key.clone(), upto);
         }
-        let agrees =
-            *agreed.entry(key).or_insert_with(|| sides_agree(lines, info, old_text, new_text));
-        drop(agreed);
-        if !agrees {
-            return hunks();
+        drop(front);
+        if wanted {
+            let (old, new) = crate::diff::blob_hashes(lines).unwrap_or_default();
+            let request = Request {
+                key: key.clone(),
+                path: path.to_string(),
+                lines: Arc::new(lines.to_vec()),
+                info: Arc::new(info.cloned().unwrap_or_default()),
+                old: blobs.get(&old).cloned(),
+                new: blobs.get(&new).cloned(),
+                upto,
+            };
+            match &self.engine {
+                Engine::Thread(tx) => {
+                    let _ = tx.send(Ask::Paint(request));
+                }
+                Engine::Inline(painter) => {
+                    let (painting, _) = painter.borrow_mut().work(&request, far());
+                    self.absorb(painting);
+                }
+            }
         }
-        // The rows the viewport asks for name the file lines to parse.
-        let bound = |side: fn(&LineInfo) -> Option<i64>| {
-            info.iter().take(upto).filter_map(side).max().unwrap_or(0) as usize
-        };
-        Painted::Sides {
-            old: self.blob_rows(path, &old_hash, old_text, bound(|i| i.0)),
-            new: self.blob_rows(path, &new_hash, new_text, bound(|i| i.1)),
-        }
+        Painted(self.front.borrow().rows.get(&key).cloned().unwrap_or_default())
     }
 
-    fn blob_rows(&self, path: &str, hash: &str, text: Option<&String>, upto: usize) -> Rc<Vec<StyledLine>> {
-        let Some(text) = text else { return Rc::new(Vec::new()) };
-        let mut blobs = self.blobs.borrow_mut();
-        if blobs.len() >= MAX_CACHED && !blobs.contains_key(hash) {
-            blobs.clear();
+    /// Take in rows the painter finished. A result for a view that is gone, or
+    /// one that does not carry on from what is held, is dropped.
+    pub fn absorb(&self, painting: Painting) {
+        let mut front = self.front.borrow_mut();
+        let Some(rows) = front.rows.get_mut(&painting.key) else { return };
+        if painting.from != rows.len() {
+            return;
         }
-        let parsed = blobs.entry(hash.to_string()).or_insert_with(|| Parsed::for_blob(path, text));
-        parsed.extend_blob(text, upto);
-        parsed.rows.clone()
+        Arc::make_mut(rows).extend(painting.rows);
+    }
+
+    /// Drop everything: the diffs it colored are gone.
+    pub fn reset(&self) {
+        let mut front = self.front.borrow_mut();
+        front.rows.clear();
+        front.asked.clear();
+        drop(front);
+        match &self.engine {
+            Engine::Thread(tx) => {
+                let _ = tx.send(Ask::Forget);
+            }
+            Engine::Inline(painter) => painter.borrow_mut().forget(),
+        }
+    }
+}
+
+/// The highlighter thread: newest request first, one slice at a time, and a
+/// result after every slice so a long file fills in from the top.
+fn paint_loop(rx: Receiver<Ask>, results: Sender<crate::worker::Msg>) {
+    let mut painter = Painter::default();
+    let mut queue: Vec<Request> = Vec::new();
+    loop {
+        if queue.is_empty() {
+            match rx.recv() {
+                Ok(ask) => take(&mut queue, &mut painter, ask),
+                Err(_) => return,
+            }
+        }
+        while let Ok(ask) = rx.try_recv() {
+            take(&mut queue, &mut painter, ask);
+        }
+        let Some(request) = queue.pop() else { continue };
+        let (painting, done) = painter.work(&request, Instant::now() + SLICE);
+        if !painting.rows.is_empty() && results.send(crate::worker::Msg::Painted(painting)).is_err() {
+            return;
+        }
+        if !done {
+            queue.push(request);
+        }
+    }
+}
+
+fn take(queue: &mut Vec<Request>, painter: &mut Painter, ask: Ask) {
+    match ask {
+        Ask::Paint(request) => {
+            // One request per view, the latest one: it asks for the most rows.
+            queue.retain(|held| held.key != request.key);
+            queue.push(request);
+        }
+        Ask::Forget => {
+            queue.clear();
+            painter.forget();
+        }
     }
 }
 
@@ -597,30 +809,30 @@ mod tests {
          \x20    \"\"\"\n\
          \x20    return 1\n";
 
-    fn docstring_case(blobs: Blobs) -> (Vec<String>, Vec<LineInfo>, Painted, usize) {
+    fn painted(blobs: Blobs) -> (Vec<String>, Vec<LineInfo>, Painted, usize) {
         let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
         let (lines, info) = (files["m.py"].clone(), infos["m.py"].clone());
         let at = lines.iter().position(|l| l.contains("return 1")).unwrap();
         let hl = Highlighter::default();
-        let painted = hl.paint("m.py", &lines, Some(&info), &blobs, lines.len());
-        (lines, info, painted, at)
+        let out = hl.paint("m.py", &lines, Some(&info), &blobs, lines.len());
+        (lines, info, out, at)
     }
 
     fn blobs_of(old: &str, new: &str) -> Blobs {
-        [("aaaaaaa".to_string(), old.to_string()), ("bbbbbbb".to_string(), new.to_string())]
+        [("aaaaaaa".to_string(), Arc::from(old)), ("bbbbbbb".to_string(), Arc::from(new))]
             .into_iter()
             .collect()
     }
 
     #[test]
     fn a_hunk_inside_a_docstring_reads_from_the_file() {
-        let (_, info, painted, at) = docstring_case(blobs_of(OLD_PY, NEW_PY));
-        let row = painted.row(at, Some(info[at])).expect("the line is colored");
+        let (_, info, out, at) = painted(blobs_of(OLD_PY, NEW_PY));
+        let row = out.row(at).expect("the line is colored");
         assert_eq!(role_of(row, "return"), Some(&Token::Keyword), "{row:?}");
         assert!(held(row, Token::Comment).is_empty(), "{row:?}");
         // The line the hunk opens on is still inside the docstring.
         let inside = info.iter().position(|&(_, n)| n == Some(6)).unwrap();
-        let row = painted.row(inside, Some(info[inside])).unwrap();
+        let row = out.row(inside).unwrap();
         assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
     }
 
@@ -628,8 +840,8 @@ mod tests {
     fn without_the_file_the_hunk_is_parsed_on_its_own() {
         // The closing quotes open a docstring of their own, and the rest of
         // the hunk falls inside it.
-        let (_, info, painted, at) = docstring_case(Blobs::new());
-        let row = painted.row(at, Some(info[at])).unwrap();
+        let (_, _, out, at) = painted(Blobs::new());
+        let row = out.row(at).unwrap();
         assert_eq!(role_of(row, "return"), None, "{row:?}");
         assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
     }
@@ -639,9 +851,8 @@ mod tests {
         // A stale or wrong blob would paint the wrong lines, so the file falls
         // back to its hunks.
         let other = OLD_PY.replace("return 1", "return 99");
-        let (_, info, painted, at) = docstring_case(blobs_of(&other, NEW_PY));
-        assert!(matches!(painted, Painted::Hunks(_)));
-        let row = painted.row(at, Some(info[at])).unwrap();
+        let (_, _, out, at) = painted(blobs_of(&other, NEW_PY));
+        let row = out.row(at).unwrap();
         assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
     }
 
@@ -649,9 +860,10 @@ mod tests {
     fn a_side_the_diff_shows_needs_its_blob() {
         // Half the file would paint half the diff, so one missing blob sends
         // the file back to its hunks.
-        let blobs: Blobs = [("bbbbbbb".to_string(), NEW_PY.to_string())].into_iter().collect();
-        let (_, _, painted, _) = docstring_case(blobs);
-        assert!(matches!(painted, Painted::Hunks(_)));
+        let blobs: Blobs = [("bbbbbbb".to_string(), Arc::from(NEW_PY))].into_iter().collect();
+        let (_, _, out, at) = painted(blobs);
+        let row = out.row(at).unwrap();
+        assert!(!held(row, Token::Comment).is_empty(), "{row:?}");
     }
 
     #[test]
@@ -661,18 +873,113 @@ mod tests {
         let (files, infos) = crate::diff::parse_diff(raw);
         let (lines, info) = (&files["n.py"], &infos["n.py"]);
         let blobs: Blobs =
-            [("bbbbbbb".to_string(), "import os\nx = 1\n".to_string())].into_iter().collect();
-        let painted = Highlighter::default().paint("n.py", lines, Some(info), &blobs, lines.len());
-        assert!(matches!(painted, Painted::Sides { .. }));
+            [("bbbbbbb".to_string(), Arc::from("import os\nx = 1\n"))].into_iter().collect();
+        let out = Highlighter::default().paint("n.py", lines, Some(info), &blobs, lines.len());
         let at = lines.iter().position(|l| l.contains("import")).unwrap();
-        let row = painted.row(at, Some(info[at])).unwrap();
+        let row = out.row(at).unwrap();
         assert_eq!(role_of(row, "import"), Some(&Token::Import), "{row:?}");
+    }
+
+    fn request_channel() -> (Highlighter, Receiver<Ask>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Highlighter::sending(tx), rx)
+    }
+
+    #[test]
+    fn one_request_covers_a_range_asked_for_twice() {
+        let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
+        let (lines, info) = (&files["m.py"], &infos["m.py"]);
+        let (hl, asks) = request_channel();
+
+        let out = hl.paint("m.py", lines, Some(info), &Blobs::new(), 4);
+        assert!(out.row(0).is_none(), "nothing is colored before the answer");
+        hl.paint("m.py", lines, Some(info), &Blobs::new(), 4);
+        hl.paint("m.py", lines, Some(info), &Blobs::new(), 2);
+        let asked: Vec<usize> = asks.try_iter().map(|a| match a {
+            Ask::Paint(r) => r.upto,
+            Ask::Forget => 0,
+        }).collect();
+        assert_eq!(asked, vec![4], "the same range is not asked for twice");
+
+        // Scrolling further asks for the rest, and never for less.
+        hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+        let asked: Vec<usize> = asks.try_iter().map(|a| match a {
+            Ask::Paint(r) => r.upto,
+            Ask::Forget => 0,
+        }).collect();
+        assert_eq!(asked, vec![9]);
+    }
+
+    #[test]
+    fn rows_arrive_in_order_and_only_once() {
+        let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
+        let (lines, info) = (&files["m.py"], &infos["m.py"]);
+        let (hl, _asks) = request_channel();
+        let key = ("m.py".to_string(), fingerprint(lines));
+        hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+
+        let row = |t: Token| vec![(t, "x".to_string())];
+        hl.absorb(Painting { key: key.clone(), from: 0, rows: vec![row(Token::Keyword); 2] });
+        let out = hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+        assert_eq!(out.row(1).map(Vec::len), Some(1));
+        assert!(out.row(2).is_none(), "the rest has not arrived");
+
+        // A partial result carries on from what is held.
+        hl.absorb(Painting { key: key.clone(), from: 2, rows: vec![row(Token::Str)] });
+        let out = hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+        assert_eq!(out.row(2).map(|r| r[0].0), Some(Token::Str));
+        // One that does not is dropped, so the rows stay in step.
+        hl.absorb(Painting { key: key.clone(), from: 0, rows: vec![row(Token::Number); 5] });
+        hl.absorb(Painting { key: key.clone(), from: 8, rows: vec![row(Token::Number)] });
+        let out = hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+        assert_eq!(out.row(0).map(|r| r[0].0), Some(Token::Keyword));
+        assert!(out.row(3).is_none());
+    }
+
+    #[test]
+    fn a_result_for_a_diff_that_is_gone_is_dropped() {
+        let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
+        let (lines, info) = (&files["m.py"], &infos["m.py"]);
+        let (hl, asks) = request_channel();
+        let key = ("m.py".to_string(), fingerprint(lines));
+        hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+
+        hl.reset();
+        assert!(matches!(asks.try_iter().last(), Some(Ask::Forget)));
+        hl.absorb(Painting { key, from: 0, rows: vec![vec![(Token::Keyword, "x".into())]] });
+        let out = hl.paint("m.py", lines, Some(info), &Blobs::new(), 9);
+        assert!(out.row(0).is_none(), "the answer belongs to a diff that is gone");
+    }
+
+    #[test]
+    fn a_slice_stops_and_the_next_one_carries_on() {
+        let (files, infos) = crate::diff::parse_diff(DOCSTRING_DIFF);
+        let (lines, info) = (files["m.py"].clone(), infos["m.py"].clone());
+        let request = Request {
+            key: ("m.py".to_string(), 0),
+            path: "m.py".to_string(),
+            lines: Arc::new(lines.clone()),
+            info: Arc::new(info),
+            old: Some(Arc::from(OLD_PY)),
+            new: Some(Arc::from(NEW_PY)),
+            upto: lines.len(),
+        };
+        let mut painter = Painter::default();
+        // A deadline already past leaves one slice of lines behind.
+        let (first, done) = painter.work(&request, Instant::now());
+        assert!(!done && first.from == 0 && !first.rows.is_empty());
+        let (second, done) = painter.work(&request, far());
+        assert!(done);
+        assert_eq!(second.from, first.rows.len());
+        assert_eq!(first.rows.len() + second.rows.len(), lines.len());
     }
 
     #[test]
     fn an_unknown_language_gets_no_roles() {
         let lines = vec!["@@ -1 +1 @@".to_string(), "+whatever".to_string()];
-        assert!(highlight_diff("notes.unknownext", &lines).is_empty());
+        let rows = highlight_diff("notes.unknownext", &lines);
+        assert_eq!(rows.len(), lines.len());
+        assert!(rows.iter().all(Vec::is_empty));
     }
 
     fn text_of(line: &StyledLine) -> String {
@@ -723,14 +1030,14 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_returns_the_same_parse_twice() {
+    fn a_reloaded_diff_is_colored_again() {
         let hl = Highlighter::default();
         let lines = vec!["@@ -1 +1 @@".to_string(), "+let x = 1;".to_string()];
-        let a = hl.rows("f.rs", &lines, lines.len());
-        let b = hl.rows("f.rs", &lines, lines.len());
-        assert!(Rc::ptr_eq(&a, &b));
+        let a = hl.paint("f.rs", &lines, None, &Blobs::new(), lines.len());
+        assert_eq!(role_of(a.row(1).unwrap(), "let"), Some(&Token::Keyword));
         let other = vec!["@@ -1 +1 @@".to_string(), "+let y = 2;".to_string()];
-        assert!(!Rc::ptr_eq(&a, &hl.rows("f.rs", &other, other.len())));
+        let b = hl.paint("f.rs", &other, None, &Blobs::new(), other.len());
+        assert_eq!(text_of(b.row(1).unwrap()), "let y = 2;");
     }
 
     fn rust_diff(n: usize) -> Vec<String> {
@@ -745,13 +1052,14 @@ mod tests {
     fn a_parse_picks_up_where_it_stopped() {
         let lines = rust_diff(300);
         let hl = Highlighter::default();
-        let near = hl.rows("f.rs", &lines, 50);
-        assert_eq!(near.len(), 50);
-        let far = hl.rows("f.rs", &lines, 200);
-        assert_eq!(far.len(), 200);
         let whole = highlight_diff("f.rs", &lines);
-        assert_eq!(&far[..], &whole[..200]);
-        assert_eq!(&near[..], &whole[..50]);
+        let near = hl.paint("f.rs", &lines, None, &Blobs::new(), 50);
+        assert_eq!(near.row(49), Some(&whole[49]));
+        assert!(near.row(50).is_none());
+        let far = hl.paint("f.rs", &lines, None, &Blobs::new(), 200);
+        assert_eq!(far.row(199), Some(&whole[199]));
+        assert_eq!(far.row(10), Some(&whole[10]));
+        assert!(far.row(200).is_none());
     }
 
     #[test]

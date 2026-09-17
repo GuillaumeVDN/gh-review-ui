@@ -77,7 +77,9 @@ pub enum Msg {
         stale_viewed: std::collections::HashSet<String>,
     },
     CommitDiff { diff: Diff, info: Info },
-    Blobs(HashMap<String, String>),
+    Blobs(crate::syntax::Blobs),
+    /// Rows a file view's colors were asked for, as the highlighter finishes them.
+    Painted(crate::syntax::Painting),
     PrOpened { number: i64, path: String },
     ViewedOk { paths: Vec<String>, viewed: bool },
     ViewedBulk { done: Vec<String>, viewed: bool, errs: usize },

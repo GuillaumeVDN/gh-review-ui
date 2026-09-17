@@ -729,7 +729,7 @@ fn diff_column_rows(
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: &lines[i],
-            hl: hl.row(i, info.and_then(|inf| inf.get(i)).copied()),
+            hl: hl.row(i),
             nos: &[new.or(old)],
             current: cur.map_or(false, |(s, e)| s <= i && i < e),
             selected: sel.0 <= i && i <= sel.1,
@@ -996,7 +996,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
-            rows: wrap_styled_hard(&code_spans(ln, hl.row(i, Some((old, new))), current), tw.max(1)),
+            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
             row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
@@ -1383,7 +1383,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
 
     let hl = match &path {
         Some(p) => st.highlight.paint(p, diff_lines, info_here, &st.blobs, st.diff_scroll + vh),
-        None => Painted::Hunks(Default::default()),
+        None => Painted::default(),
     };
 
     // The gutter carries both line numbers, old then new; the text column takes
@@ -1446,7 +1446,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: ln,
-            hl: hl.row(i, info_here.and_then(|inf| inf.get(i)).copied()),
+            hl: hl.row(i),
             nos: &[nos.0, nos.1],
             current,
             selected,
@@ -1596,7 +1596,7 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let tw = iw.saturating_sub(gw);
     let hl = match &path {
         Some(p) => st.highlight.paint(p, lines_vec, info, &st.blobs, st.edit_diff_scroll + vh),
-        None => Painted::Hunks(Default::default()),
+        None => Painted::default(),
     };
     st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
     let mut out: Vec<Line> = Vec::new();
@@ -1605,7 +1605,7 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
         let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
         let row = DiffRow {
             line: &lines_vec[i],
-            hl: hl.row(i, info.and_then(|inf| inf.get(i)).copied()),
+            hl: hl.row(i),
             nos: &[old, new],
             current: false,
             selected: false,
@@ -1904,6 +1904,27 @@ mod tests {
         assert_eq!(spans[1].1, "let x = 1;");
         // A header line stays one span, in its own style.
         assert_eq!(code_spans("@@ -1 +1 @@", None, false).len(), 1);
+    }
+
+    #[test]
+    fn a_row_nobody_has_colored_yet_keeps_its_marker_and_gutter() {
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let row = DiffRow {
+            line: "+let x = 1;",
+            hl: None,
+            nos: &[None, Some(42)],
+            current: true,
+            selected: false,
+            local_del: false,
+        };
+        push_diff_rows(&mut out, 10, &row, 4, 24, true);
+        assert_eq!(out.len(), 1);
+        let text: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("▌"), "{text:?}");
+        assert!(text.contains("  42 "), "{text:?}");
+        assert!(text.contains("+let x = 1;"), "{text:?}");
+        // The whole row still sits on the added-line tint.
+        assert!(out[0].spans.iter().all(|s| s.style.bg.is_some()));
     }
 
     #[test]

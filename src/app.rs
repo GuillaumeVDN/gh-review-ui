@@ -48,9 +48,14 @@ fn event_loop(
 ) -> Result<()> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let paint_tx = msg_tx.clone();
     thread::spawn(move || worker::worker_loop(job_rx, msg_tx));
 
-    let mut st = State::default();
+    // Every parse runs on a thread of its own; drawing only reads what is done.
+    let mut st = State {
+        highlight: crate::syntax::Highlighter::threaded(paint_tx),
+        ..Default::default()
+    };
     match api::detect_repo() {
         Ok((o, n)) => {
             st.repo_owner = o;
