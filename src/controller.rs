@@ -338,25 +338,31 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove("review");
             st.status = format!("Review submitted ({event})");
         }
-        Msg::ReviewHeld { kept, posted, reasons, archive } => {
+        Msg::ReviewHeld { kept, posted, reasons, archive, submitted } => {
             st.busy.remove("review");
             st.pending = kept;
             st.pending_idx = 0;
-            st.status = format!(
-                "Review NOT submitted — GitHub refused {} of {} comment(s)",
-                reasons.len(),
-                reasons.len() + posted
-            );
+            st.status = match submitted {
+                true => format!("Review submitted — GitHub dropped {} comment(s)", reasons.len()),
+                false => format!(
+                    "Review NOT submitted — GitHub refused {} of {} comment(s)",
+                    reasons.len(),
+                    reasons.len() + posted
+                ),
+            };
             // A one-line status cannot carry which comment failed and why, and
             // that is what the reviewer needs to fix them.
             let mut lines = vec![
-                format!("{posted} comment(s) are waiting in the review on GitHub."),
-                format!("{} comment(s) stay pending here, refused:", reasons.len()),
+                match submitted {
+                    true => format!("{posted} comment(s) went out with the review."),
+                    false => format!("{posted} comment(s) are waiting in the review on GitHub."),
+                },
+                format!("{} comment(s) stay pending here:", reasons.len()),
                 String::new(),
             ];
             lines.extend(reasons);
             lines.push(String::new());
-            lines.push("Fix the lines they point at, then submit again.".into());
+            lines.push("Move them onto a line the PR diff holds, then submit again.".into());
             lines.push(format!("Every comment is also in {archive}"));
             st.overlay =
                 Overlay::Hooks { title: st.status.clone(), lines, failed: true, scroll: 0 };
@@ -1915,6 +1921,7 @@ mod tests {
                 posted: 1,
                 reasons: vec!["b:2 — that line is not part of the diff".into()],
                 archive: "/tmp/pr-7.archive.jsonl".into(),
+                submitted: false,
             },
             &tx,
         );

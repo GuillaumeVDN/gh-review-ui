@@ -898,7 +898,7 @@ pub fn find_pending_review(owner: &str, name: &str, number: i64, login: &str) ->
     Ok((pr_id, rid))
 }
 
-fn ensure_pending_review(owner: &str, name: &str, number: i64, login: &str, pr_id: &str) -> Result<String> {
+pub fn ensure_pending_review(owner: &str, name: &str, number: i64, login: &str, pr_id: &str) -> Result<String> {
     if let (_, Some(rid)) = find_pending_review(owner, name, number, login)? {
         return Ok(rid);
     }
@@ -1092,6 +1092,11 @@ pub fn update_pending_comment_api(comment_id: &str, body: &str) -> Result<()> {
 
 pub fn submit_review_api(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, event: &str, body: &str) -> Result<()> {
     let review_id = ensure_pending_review(owner, name, number, login, pr_id)?;
+    submit_review_id(&review_id, event, body)
+}
+
+fn submit_review_id(review_id: &str, event: &str, body: &str) -> Result<()> {
+    let review_id = review_id.to_string();
     let q = "mutation($r:ID!, $event:PullRequestReviewEvent!, $body:String) { submitPullRequestReview(input:{pullRequestReviewId:$r, event:$event, body:$body}) { pullRequestReview { id } } }";
     let mut vars: Vec<(&str, Var)> = vec![("r", review_id.into()), ("event", event.into())];
     if !body.is_empty() {
@@ -1151,34 +1156,22 @@ pub fn load_local_comments(owner: &str, name: &str, number: i64) -> Vec<PendingC
 /// burst of writes, and asks for a second between them.
 const PACE: std::time::Duration = std::time::Duration::from_millis(1_000);
 
-/// Post `comments` to the PR's pending review, one at a time. Returns the ones
-/// the PR took, and the ones it refused with the reason.
+/// Post `comments` to the pending review `review_id`, one at a time. Returns
+/// the ones the PR took, and the ones it refused with the reason.
 ///
-/// The review id is read once, because two reads of it can each create one. The
-/// PR refuses a thread whose line left the diff, and one call per comment keeps
-/// that refusal to the one comment.
+/// The PR refuses a thread whose line left the diff, and one call per comment
+/// keeps that refusal to the one comment.
 pub fn post_review_comments(
-    owner: &str,
-    name: &str,
-    number: i64,
-    login: &str,
-    pr_id: &str,
+    review_id: &str,
     comments: &[PendingComment],
 ) -> (Vec<PendingComment>, Vec<(PendingComment, String)>) {
-    let review_id = match ensure_pending_review(owner, name, number, login, pr_id) {
-        Ok(id) => id,
-        Err(e) => {
-            let why = format!("no pending review: {e}");
-            return (Vec::new(), comments.iter().map(|c| (c.clone(), why.clone())).collect());
-        }
-    };
     let mut posted = Vec::new();
     let mut refused = Vec::new();
     for (i, c) in comments.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(PACE);
         }
-        match place_comment(&review_id, c) {
+        match place_comment(review_id, c) {
             Ok(()) => posted.push(c.clone()),
             Err(why) => refused.push((c.clone(), why)),
         }
@@ -1206,9 +1199,9 @@ fn place_comment(review_id: &str, c: &PendingComment) -> Result<(), String> {
     Err(why)
 }
 
-/// Submit the review, and try again when the call fails: the comments are
-/// already on it, so a lost call would leave them unsent.
-pub fn submit_review_retry(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, event: &str, body: &str) -> Result<()> {
+/// Submit the review `review_id`, and try again when the call fails: the
+/// comments are already on it, so a lost call would leave them unsent.
+pub fn submit_review_retry(review_id: &str, event: &str, body: &str) -> Result<()> {
     let mut last = None;
     let mut wait = std::time::Duration::from_secs(2);
     for attempt in 0..3 {
@@ -1216,12 +1209,47 @@ pub fn submit_review_retry(owner: &str, name: &str, number: i64, login: &str, pr
             std::thread::sleep(wait);
             wait *= 2;
         }
-        match submit_review_api(owner, name, number, login, pr_id, event, body) {
+        match submit_review_id(review_id, event, body) {
             Ok(()) => return Ok(()),
             Err(e) => last = Some(e),
         }
     }
     Err(last.expect("three tries leave an error"))
+}
+
+/// The `(path, line)` of every comment the review holds.
+fn review_anchors(review_id: &str) -> Result<std::collections::HashSet<(String, i64)>> {
+    let q = "query($r:ID!) { node(id:$r) { ... on PullRequestReview { comments(first:100) { nodes { path line originalLine } } } } }";
+    let d = gh_graphql(q, &[("r", review_id.into())])?;
+    let mut out = std::collections::HashSet::new();
+    if let Some(nodes) = d["data"]["node"]["comments"]["nodes"].as_array() {
+        for c in nodes {
+            let line = c["line"].as_i64().or_else(|| c["originalLine"].as_i64()).unwrap_or(0);
+            if let Some(path) = c["path"].as_str() {
+                out.insert((path.to_string(), line));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The comments the review does not hold any more.
+///
+/// GitHub takes a thread whose line is outside the PR diff, keeps it while the
+/// review is pending, then drops it when the review goes out. Only a read-back
+/// tells the reviewer which of their comments nobody will ever see.
+pub fn comments_dropped(review_id: &str, posted: &[PendingComment]) -> Vec<PendingComment> {
+    match review_anchors(review_id) {
+        Ok(anchors) => dropped_from(posted, &anchors),
+        Err(_) => Vec::new(), // a read we cannot make says nothing about the review
+    }
+}
+
+fn dropped_from(
+    posted: &[PendingComment],
+    anchors: &std::collections::HashSet<(String, i64)>,
+) -> Vec<PendingComment> {
+    posted.iter().filter(|c| !anchors.contains(&(c.path.clone(), c.line))).cloned().collect()
 }
 
 fn archive_path(owner: &str, name: &str, number: i64) -> PathBuf {
@@ -1333,6 +1361,24 @@ mod tests {
         assert!(lines[2].contains("\"path\":\"c\""), "{}", lines[2]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_comment_the_review_does_not_hold_counts_as_dropped() {
+        let c = |path: &str, line: i64| PendingComment {
+            path: path.into(),
+            body: "b".into(),
+            line,
+            side: "RIGHT".into(),
+            comment_id: String::new(),
+            start_line: None,
+            start_side: String::new(),
+        };
+        let posted = vec![c("a.py", 10), c("b.py", 89)];
+        let anchors = [("a.py".to_string(), 10)].into_iter().collect();
+        let lost = dropped_from(&posted, &anchors);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].path, "b.py");
     }
 
     /// One `reviewThreads` page, in the shape the query asks GitHub for.

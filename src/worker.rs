@@ -88,7 +88,7 @@ pub enum Msg {
     ReviewSubmitted(String),
     /// The PR refused part of a local review, so the review stays unsubmitted
     /// and the refused comments stay pending.
-    ReviewHeld { kept: Vec<PendingComment>, posted: usize, reasons: Vec<String>, archive: String },
+    ReviewHeld { kept: Vec<PendingComment>, posted: usize, reasons: Vec<String>, archive: String, submitted: bool },
     Edits(api::Edits),
     EditsCommitted { status: String, amended: bool, committed: bool },
     /// One line of a running commit's hook output.
@@ -228,7 +228,10 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             Msg::ReviewSubmitted(event.clone())
         }
         Job::PostLocalReview { owner, name, number, login, pr_id, comments, event, body } => {
-            let (posted, refused) = api::post_review_comments(owner, name, *number, login, pr_id, comments);
+            // One read of the review id for the whole batch: two reads of it
+            // can each create a review, and the comments then split in two.
+            let review_id = api::ensure_pending_review(owner, name, *number, login, pr_id)?;
+            let (posted, refused) = api::post_review_comments(&review_id, comments);
             api::archive_comments(owner, name, *number, "posted", &posted);
             let kept: Vec<PendingComment> = refused.iter().map(|(c, _)| c.clone()).collect();
             // The posted ones leave the store and the pane before the submit:
@@ -245,13 +248,30 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                         .map(|(c, why)| format!("{}:{} — {why}", c.path, c.line))
                         .collect(),
                     archive: archive.display().to_string(),
+                    submitted: false,
                 });
             }
             let _ = tx.send(Msg::PendingList {
                 pending: Vec::new(),
                 status: format!("Posted {} comment(s), submitting…", posted.len()),
             });
-            api::submit_review_retry(owner, name, *number, login, pr_id, event, body)?;
+            api::submit_review_retry(&review_id, event, body)?;
+            // The review can go out lighter than it left: read it back.
+            let lost = api::comments_dropped(&review_id, &posted);
+            if !lost.is_empty() {
+                let archive = api::archive_comments(owner, name, *number, "dropped", &lost);
+                api::save_local_comments(owner, name, *number, &lost);
+                return Ok(Msg::ReviewHeld {
+                    posted: posted.len() - lost.len(),
+                    reasons: lost
+                        .iter()
+                        .map(|c| format!("{}:{} — that line is outside the PR diff", c.path, c.line))
+                        .collect(),
+                    kept: lost,
+                    archive: archive.display().to_string(),
+                    submitted: true,
+                });
+            }
             Msg::ReviewSubmitted(event.clone())
         }
         Job::LoadEdits { wt } => Msg::Edits(api::load_edits(wt)),
