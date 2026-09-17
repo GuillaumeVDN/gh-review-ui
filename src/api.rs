@@ -1050,6 +1050,13 @@ fn thread_comment(c: &Value) -> ThreadComment {
 /// `thread: null` with **no** GraphQL error, so success can't be assumed.
 pub fn add_pending_comment_api(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, c: &PendingComment) -> Result<bool> {
     let review_id = ensure_pending_review(owner, name, number, login, pr_id)?;
+    add_review_thread(&review_id, c)
+}
+
+/// Hang one comment on an existing pending review. Answers whether the PR took
+/// it: it refuses a line that is not part of the diff.
+fn add_review_thread(review_id: &str, c: &PendingComment) -> Result<bool> {
+    let review_id = review_id.to_string();
     let mut decls = "$r:ID!, $path:String!, $line:Int!, $body:String!, $side:DiffSide!".to_string();
     let mut fields = "pullRequestReviewId:$r, path:$path, line:$line, body:$body, side:$side".to_string();
     let mut vars: Vec<(&str, Var)> = vec![
@@ -1140,6 +1147,120 @@ pub fn load_local_comments(owner: &str, name: &str, number: i64) -> Vec<PendingC
         .unwrap_or_default()
 }
 
+/// A pause between two mutations. GitHub's secondary rate limit refuses a
+/// burst of writes, and asks for a second between them.
+const PACE: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// Post `comments` to the PR's pending review, one at a time. Returns the ones
+/// the PR took, and the ones it refused with the reason.
+///
+/// The review id is read once, because two reads of it can each create one. The
+/// PR refuses a thread whose line left the diff, and one call per comment keeps
+/// that refusal to the one comment.
+pub fn post_review_comments(
+    owner: &str,
+    name: &str,
+    number: i64,
+    login: &str,
+    pr_id: &str,
+    comments: &[PendingComment],
+) -> (Vec<PendingComment>, Vec<(PendingComment, String)>) {
+    let review_id = match ensure_pending_review(owner, name, number, login, pr_id) {
+        Ok(id) => id,
+        Err(e) => {
+            let why = format!("no pending review: {e}");
+            return (Vec::new(), comments.iter().map(|c| (c.clone(), why.clone())).collect());
+        }
+    };
+    let mut posted = Vec::new();
+    let mut refused = Vec::new();
+    for (i, c) in comments.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(PACE);
+        }
+        match place_comment(&review_id, c) {
+            Ok(()) => posted.push(c.clone()),
+            Err(why) => refused.push((c.clone(), why)),
+        }
+    }
+    (posted, refused)
+}
+
+/// Place one comment, and try again when the call fails. A call the network or
+/// a rate limit drops takes a comment the reviewer wrote with it, and GitHub
+/// keeps no trace of it.
+fn place_comment(review_id: &str, c: &PendingComment) -> Result<(), String> {
+    let mut why = String::new();
+    let mut wait = std::time::Duration::from_secs(2);
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(wait);
+            wait *= 2;
+        }
+        match add_review_thread(review_id, c) {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err("that line is not part of the diff".into()),
+            Err(e) => why = e.to_string(),
+        }
+    }
+    Err(why)
+}
+
+/// Submit the review, and try again when the call fails: the comments are
+/// already on it, so a lost call would leave them unsent.
+pub fn submit_review_retry(owner: &str, name: &str, number: i64, login: &str, pr_id: &str, event: &str, body: &str) -> Result<()> {
+    let mut last = None;
+    let mut wait = std::time::Duration::from_secs(2);
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(wait);
+            wait *= 2;
+        }
+        match submit_review_api(owner, name, number, login, pr_id, event, body) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("three tries leave an error"))
+}
+
+fn archive_path(owner: &str, name: &str, number: i64) -> PathBuf {
+    local_comments_path(owner, name, number).with_extension("archive.jsonl")
+}
+
+/// Append `comments` to the PR's archive and return the file.
+///
+/// The archive is the copy nobody deletes. A submit GitHub refuses, or a
+/// hand-off to Claude that goes astray, still leaves the words on disk.
+pub fn archive_comments(
+    owner: &str,
+    name: &str,
+    number: i64,
+    kind: &str,
+    comments: &[PendingComment],
+) -> PathBuf {
+    let path = archive_path(owner, name, number);
+    if comments.is_empty() {
+        return path;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut out = String::new();
+    for c in comments {
+        out.push_str(&json!({ "at": at, "kind": kind, "comment": comment_to_json(c) }).to_string());
+        out.push('\n');
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(out.as_bytes());
+    }
+    path
+}
+
 pub fn save_local_comments(owner: &str, name: &str, number: i64, comments: &[PendingComment]) {
     let path = local_comments_path(owner, name, number);
     if let Some(parent) = path.parent() {
@@ -1184,6 +1305,34 @@ mod tests {
 
     fn diff_of(entries: &[(&str, &str)]) -> Diff {
         entries.iter().map(|(p, d)| (p.to_string(), d.lines().map(String::from).collect())).collect()
+    }
+
+    #[test]
+    fn the_archive_keeps_every_comment_it_is_given() {
+        let dir = std::env::temp_dir().join(format!("ghreview-archive-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+
+        let c = |path: &str, line: i64| PendingComment {
+            path: path.into(),
+            body: "b".into(),
+            line,
+            side: "RIGHT".into(),
+            comment_id: String::new(),
+            start_line: None,
+            start_side: String::new(),
+        };
+        let path = archive_comments("o", "n", 7, "refused", &[c("a", 1), c("b", 2)]);
+        archive_comments("o", "n", 7, "claude", &[c("c", 3)]);
+
+        let text = std::fs::read_to_string(&path).expect("the archive is a file");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "a later write appends: {text}");
+        assert!(lines[0].contains("\"kind\":\"refused\""), "{}", lines[0]);
+        assert!(lines[2].contains("\"kind\":\"claude\""), "{}", lines[2]);
+        assert!(lines[2].contains("\"path\":\"c\""), "{}", lines[2]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// One `reviewThreads` page, in the shape the query asks GitHub for.

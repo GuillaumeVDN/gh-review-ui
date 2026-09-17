@@ -86,6 +86,9 @@ pub enum Msg {
     PrDetails { number: i64, data: Value },
     PendingList { pending: Vec<PendingComment>, status: String },
     ReviewSubmitted(String),
+    /// The PR refused part of a local review, so the review stays unsubmitted
+    /// and the refused comments stay pending.
+    ReviewHeld { kept: Vec<PendingComment>, posted: usize, reasons: Vec<String>, archive: String },
     Edits(api::Edits),
     EditsCommitted { status: String, amended: bool, committed: bool },
     /// One line of a running commit's hook output.
@@ -197,9 +200,13 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             let status = if placed {
                 "Comment added to pending review".into()
             } else {
+                // The reload drops it, so the archive is all that is left of it.
+                let archive = api::archive_comments(owner, name, *number, "refused", std::slice::from_ref(comment));
                 format!(
-                    "GitHub rejected the comment on {}:{} — that line isn't part of the diff",
-                    comment.path, comment.line
+                    "GitHub rejected the comment on {}:{} — that line isn't part of the diff · kept in {}",
+                    comment.path,
+                    comment.line,
+                    archive.display()
                 )
             };
             Msg::PendingList { pending, status }
@@ -221,11 +228,30 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             Msg::ReviewSubmitted(event.clone())
         }
         Job::PostLocalReview { owner, name, number, login, pr_id, comments, event, body } => {
-            for c in comments {
-                let _ = api::add_pending_comment_api(owner, name, *number, login, pr_id, c);
+            let (posted, refused) = api::post_review_comments(owner, name, *number, login, pr_id, comments);
+            api::archive_comments(owner, name, *number, "posted", &posted);
+            let kept: Vec<PendingComment> = refused.iter().map(|(c, _)| c.clone()).collect();
+            // The posted ones leave the store and the pane before the submit:
+            // GitHub holds them in the review, so a submit that fails must not
+            // send them a second time.
+            api::save_local_comments(owner, name, *number, &kept);
+            if !kept.is_empty() {
+                let archive = api::archive_comments(owner, name, *number, "refused", &kept);
+                return Ok(Msg::ReviewHeld {
+                    kept,
+                    posted: posted.len(),
+                    reasons: refused
+                        .iter()
+                        .map(|(c, why)| format!("{}:{} — {why}", c.path, c.line))
+                        .collect(),
+                    archive: archive.display().to_string(),
+                });
             }
-            api::submit_review_api(owner, name, *number, login, pr_id, event, body)?;
-            api::save_local_comments(owner, name, *number, &[]); // drafts consumed
+            let _ = tx.send(Msg::PendingList {
+                pending: Vec::new(),
+                status: format!("Posted {} comment(s), submitting…", posted.len()),
+            });
+            api::submit_review_retry(owner, name, *number, login, pr_id, event, body)?;
             Msg::ReviewSubmitted(event.clone())
         }
         Job::LoadEdits { wt } => Msg::Edits(api::load_edits(wt)),

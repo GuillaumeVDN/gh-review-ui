@@ -338,6 +338,29 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove("review");
             st.status = format!("Review submitted ({event})");
         }
+        Msg::ReviewHeld { kept, posted, reasons, archive } => {
+            st.busy.remove("review");
+            st.pending = kept;
+            st.pending_idx = 0;
+            st.status = format!(
+                "Review NOT submitted — GitHub refused {} of {} comment(s)",
+                reasons.len(),
+                reasons.len() + posted
+            );
+            // A one-line status cannot carry which comment failed and why, and
+            // that is what the reviewer needs to fix them.
+            let mut lines = vec![
+                format!("{posted} comment(s) are waiting in the review on GitHub."),
+                format!("{} comment(s) stay pending here, refused:", reasons.len()),
+                String::new(),
+            ];
+            lines.extend(reasons);
+            lines.push(String::new());
+            lines.push("Fix the lines they point at, then submit again.".into());
+            lines.push(format!("Every comment is also in {archive}"));
+            st.overlay =
+                Overlay::Hooks { title: st.status.clone(), lines, failed: true, scroll: 0 };
+        }
         Msg::Edits(edits) => {
             st.busy.remove("edits");
             let api::Edits { files, combined, unstaged, staged } = edits;
@@ -981,11 +1004,16 @@ pub fn confirm_review(st: &mut State, tx: &Sender<Job>) {
         match editor::send_review_to_claude(st, &prompt) {
             Ok(where_) => {
                 let n = st.pending.len();
+                // Claude can lose the prompt, and the clear below is final, so
+                // the archive keeps a copy of what the reviewer wrote.
+                let archive =
+                    api::archive_comments(&st.repo_owner, &st.repo_name, pr.number, "claude", &st.pending);
                 // They are Claude's job now. Left pending they come back on
                 // every reload, and — worse — ride along on the next review
                 // that is actually submitted.
                 clear_pending_comments(st, tx);
-                st.status = format!("Sent {n} comment(s) to {where_} · drafts cleared");
+                st.status =
+                    format!("Sent {n} comment(s) to {where_} · copy in {}", archive.display());
             }
             Err(e) => st.status = format!("Failed to launch Claude: {e}"),
         }
@@ -1870,6 +1898,37 @@ mod tests {
             start_line: None,
             start_side: String::new(),
         }
+    }
+
+    #[test]
+    fn a_refused_comment_stays_pending_and_the_reader_learns_why() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pending = vec![comment("a", 1), comment("b", 2)];
+        st.busy.insert("review".into());
+
+        apply_msg(
+            &mut st,
+            Msg::ReviewHeld {
+                kept: vec![comment("b", 2)],
+                posted: 1,
+                reasons: vec!["b:2 — that line is not part of the diff".into()],
+                archive: "/tmp/pr-7.archive.jsonl".into(),
+            },
+            &tx,
+        );
+
+        // The comment the PR refused is still there to fix and send again.
+        assert_eq!(st.pending.len(), 1);
+        assert_eq!(st.pending[0].path, "b");
+        assert!(!st.busy.contains("review"));
+        let Overlay::Hooks { lines, failed, .. } = &st.overlay else {
+            panic!("the reasons need a window: {:?}", st.status)
+        };
+        assert!(*failed);
+        assert!(lines.iter().any(|l| l.contains("b:2")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("archive.jsonl")), "{lines:?}");
     }
 
     /// A branch with local commits touches files the PR has never seen; the
