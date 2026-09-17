@@ -1,5 +1,6 @@
-//! End-to-end check of hunk staging against a real git repo: the synthesised
-//! one-block patches must apply to (and reverse out of) the index.
+//! End-to-end checks of the pending-edits pane against a real git repo:
+//! staging whole files, committing what the index holds, and reverting one
+//! block of a local diff.
 
 use std::path::Path;
 use std::process::Command;
@@ -30,61 +31,6 @@ fn repo(name: &str) -> String {
     dir.display().to_string()
 }
 
-#[test]
-fn stages_then_unstages_a_single_block() {
-    let wt = repo("single-block");
-    let edits = api::load_edits(&wt);
-    let lines = &edits.unstaged.0["f.txt"];
-    let blocks = compute_hunks(lines);
-    assert_eq!(blocks.len(), 2, "two separate change blocks");
-
-    // Stage only the second block (d → D).
-    let patch = build_hunk_patch(lines, blocks[1], false).unwrap();
-    api::apply_index_patch(&wt, &patch, false).unwrap();
-
-    let after = api::load_edits(&wt);
-    // The index now holds a/b/c/D/e: staged carries D, unstaged still carries B.
-    let staged: Vec<&String> = after.staged.0["f.txt"].iter().collect();
-    assert!(staged.iter().any(|l| l.as_str() == "+D"), "{staged:?}");
-    assert!(!staged.iter().any(|l| l.as_str() == "+B"), "{staged:?}");
-    let unstaged: Vec<&String> = after.unstaged.0["f.txt"].iter().collect();
-    assert!(unstaged.iter().any(|l| l.as_str() == "+B"), "{unstaged:?}");
-    assert!(!unstaged.iter().any(|l| l.as_str() == "+D"), "{unstaged:?}");
-    // The worktree is untouched by staging.
-    assert_eq!(std::fs::read_to_string(format!("{wt}/f.txt")).unwrap(), "a\nB\nc\nD\ne\n");
-
-    // Unstage it again, from the staged diff this time.
-    let staged_lines = &after.staged.0["f.txt"];
-    let sblocks = compute_hunks(staged_lines);
-    let rpatch = build_hunk_patch(staged_lines, sblocks[0], true).unwrap();
-    api::apply_index_patch(&wt, &rpatch, true).unwrap();
-
-    let back = api::load_edits(&wt);
-    assert!(!back.staged.0.contains_key("f.txt"), "index back to HEAD");
-    assert_eq!(compute_hunks(&back.unstaged.0["f.txt"]).len(), 2);
-    std::fs::remove_dir_all(&wt).ok();
-}
-
-#[test]
-fn stages_part_of_an_untracked_file() {
-    let wt = repo("untracked");
-    std::fs::write(format!("{wt}/new.txt"), "one\ntwo\n").unwrap();
-    let edits = api::load_edits(&wt);
-    let lines = &edits.unstaged.0["new.txt"];
-    let blocks = compute_hunks(lines);
-    // Stage just the first added line.
-    let patch = build_hunk_patch(lines, (blocks[0].0, blocks[0].0 + 1), false).unwrap();
-    api::apply_index_patch(&wt, &patch, false).unwrap();
-
-    let after = api::load_edits(&wt);
-    assert_eq!(git(Path::new(&wt), &["show", ":new.txt"]), "one\n");
-    let unstaged: Vec<&String> = after.unstaged.0["new.txt"].iter().collect();
-    assert!(unstaged.iter().any(|l| l.as_str() == "+two"), "{unstaged:?}");
-    std::fs::remove_dir_all(&wt).ok();
-}
-
-/// The hooks run for a plain commit and are skipped for `w`; a temporary repo
-/// has none either way, so this pins the outcome shape rather than the hooks.
 #[test]
 fn an_amend_folds_the_work_into_head_instead_of_adding_a_commit() {
     let wt = repo("amend");
@@ -148,11 +94,12 @@ fn command_output_arrives_line_by_line() {
 #[test]
 fn commit_takes_the_index_when_something_is_staged() {
     let wt = repo("commit-staged");
+    // Stage the file as it stands, then change it again: the index holds one
+    // version and the working tree another.
+    api::stage_paths(&wt, &["f.txt".to_string()], false).unwrap();
+    std::fs::write(Path::new(&wt).join("f.txt"), "a\nB\nc\nD\nE\n").unwrap();
     let edits = api::load_edits(&wt);
-    let lines = &edits.unstaged.0["f.txt"];
-    let blocks = compute_hunks(lines);
-    let patch = build_hunk_patch(lines, blocks[1], false).unwrap();
-    api::apply_index_patch(&wt, &patch, false).unwrap();
+    assert!(edits.staged.contains("f.txt") && edits.unstaged.contains("f.txt"));
 
     let done = api::commit_edit_files(
         &wt,
@@ -164,21 +111,21 @@ fn commit_takes_the_index_when_something_is_staged() {
     .unwrap();
     assert_eq!(done.files, 1);
     assert!(done.ok);
-    // Only the staged half went in; the rest is still a local edit.
+    // Only what was staged went in; the rest is still a local edit.
     let (files, _) = parse_diff(&git(Path::new(&wt), &["show", "HEAD", "-p", "-U0"]));
     assert!(files["f.txt"].iter().any(|l| l == "+D"));
-    assert!(!files["f.txt"].iter().any(|l| l == "+B"));
-    assert!(api::load_edits(&wt).unstaged.0.contains_key("f.txt"));
+    assert!(!files["f.txt"].iter().any(|l| l == "+E"));
+    assert!(api::load_edits(&wt).unstaged.contains("f.txt"));
     std::fs::remove_dir_all(&wt).ok();
 }
 
-/// `d` on an unstaged hunk: that block goes back to what HEAD has, and the
-/// other one — the whole point of doing it by hunk — stays.
+/// `d` on a block of a file with nothing staged: that block goes back to what
+/// HEAD has, and the other one stays.
 #[test]
-fn reverting_an_unstaged_hunk_leaves_the_other_alone() {
+fn reverting_a_block_leaves_the_other_alone() {
     let wt = repo("revert-unstaged");
     let edits = api::load_edits(&wt);
-    let lines = &edits.unstaged.0["f.txt"];
+    let lines = &edits.combined.0["f.txt"];
     let blocks = compute_hunks(lines);
     // Built against the post-image (the working tree), which is what it is
     // being undone from; a forwards patch would not apply while b → B is there.
@@ -191,15 +138,15 @@ fn reverting_an_unstaged_hunk_leaves_the_other_alone() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
-/// `d` on a *staged* hunk has to take it out of the index and the working tree
-/// both: leaving the file alone would only unstage the change, which is the
-/// one thing `d` must not quietly do.
+/// `d` on a block of a file with something staged has to take it out of the
+/// index and the working tree both: leaving the index alone would put the
+/// change back on the next commit.
 #[test]
-fn reverting_a_staged_hunk_takes_it_off_disk_as_well() {
+fn reverting_a_block_of_a_staged_file_takes_it_off_disk_as_well() {
     let wt = repo("revert-staged");
-    git(Path::new(&wt), &["add", "f.txt"]); // both blocks staged
+    api::stage_paths(&wt, &["f.txt".to_string()], false).unwrap();
     let edits = api::load_edits(&wt);
-    let lines = &edits.staged.0["f.txt"];
+    let lines = &edits.combined.0["f.txt"];
     let blocks = compute_hunks(lines);
     let patch = build_hunk_patch(lines, blocks[1], true).unwrap();
 
@@ -217,11 +164,7 @@ fn reverting_a_staged_hunk_takes_it_off_disk_as_well() {
 #[test]
 fn discard_reverts_the_index_too() {
     let wt = repo("discard");
-    let edits = api::load_edits(&wt);
-    let lines = &edits.unstaged.0["f.txt"];
-    let blocks = compute_hunks(lines);
-    let patch = build_hunk_patch(lines, blocks[0], false).unwrap();
-    api::apply_index_patch(&wt, &patch, false).unwrap();
+    api::stage_paths(&wt, &["f.txt".to_string()], false).unwrap();
 
     api::discard_edit(&wt, "f.txt", false).unwrap();
     let after = api::load_edits(&wt);

@@ -322,19 +322,9 @@ pub struct State {
     pub edit_diff_by_file: DiffMap,
     pub edit_info_by_file: InfoMap,
     pub edit_hunks_by_file: HunkMap,
-    /// Worktree vs index (`git diff`) — the left column of a split local diff.
-    pub unstaged_diff_by_file: DiffMap,
-    pub unstaged_info_by_file: InfoMap,
-    pub unstaged_hunks_by_file: HunkMap,
-    /// Index vs HEAD (`git diff --cached`) — the right column of a split.
-    pub staged_diff_by_file: DiffMap,
-    pub staged_info_by_file: InfoMap,
-    pub staged_hunks_by_file: HunkMap,
-    /// In a split local diff, whether the staged (right) column has the cursor.
-    pub staged_side: bool,
-    /// `(scroll, hunk_idx)` of the *other* column of a split local diff; swapped
-    /// with the live pair when switching sides.
-    pub alt_diff_view: (usize, usize),
+    /// Paths with something on one side of the index, for the [4] marks.
+    pub unstaged_paths: HashSet<String>,
+    pub staged_paths: HashSet<String>,
     pub edit_diff_scroll: usize,
     /// When set, the [0] pane shows this file's *local* diff (from [4]) with hunk
     /// navigation instead of the PR review diff.

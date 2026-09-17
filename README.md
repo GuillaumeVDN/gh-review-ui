@@ -105,7 +105,7 @@ Files pane:
   unviewed file.
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `e` — open the selected file in the editor (top of file)
-- `s` — switch the review diff between inline and side by side
+- `s` — switch the diff between inline and side by side
 - `Enter` — open file in the diff pane (folder: collapse / expand)
 
 Pending edits pane (local, uncommitted changes in the worktree). `--edits`
@@ -116,7 +116,8 @@ tree is clean:
   the left is the pane's "viewed" equivalent: `[ ]` unstaged, `[~]` partly
   staged, `[✔]` fully staged (dimmed). Staging does what `z` does next: it folds
   every fully-staged folder and jumps to the first unstaged file.
-- `Enter` — show the file's local diff in the diff pane, with hunk navigation
+- `Enter` — show the file's local diff in the diff pane, with block navigation.
+  It is the whole change against HEAD, however much of it is staged.
 - `c` — commit; what is staged is what gets committed. With an empty index the
   whole list is committed, as before.
 - `P` — push the commits to the PR branch
@@ -137,7 +138,7 @@ Diff pane:
   the comments drawn inline, in the order they read
 - `PgDn` / `PgUp` — page down / up
 - `c` — start the comment line picker on the enclosing block (see below)
-- `s` — switch the review diff between inline and side by side
+- `s` — switch the diff between inline and side by side
 - `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
 - on a **pending comment** of yours:
@@ -147,8 +148,8 @@ Diff pane:
   - `Enter` — answer it: a new comment of yours, on the same line
   - `o` — open the thread on github.com
 - on a **local** diff (opened with `Enter` from the pending-edits pane):
-  - `Space` — stage / unstage the selected change block (lazygit-style)
-  - `h` / `l` — move between the two columns of a partly-staged file
+  - `d` — revert the selected change block, back to what HEAD holds. A file with
+    something staged loses the block from the index as well as from the disk.
 
 Every diff carries a line-number gutter, dimmed on the left of the code: the old
 number then the new one inline, and one number per column side by side. A pane
@@ -200,19 +201,14 @@ light set:
 - else it reads `COLORFGBG` (`fg;bg`), which some terminals export;
 - else it takes the dark set.
 
-`s` draws the review diff side by side: the old side on the left, the new side
-on the right, and the left panes shrink to make room. Each deletion sits across
-from the addition that replaces it; an unpaired change leaves the other column
-empty. File headers, `@@` headers and inline comments span both columns, and
-local worktree edits stay on the new side. Everything else carries over from the
+`s` draws the diff side by side: the old side on the left, the new side on the
+right, and the left panes shrink to make room. Each deletion sits across from
+the addition that replaces it; an unpaired change leaves the other column empty.
+File headers, `@@` headers and inline comments span both columns, and local
+worktree edits stay on the new side. Everything else carries over from the
 inline view: the change-block band, the comment picker, `j`/`k`, and the scroll
-keeps its place across the switch. A local diff from the pending-edits pane
-always stays inline, since its columns are the index instead.
-
-A partly-staged file splits the pane in two columns — unstaged on the left,
-staged on the right — and the left panes shrink to make room. The focused column
-(marked `▌`) is what `j`/`k` and `Space` act on: `Space` stages a block from the
-left column and unstages one from the right.
+keeps its place across the switch. A local diff reads the same way, with HEAD on
+the left and the worktree on the right.
 
 A "hunk" here is a **change block** — a contiguous run of `+`/`-` lines. Context
 (and the extra context rendered around edits) splits blocks, so two edits

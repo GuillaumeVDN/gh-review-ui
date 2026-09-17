@@ -415,9 +415,6 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
         Focus::Diff => match k.code {
             KeyCode::Down | KeyCode::Char('j') => nav::jump_stop(st, 1),
             KeyCode::Up | KeyCode::Char('k') => nav::jump_stop(st, -1),
-            KeyCode::Left | KeyCode::Char('h') => controller::switch_stage_side(st, false),
-            KeyCode::Right | KeyCode::Char('l') => controller::switch_stage_side(st, true),
-            KeyCode::Char(' ') => controller::toggle_stage_hunk(st, tx),
             KeyCode::Char('d') => {
                 if !controller::discard_focused_comment(st, tx) {
                     controller::begin_discard_hunk(st);

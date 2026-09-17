@@ -14,8 +14,8 @@ use crate::models::{
     SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff, is_split,
-    source_maps, stage_state, stop_reveal, thread_anchor, Stop,
+    current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff, source_maps,
+    stage_state, stop_reveal, thread_anchor, Stop,
 };
 use crate::syntax::{Painted, StyledLine};
 use crate::textbuffer;
@@ -33,23 +33,16 @@ pub struct PaneRects {
     pub body: Rect,
 }
 
-/// Whether the [0] pane is showing a split (unstaged | staged) local diff, which
-/// needs the extra width taken from the left column.
-pub fn shows_split_diff(st: &State) -> bool {
-    st.local_diff_path.as_deref().map_or(false, |p| is_split(st, p))
-}
-
-/// Whether the [0] pane draws the review diff side by side, which needs the
-/// same extra width as a split local diff.
+/// Whether the [0] pane draws its diff side by side, which takes the extra
+/// width from the left column.
 pub fn shows_sbs_diff(st: &State) -> bool {
     st.side_by_side
-        && matches!(st.focus, Focus::Files | Focus::Diff)
-        && diff_path(st).map_or(false, |p| !is_local_diff(st, &p))
+        && matches!(st.focus, Focus::Diff | Focus::Files | Focus::Edits)
+        && diff_path(st).is_some()
 }
 
 pub fn compute_layout(area: Rect, st: &State) -> (PaneRects, Rect, Rect) {
-    let two_columns = shows_split_diff(st) || shows_sbs_diff(st);
-    compute_layout_at(area, st.focus, st.local_diff_path.is_some(), two_columns)
+    compute_layout_at(area, st.focus, st.local_diff_path.is_some(), shows_sbs_diff(st))
 }
 
 pub fn compute_layout_at(area: Rect, focus: Focus, local_diff: bool, split: bool) -> (PaneRects, Rect, Rect) {
@@ -436,7 +429,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · gg/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
-            format!("j/k: block · Space: stage hunk · d: revert hunk · h/l: column · c: comment · e: editor · Esc: back · {common}")
+            format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")
         }
         Focus::Diff => match focused_stop(st) {
             Some(Stop::Pending(_)) => {
@@ -707,114 +700,6 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Rows for one column of a split local diff: plain diff lines, the selected
-/// change block marked (`cur`, active column only) and the comment-picker
-/// selection reversed.
-fn diff_column_rows(
-    lines: &[String],
-    info: Option<&Vec<LineInfo>>,
-    hl: &Painted,
-    view: (usize, usize, usize),
-    cur: Option<(usize, usize)>,
-    sel: (usize, usize),
-) -> Vec<Line<'static>> {
-    let (scroll, vh, tw) = view;
-    // The column is narrow, so it carries the new-side number alone.
-    let nw = fit_num_width(num_width(info), 1, tw, 12);
-    let gw = if nw == 0 { 0 } else { nw + 1 };
-    let tw = tw.saturating_sub(gw);
-    let mut out: Vec<Line> = Vec::new();
-    let mut i = scroll;
-    while out.len() < vh && i < lines.len() {
-        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
-        let row = DiffRow {
-            line: &lines[i],
-            hl: hl.row(i),
-            nos: &[new.or(old)],
-            current: cur.map_or(false, |(s, e)| s <= i && i < e),
-            selected: sel.0 <= i && i <= sel.1,
-            local_del: false,
-        };
-        push_diff_rows(&mut out, vh, &row, nw, tw, true);
-        i += 1;
-    }
-    out
-}
-
-/// A partly-staged file's local diff, side by side: unstaged left, staged right.
-/// The focused column drives j/k and Space; `h`/`l` moves between them.
-fn render_split_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
-    let cols = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    let (sel_lo, sel_hi) = if st.comment_mode {
-        let anchor = st.comment_start.unwrap_or(st.comment_line);
-        (anchor.min(st.comment_line), anchor.max(st.comment_line))
-    } else {
-        (1usize, 0usize) // empty
-    };
-    let body_h = inner.height.saturating_sub(1) as usize;
-    // Reveal the active column's selected block before splitting the scrolls.
-    if st.diff_reveal_pending {
-        let range = if st.comment_mode {
-            Some((st.comment_line, st.comment_line + 1))
-        } else {
-            current_hunk_range(st, path)
-        };
-        if let Some((s, e)) = range {
-            st.diff_scroll = reveal_scroll(st.diff_scroll, s, e, body_h);
-        }
-        st.diff_reveal_pending = false;
-    }
-    let cur = if st.focus == Focus::Diff { current_hunk_range(st, path) } else { None };
-
-    for (staged, area) in [(false, cols[0]), (true, cols[2])] {
-        let active = staged == st.staged_side;
-        let (diffs, infos, hunks) = if staged {
-            (&st.staged_diff_by_file, &st.staged_info_by_file, &st.staged_hunks_by_file)
-        } else {
-            (&st.unstaged_diff_by_file, &st.unstaged_info_by_file, &st.unstaged_hunks_by_file)
-        };
-        let empty = Vec::new();
-        let lines = diffs.get(path).unwrap_or(&empty);
-        let n_hunks = hunks.get(path).map_or(0, |h| h.len());
-        let label = format!(
-            "{} {} ({n_hunks})",
-            if active { "▌" } else { " " },
-            if staged { "Staged" } else { "Unstaged" }
-        );
-        let (lstyle, tw) = (
-            if active { theme::focus() } else { theme::dim() },
-            area.width.saturating_sub(1) as usize,
-        );
-        f.render_widget(
-            Paragraph::new(Line::styled(pad(&label, area.width as usize), lstyle)),
-            Rect { height: 1, ..area },
-        );
-        let body = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
-        let vh = body.height as usize;
-        let scroll = if active { &mut st.diff_scroll } else { &mut st.alt_diff_view.0 };
-        *scroll = (*scroll).min(lines.len().saturating_sub(1));
-        let scroll = *scroll;
-        let hl = st.highlight.paint(path, lines, infos.get(path), &st.blobs, scroll + vh);
-        let rows = diff_column_rows(
-            lines,
-            infos.get(path),
-            &hl,
-            (scroll, vh, tw),
-            if active { cur } else { None },
-            if active { (sel_lo, sel_hi) } else { (1, 0) },
-        );
-        f.render_widget(Paragraph::new(rows), body);
-    }
-    // Separator between the two columns.
-    let sep: Vec<Line> = (0..inner.height).map(|_| Line::styled("│", theme::dim())).collect();
-    f.render_widget(Paragraph::new(sep), cols[1]);
-}
-
 /// One column of one side-by-side row: the line-number gutter and the wrapped
 /// text, plus the styling the line carries (hunk band, comment picker, local
 /// overlay).
@@ -892,10 +777,11 @@ fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: S
 /// not diff lines.
 fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     let (vh, iw) = (inner.height as usize, inner.width as usize);
-    let empty: Vec<String> = Vec::new();
-    let rows = crate::diff::side_by_side(st.diff_by_file.get(path).unwrap_or(&empty));
-    let row_by_line =
-        crate::diff::sbs_row_by_line(&rows, st.diff_by_file.get(path).map_or(0, Vec::len));
+    let rows = crate::diff::side_by_side(
+        source_maps(st, path).0.get(path).map(Vec::as_slice).unwrap_or_default(),
+    );
+    let n_lines = source_maps(st, path).0.get(path).map_or(0, Vec::len);
+    let row_by_line = crate::diff::sbs_row_by_line(&rows, n_lines);
 
     let focused = st.focus == Focus::Diff;
     let sel = if focused && !st.comment_mode { focused_stop(st) } else { None };
@@ -922,7 +808,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     st.diff_scroll = st.diff_scroll.min(rows.len().saturating_sub(1));
     let scroll = st.diff_scroll;
 
-    let diff_lines: &[String] = match st.diff_by_file.get(path) {
+    let diff_lines: &[String] = match source_maps(st, path).0.get(path) {
         Some(v) if !v.is_empty() => v,
         _ => {
             let msg = Line::styled("(no diff — binary, removed, or too large)", theme::dim());
@@ -944,13 +830,14 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         st.threads.iter().enumerate().filter(|(_, t)| t.path == path).collect();
     let top = top_threads(st, path);
     let now = now_epoch();
-    let info_here = st.info_by_file.get(path);
+    let info_here = source_maps(st, path).1.get(path);
     // The visible rows name the diff lines to color; a wrapped row shows fewer.
     let seen = rows.iter().skip(st.diff_scroll).take(vh);
     let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
     let hl = st.highlight.paint(path, diff_lines, info_here, &st.blobs, upto);
-    let overlay = match (st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
-        (Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
+    // The local diff already is the edits, so there is nothing to overlay on it.
+    let overlay = match (is_local_diff(st, path), st.edit_diff_by_file.get(path), st.edit_info_by_file.get(path)) {
+        (false, Some(l), Some(inf)) if !l.is_empty() => Some(crate::diff::local_overlay(l, inf)),
         _ => None,
     };
     // A locally re-added line that the PR deleted is a restore, not an addition.
@@ -1266,10 +1153,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let path = diff_path(st);
     let local = path.as_ref().map_or(false, |p| is_local_diff(st, p));
     let has_overlay = !local && path.as_ref().map_or(false, |p| st.edit_diff_by_file.contains_key(p));
-    let split = local && path.as_ref().map_or(false, |p| is_split(st, p));
-    let sbs = !local && st.side_by_side && path.is_some();
+    let sbs = st.side_by_side && path.is_some();
     let title = match (&path, local) {
-        (Some(p), true) => format!("[0] Local diff — {p}{}", if split { "  · unstaged | staged" } else { "" }),
+        (Some(p), true) => {
+            format!("[0] Local diff — {p}{}", if sbs { "  · HEAD | worktree" } else { "" })
+        }
         (Some(p), false) => {
             let threads = st.threads.iter().filter(|t| &t.path == p).count();
             format!(
@@ -1287,11 +1175,6 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let b = block(&title, st.focus == Focus::Diff, false);
     let inner = b.inner(area);
     f.render_widget(b, area);
-    if split {
-        let p = path.unwrap();
-        render_split_diff(f, st, inner, &p);
-        return;
-    }
     if sbs && !(is_loading(st) && st.diff_by_file.is_empty()) {
         let p = path.unwrap();
         render_sbs_diff(f, st, inner, &p);

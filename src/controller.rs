@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::navigation::{
     cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
-    hunk_unstages, is_local_diff, is_split, line_target, stage_state, Stop,
+    is_local_diff, line_target, stage_state, Stop,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -78,15 +78,13 @@ fn reset_review_panels(st: &mut State) {
     st.edit_tree.clear();
     st.edit_diff_by_file.clear();
     st.edit_info_by_file.clear();
-    st.unstaged_diff_by_file.clear();
-    st.staged_diff_by_file.clear();
+    st.unstaged_paths.clear();
+    st.staged_paths.clear();
     st.edit_idx = 0;
     st.edit_offset = 0;
-    st.staged_side = false;
     // Whose history we rewrote is a fact about the branch we are leaving: kept,
     // it would force-push the next one.
     st.amended = false;
-    st.alt_diff_view = (0, 0);
     set_diff(st, Default::default(), Default::default());
     st.focus = Focus::Files;
 }
@@ -344,13 +342,10 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.busy.remove("edits");
             let api::Edits { files, combined, unstaged, staged } = edits;
             st.edit_hunks_by_file = combined.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
-            st.unstaged_hunks_by_file = unstaged.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
-            st.staged_hunks_by_file = staged.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
             st.edit_kind_by_path = files.iter().map(|e| (e.path.clone(), e.kind)).collect();
             st.edit_files = files;
             (st.edit_diff_by_file, st.edit_info_by_file) = combined;
-            (st.unstaged_diff_by_file, st.unstaged_info_by_file) = unstaged;
-            (st.staged_diff_by_file, st.staged_info_by_file) = staged;
+            (st.unstaged_paths, st.staged_paths) = (unstaged, staged);
             st.edit_diff_scroll = 0;
             tree::rebuild_edits(st);
             if st.edit_idx >= st.edit_tree.len() {
@@ -363,10 +358,6 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     if st.focus == Focus::Diff {
                         st.focus = Focus::Edits;
                     }
-                } else if !is_split(st, &p) {
-                    // Staging closed the split: back to the single combined view.
-                    st.staged_side = false;
-                    st.alt_diff_view = (0, 0);
                 }
             }
             // Merge edit-only files (new/deleted/renamed, not in the PR diff) into
@@ -1293,43 +1284,17 @@ pub fn toggle_stage(st: &mut State, tx: &Sender<Job>) {
     st.status = format!("{} {label}", if unstage { "Unstaged" } else { "Staged" });
     st.stage_advance = !unstage;
     let wt = st.active_worktree.clone();
-    submit(st, tx, Job::Stage { wt, paths, patch: None, unstage });
+    submit(st, tx, Job::Stage { wt, paths, unstage });
 }
-
-/// Stage / unstage the selected change block of the local diff shown in [0]
-/// (lazygit-style hunk staging). On a split, the focused column decides the
-/// direction; otherwise the file's own side does.
-pub fn toggle_stage_hunk(st: &mut State, tx: &Sender<Job>) {
-    if st.active_worktree.is_empty() || st.busy.contains("edits") {
-        return;
-    }
-    let Some(path) = diff_path(st) else { return };
-    if !is_local_diff(st, &path) {
-        st.status = "Staging only applies to the local diff (Enter from [4]).".into();
-        return;
-    }
-    let unstage = hunk_unstages(st, &path);
-    let Some(block) = current_hunk_range(st, &path) else { return };
-    let Some(lines) = crate::navigation::diff_lines(st, &path) else { return };
-    let Some(patch) = crate::diff::build_hunk_patch(lines, block, unstage) else {
-        st.status = "That block can't be staged by hunk.".into();
-        return;
-    };
-    st.status = format!("{} a hunk of {path}", if unstage { "Unstaged" } else { "Staged" });
-    let wt = st.active_worktree.clone();
-    submit(st, tx, Job::Stage { wt, paths: vec![path], patch: Some(patch), unstage });
-}
-
-/// `d` on a hunk of a local diff: ask, then throw that hunk away.
+/// `d` on a block of a local diff: ask, then throw that block away.
 ///
-/// It asks for the same reason `d` in `[4]` does — the work is not recoverable
-/// — and the patch is built now rather than on the answer, so what disappears
-/// is what was on screen when the question was asked.
+/// It asks for the same reason `d` in `[4]` does, the work is not recoverable,
+/// and the patch is built now rather than on the answer, so what disappears is
+/// what was on screen when the question was asked.
 ///
-/// Reverting from the staged column of a *partly* staged file is the one case
-/// git refuses: the change has to leave the index and the working tree
-/// together, and there the two do not agree. It says so rather than half-doing
-/// it; reverting from the unstaged column always works.
+/// The block goes back to what HEAD holds. A file with something staged loses
+/// it from the index as well as from the disk, since leaving a copy in the
+/// index would put the change back on the next commit.
 pub fn begin_discard_hunk(st: &mut State) {
     if st.active_worktree.is_empty() || st.busy.contains("edits") {
         return;
@@ -1339,11 +1304,7 @@ pub fn begin_discard_hunk(st: &mut State) {
         st.status = "Reverting a hunk only applies to the local diff (Enter from [4]).".into();
         return;
     }
-    let staged = match stage_state(st, &path) {
-        StageState::Staged => true,
-        StageState::Partial => st.staged_side,
-        StageState::Unstaged => false,
-    };
+    let staged = stage_state(st, &path) != StageState::Unstaged;
     let Some(block) = current_hunk_range(st, &path) else { return };
     let Some(lines) = crate::navigation::diff_lines(st, &path) else { return };
     // Built against the *post-image* side, the way unstaging builds it: what we
@@ -1360,31 +1321,11 @@ pub fn begin_discard_hunk(st: &mut State) {
     };
 }
 
-/// Move the cursor between the unstaged (left) and staged (right) columns of a
-/// split local diff, each keeping its own scroll + selected block.
-pub fn switch_stage_side(st: &mut State, staged: bool) {
-    let Some(path) = diff_path(st) else { return };
-    if !is_local_diff(st, &path) || !is_split(st, &path) || st.staged_side == staged {
-        return;
-    }
-    st.staged_side = staged;
-    let cur = (st.diff_scroll, st.diff_hunk_idx);
-    (st.diff_scroll, st.diff_hunk_idx) = st.alt_diff_view;
-    st.alt_diff_view = cur;
-    st.diff_stop_idx = st.diff_hunk_idx; // a local diff has blocks and nothing else
-    st.comment_mode = false;
-    st.diff_reveal_pending = true;
-}
-
-/// Switch the review diff between the inline and the side-by-side view.
-///
-/// `diff_scroll` counts diff lines inline and side-by-side rows in the other
-/// view, so it is converted and the reader keeps their place. A local diff from
-/// [4] always stays inline: its columns are the index, not the two sides.
+/// `s`: old side on the left, new side on the right, for the diff on screen.
 pub fn toggle_side_by_side(st: &mut State) {
     let sbs = !st.side_by_side;
-    if let Some(path) = diff_path(st).filter(|p| !is_local_diff(st, p)) {
-        if let Some(lines) = st.diff_by_file.get(&path) {
+    if let Some(path) = diff_path(st) {
+        if let Some(lines) = crate::navigation::diff_lines(st, &path) {
             let rows = crate::diff::side_by_side(lines);
             st.diff_scroll = if sbs {
                 crate::diff::sbs_row_by_line(&rows, lines.len())
@@ -1425,8 +1366,6 @@ pub fn enter_local_diff(st: &mut State) {
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
     st.diff_stop_idx = 0;
-    st.staged_side = false; // a split opens on the unstaged (left) column
-    st.alt_diff_view = (0, 0);
     st.diff_reveal_pending = true;
 }
 
@@ -1870,18 +1809,28 @@ mod tests {
         assert_eq!(st.diff_scroll, extra);
     }
 
-    /// A local diff from [4] has no old/new sides to split, so the toggle only
-    /// records the choice for the review diff.
+    /// The local diff reads side by side like any other, and its scroll keeps
+    /// its place across the switch.
     #[test]
-    fn the_side_by_side_toggle_leaves_a_local_diff_alone() {
+    fn the_side_by_side_toggle_takes_the_local_diff_too() {
         let mut st = review_diff_state();
-        st.edit_diff_by_file.insert("f".into(), vec!["+local".into()]);
+        let lines: Vec<String> = ["@@ -1,3 +1,3 @@", " keep", "-old", "+new", " tail"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let rows = crate::diff::side_by_side(&lines);
+        st.edit_diff_by_file.insert("f".into(), lines.clone());
         st.local_diff_path = Some("f".into());
-        st.diff_scroll = 3;
+        let at = lines.iter().position(|l| l == "+new").expect("the added line");
+        st.diff_scroll = at;
 
         toggle_side_by_side(&mut st);
         assert!(st.side_by_side);
-        assert_eq!(st.diff_scroll, 3);
+        assert_eq!(st.diff_scroll, crate::diff::sbs_row_by_line(&rows, lines.len())[at]);
+
+        toggle_side_by_side(&mut st);
+        assert!(!st.side_by_side);
+        assert_eq!(st.diff_scroll, rows[crate::diff::sbs_row_by_line(&rows, lines.len())[at]].line().unwrap());
     }
 
     /// Enter on a folder folds it, the way it does in the Files pane. A folder
@@ -2025,15 +1974,13 @@ mod tests {
         toggle_stage(&mut st, &tx);
         assert!(st.stage_advance, "the cursor moves once git confirms");
 
-        let staged: crate::models::DiffMap =
-            [("a.rs".to_string(), vec!["@@".to_string()])].into_iter().collect();
         apply_msg(
             &mut st,
             Msg::Edits(crate::api::Edits {
                 files: vec![edit("a.rs"), edit("b.rs")],
                 combined: Default::default(),
                 unstaged: Default::default(),
-                staged: (staged, Default::default()),
+                staged: ["a.rs".to_string()].into_iter().collect(),
             }),
             &tx,
         );
@@ -2051,7 +1998,7 @@ mod tests {
         let mut st = State::default();
         st.active_worktree = "/tmp/wt".into();
         st.edit_files = vec![edit("a.rs"), edit("b.rs")];
-        st.staged_diff_by_file.insert("a.rs".into(), vec!["@@".into()]);
+        st.staged_paths.insert("a.rs".into());
         crate::tree::rebuild_edits(&mut st);
         st.edit_idx = st
             .edit_tree

@@ -299,9 +299,9 @@ mod tests {
             .collect();
         // Staged means: present in the staged diff and absent from the unstaged one.
         for p in ["src/a.rs", "docs/x.md"] {
-            st.staged_diff_by_file.insert(p.to_string(), Vec::new());
+            st.staged_paths.insert(p.to_string());
         }
-        st.unstaged_diff_by_file.insert("src/b.rs".to_string(), Vec::new());
+        st.unstaged_paths.insert("src/b.rs".to_string());
         rebuild_edits(&mut st);
 
         assert_eq!(fold_staged_dirs(&mut st), 1);
@@ -320,8 +320,8 @@ mod tests {
             path: "src/a.rs".into(),
             kind: crate::models::EditKind::Modified,
         }];
-        st.staged_diff_by_file.insert("src/a.rs".to_string(), Vec::new());
-        st.unstaged_diff_by_file.insert("src/a.rs".to_string(), Vec::new());
+        st.staged_paths.insert("src/a.rs".to_string());
+        st.unstaged_paths.insert("src/a.rs".to_string());
         rebuild_edits(&mut st);
 
         assert_eq!(fold_staged_dirs(&mut st), 0);
@@ -338,7 +338,7 @@ mod tests {
                 kind: crate::models::EditKind::Modified,
             })
             .collect();
-        st.staged_diff_by_file.insert("b.rs".to_string(), Vec::new());
+        st.staged_paths.insert("b.rs".to_string());
         rebuild_edits(&mut st);
 
         // From a.rs: b.rs is done, so c.rs is next.
@@ -356,7 +356,7 @@ mod tests {
             path: "a.rs".into(),
             kind: crate::models::EditKind::Modified,
         }];
-        st.staged_diff_by_file.insert("a.rs".to_string(), Vec::new());
+        st.staged_paths.insert("a.rs".to_string());
         rebuild_edits(&mut st);
         assert!(next_unstaged_index(&st, None).is_none());
     }

@@ -41,8 +41,8 @@ pub enum Job {
     },
     LoadEdits { wt: String },
     DiscardEdit { wt: String, path: String, added: bool },
-    /// Stage/unstage whole `paths`, or a single hunk when `patch` is set.
-    Stage { wt: String, paths: Vec<String>, patch: Option<String>, unstage: bool },
+    /// Stage or unstage whole `paths`.
+    Stage { wt: String, paths: Vec<String>, unstage: bool },
     CommitEdits { wt: String, message: String, paths: Vec<String>, kind: CommitKind },
     /// Undo one hunk of a local diff.
     RevertHunk { wt: String, patch: String, staged: bool },
@@ -242,11 +242,8 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             api::apply_patch(wt, patch, true, target)?;
             Msg::Edits(api::load_edits(wt))
         }
-        Job::Stage { wt, paths, patch, unstage } => {
-            match patch {
-                Some(p) => api::apply_index_patch(wt, p, *unstage)?,
-                None => api::stage_paths(wt, paths, *unstage)?,
-            }
+        Job::Stage { wt, paths, unstage } => {
+            api::stage_paths(wt, paths, *unstage)?;
             Msg::Edits(api::load_edits(wt))
         }
         Job::CommitEdits { wt, message, paths, kind } => {

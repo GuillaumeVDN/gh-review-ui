@@ -548,10 +548,9 @@ pub struct Edits {
     pub files: Vec<crate::models::EditEntry>,
     /// HEAD → worktree: everything changed locally, whichever side of the index.
     pub combined: (Diff, Info),
-    /// index → worktree.
-    pub unstaged: (Diff, Info),
-    /// HEAD → index.
-    pub staged: (Diff, Info),
+    /// Paths with a change on that side of the index.
+    pub unstaged: HashSet<String>,
+    pub staged: HashSet<String>,
 }
 
 /// Load the local changes of `wt` split by index side, plus the combined view
@@ -566,19 +565,23 @@ pub fn load_edits(wt: &str) -> Edits {
     // The combined diff normally lists everything, but a change that is staged
     // *and* reverted in the worktree only shows in the per-side diffs.
     let mut files = crate::diff::classify_edits(&combined_raw);
-    for raw in [&staged_raw, &unstaged_raw] {
-        for e in crate::diff::classify_edits(raw) {
+    let sides = [&staged_raw, &unstaged_raw].map(|raw| crate::diff::classify_edits(raw));
+    for side in &sides {
+        for e in side {
             if !files.iter().any(|f| f.path == e.path) {
-                files.push(e);
+                files.push(e.clone());
             }
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    let paths = |side: &[crate::models::EditEntry]| -> HashSet<String> {
+        side.iter().map(|e| e.path.clone()).collect()
+    };
     Edits {
         files,
         combined: parse_diff(&combined_raw),
-        unstaged: parse_diff(&unstaged_raw),
-        staged: parse_diff(&staged_raw),
+        unstaged: paths(&sides[1]),
+        staged: paths(&sides[0]),
     }
 }
 
@@ -601,19 +604,12 @@ pub fn stage_paths(wt: &str, paths: &[String], unstage: bool) -> Result<()> {
 /// Where a synthesised hunk patch lands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PatchTarget {
-    /// Staging and unstaging: the index alone moves.
-    Index,
-    /// Reverting an unstaged hunk: it exists only in the working tree.
+    /// Reverting a block of a file with nothing staged: it exists only in the
+    /// working tree.
     Worktree,
-    /// Reverting a staged hunk: it has to leave both, or unstaging is all that
-    /// happens and the change is still on disk.
+    /// Reverting a block of a file with something staged: it has to leave both,
+    /// or the index would put the change back on the next commit.
     Both,
-}
-
-/// Apply `patch` to the index only (`git apply --cached`), forward to stage a
-/// hunk or reversed to unstage it.
-pub fn apply_index_patch(wt: &str, patch: &str, reverse: bool) -> Result<()> {
-    apply_patch(wt, patch, reverse, PatchTarget::Index)
 }
 
 /// Apply `patch` to `target`. `--recount` lets git fix the hunk header counts
@@ -622,7 +618,6 @@ pub fn apply_patch(wt: &str, patch: &str, reverse: bool, target: PatchTarget) ->
     let mut cmd = std::process::Command::new("git");
     cmd.args(["-C", wt, "apply", "--recount", "--whitespace=nowarn"]);
     match target {
-        PatchTarget::Index => cmd.arg("--cached"),
         PatchTarget::Both => cmd.arg("--index"),
         PatchTarget::Worktree => &mut cmd,
     };

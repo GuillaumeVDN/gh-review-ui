@@ -10,16 +10,11 @@ use crate::models::{
 };
 
 /// The three per-file maps backing `path`'s currently-shown diff: the PR review
-/// diff, one column of a split local diff, or the combined local diff.
+/// diff, or the local one, which is the whole change against HEAD.
 pub fn source_maps<'a>(st: &'a State, path: &str) -> (&'a DiffMap, &'a InfoMap, &'a HunkMap) {
-    if !is_local_diff(st, path) {
-        (&st.diff_by_file, &st.info_by_file, &st.hunks_by_file)
-    } else if !is_split(st, path) {
-        (&st.edit_diff_by_file, &st.edit_info_by_file, &st.edit_hunks_by_file)
-    } else if st.staged_side {
-        (&st.staged_diff_by_file, &st.staged_info_by_file, &st.staged_hunks_by_file)
-    } else {
-        (&st.unstaged_diff_by_file, &st.unstaged_info_by_file, &st.unstaged_hunks_by_file)
+    match is_local_diff(st, path) {
+        false => (&st.diff_by_file, &st.info_by_file, &st.hunks_by_file),
+        true => (&st.edit_diff_by_file, &st.edit_info_by_file, &st.edit_hunks_by_file),
     }
 }
 
@@ -35,29 +30,10 @@ pub fn info_lines<'a>(st: &'a State, path: &str) -> Option<&'a Vec<LineInfo>> {
 
 /// How much of `path`'s local change is staged.
 pub fn stage_state(st: &State, path: &str) -> StageState {
-    match (
-        st.staged_diff_by_file.contains_key(path),
-        st.unstaged_diff_by_file.contains_key(path),
-    ) {
+    match (st.staged_paths.contains(path), st.unstaged_paths.contains(path)) {
         (true, true) => StageState::Partial,
         (true, false) => StageState::Staged,
         _ => StageState::Unstaged,
-    }
-}
-
-/// Whether `path`'s local diff has content on both sides of the index, so the
-/// [0] pane splits into unstaged (left) / staged (right) columns.
-pub fn is_split(st: &State, path: &str) -> bool {
-    stage_state(st, path) == StageState::Partial
-}
-
-/// Whether Space on a hunk of `path`'s local diff *unstages* it: on the staged
-/// column of a split, or anywhere in an entirely-staged file.
-pub fn hunk_unstages(st: &State, path: &str) -> bool {
-    match stage_state(st, path) {
-        StageState::Staged => true,
-        StageState::Partial => st.staged_side,
-        StageState::Unstaged => false,
     }
 }
 
@@ -358,6 +334,25 @@ pub fn hunk_for_comment(st: &State, c: &PendingComment) -> (Vec<String>, Option<
 mod tests {
     use super::*;
     use crate::models::{FileEntry, PendingComment, ReviewThread, TreeRow};
+
+    /// However much of a file is staged, its local diff is the whole change
+    /// against HEAD.
+    #[test]
+    fn a_partly_staged_file_shows_its_change_against_head() {
+        let mut st = State::default();
+        let combined = vec!["@@ -1,2 +1,2 @@".to_string(), "-old".to_string(), "+new".to_string()];
+        st.edit_diff_by_file.insert("f.rs".into(), combined.clone());
+        st.local_diff_path = Some("f.rs".into());
+        st.staged_paths.insert("f.rs".into());
+        st.unstaged_paths.insert("f.rs".into());
+
+        assert_eq!(stage_state(&st, "f.rs"), StageState::Partial);
+        assert_eq!(diff_lines(&st, "f.rs"), Some(&combined));
+        // The review diff of the same path is another thing entirely.
+        st.diff_by_file.insert("f.rs".into(), vec!["@@ -1 +1 @@".to_string()]);
+        st.local_diff_path = None;
+        assert_eq!(diff_lines(&st, "f.rs").map(Vec::len), Some(1));
+    }
 
     fn diff_state() -> State {
         let mut st = State::default();

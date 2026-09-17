@@ -234,3 +234,30 @@ fn side_by_side_renders_in_a_tiny_terminal() {
         let _ = screen(&mut st, w, h); // must not panic
     }
 }
+
+/// A local diff from the pending-edits pane reads side by side like any other,
+/// and its own content is what the two columns hold.
+#[test]
+fn the_local_diff_reads_side_by_side_too() {
+    let raw = "diff --git a/f.txt b/f.txt\nindex 3..4 100644\n--- a/f.txt\n+++ b/f.txt\n\
+               @@ -1,3 +1,3 @@\n ctx\n-gone\n+fresh\n tail\n";
+    let mut st = State::default();
+    let (d, i) = parse_diff(raw);
+    st.edit_hunks_by_file = d.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+    (st.edit_diff_by_file, st.edit_info_by_file) = (d, i);
+    st.edit_files = vec![ghreview::models::EditEntry {
+        path: "f.txt".into(),
+        kind: ghreview::models::EditKind::Modified,
+    }];
+    st.local_diff_path = Some("f.txt".into());
+    st.focus = Focus::Diff;
+    st.side_by_side = true;
+
+    let out = screen(&mut st, 160, 30);
+    assert!(out.contains("Local diff"), "{out}");
+    assert!(out.contains("HEAD | worktree"), "the title marks the view: {out}");
+    let row = row_with(&out, "gone");
+    let (del, add) = (row.find("-gone").unwrap(), row.find("+fresh").unwrap());
+    assert!(del < add, "the old side reads on the left: {row}");
+    assert!(row[del..add].contains('│'), "the two columns are apart: {row}");
+}
