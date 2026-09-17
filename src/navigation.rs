@@ -258,7 +258,7 @@ pub fn jump_stop(st: &mut State, direction: i64) {
 }
 
 /// The diff-line range to scroll into view for the current stop: the block, or
-/// the anchored line plus room for the comment under it.
+/// the line a comment hangs under, since the comment draws as part of it.
 pub fn stop_reveal(st: &State, path: &str) -> Option<Range> {
     let stops = diff_stops(st, path);
     let at = match stops.get(st.diff_stop_idx)? {
@@ -272,7 +272,7 @@ pub fn stop_reveal(st: &State, path: &str) -> Option<Range> {
             thread_anchor(st, path, t).unwrap_or(0)
         }
     };
-    Some((at, (at + 3).min(diff_lines(st, path).map_or(at + 1, Vec::len))))
+    Some((at, at + 1))
 }
 
 /// New-file line to open in the editor for the selected hunk.

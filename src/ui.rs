@@ -103,18 +103,27 @@ fn clamp_view(idx: usize, offset: usize, vh: usize, total: usize) -> usize {
     offset.min(max_off)
 }
 
-/// Minimal scroll so `[lo, hi)` is visible in `vh` rows.
-pub fn reveal_scroll(scroll: usize, lo: usize, hi: usize, vh: usize) -> usize {
-    if vh == 0 {
-        return scroll;
+/// How many times a draw may scroll again to reveal a stop.
+const REVEAL_TRIES: usize = 6;
+
+/// The scroll the stop `[lo, hi)` needs, from what the draw really showed.
+///
+/// A unit takes more rows than one: a line wraps, a local edit follows it and a
+/// comment hangs under it. So the draw reports `drawn`, the unit past the last
+/// one it finished, and the next scroll comes from that. The result stops at
+/// `lo`, so a stop taller than the pane starts at the top. `None` ends the
+/// retry: the stop is on screen, or the scroll cannot move any further.
+fn reveal_again(scroll: usize, (lo, hi): (usize, usize), drawn: usize) -> Option<usize> {
+    if drawn >= hi {
+        return None;
     }
-    if lo < scroll {
-        return lo;
-    }
-    if hi > scroll + vh {
-        return if hi - lo > vh { lo } else { hi - vh };
-    }
-    scroll
+    let next = (scroll + (hi - drawn)).min(lo);
+    (next != scroll).then_some(next)
+}
+
+/// The scroll a stop starts its reveal from: the draw itself moves it on.
+fn reveal_start(scroll: usize, target: Option<(usize, usize)>, len: usize) -> usize {
+    target.map_or(scroll, |(lo, _)| scroll.min(lo)).min(len.saturating_sub(1))
 }
 
 /// True while a PR checkout is in flight (worktree fetch + active load), so the
@@ -777,10 +786,17 @@ fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: S
 /// not diff lines.
 fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     let (vh, iw) = (inner.height as usize, inner.width as usize);
-    let rows = crate::diff::side_by_side(
-        source_maps(st, path).0.get(path).map(Vec::as_slice).unwrap_or_default(),
-    );
     let n_lines = source_maps(st, path).0.get(path).map_or(0, Vec::len);
+    if n_lines == 0 {
+        st.diff_scroll = 0;
+        st.diff_reveal_pending = false;
+        let msg = Line::styled("(no diff — binary, removed, or too large)", theme::dim());
+        f.render_widget(Paragraph::new(msg), inner);
+        return;
+    }
+    let no_lines = Vec::new();
+    let diff_lines: &[String] = source_maps(st, path).0.get(path).unwrap_or(&no_lines);
+    let rows = crate::diff::side_by_side(diff_lines);
     let row_by_line = crate::diff::sbs_row_by_line(&rows, n_lines);
 
     let focused = st.focus == Focus::Diff;
@@ -790,32 +806,23 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         true => current_hunk_range(st, path),
         false => None,
     };
-    if st.diff_reveal_pending {
-        let target = if st.comment_mode {
-            Some((st.comment_line, st.comment_line))
-        } else if focused {
-            stop_reveal(st, path).map(|(s, e)| (s, e.saturating_sub(1)))
-        } else {
-            None
-        };
-        if let Some((s, e)) = target {
-            let lo = row_by_line.get(s).copied().unwrap_or(0);
-            let hi = row_by_line.get(e).copied().unwrap_or(lo);
-            st.diff_scroll = reveal_scroll(st.diff_scroll, lo, hi + 1, vh);
-        }
-        st.diff_reveal_pending = false;
-    }
-    st.diff_scroll = st.diff_scroll.min(rows.len().saturating_sub(1));
-    let scroll = st.diff_scroll;
-
-    let diff_lines: &[String] = match source_maps(st, path).0.get(path) {
-        Some(v) if !v.is_empty() => v,
-        _ => {
-            let msg = Line::styled("(no diff — binary, removed, or too large)", theme::dim());
-            f.render_widget(Paragraph::new(msg), inner);
-            return;
-        }
+    // Only recenter after a keyboard navigation; mouse/PgUp/Dn scroll freely.
+    let target = if !st.diff_reveal_pending {
+        None
+    } else if st.comment_mode {
+        Some((st.comment_line, st.comment_line + 1))
+    } else if focused {
+        stop_reveal(st, path)
+    } else {
+        None
     };
+    // The scroll counts rows here, so the stop becomes a row range.
+    let target = target.map(|(s, e)| {
+        let lo = row_by_line.get(s).copied().unwrap_or(0);
+        let hi = row_by_line.get(e.saturating_sub(1)).copied().unwrap_or(lo);
+        (lo, hi + 1)
+    });
+    let mut scroll = reveal_start(st.diff_scroll, target, rows.len());
 
     let (sel_lo, sel_hi) = if st.comment_mode {
         let anchor = st.comment_start.unwrap_or(st.comment_line);
@@ -831,8 +838,10 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     let top = top_threads(st, path);
     let now = now_epoch();
     let info_here = source_maps(st, path).1.get(path);
-    // The visible rows name the diff lines to color; a wrapped row shows fewer.
-    let seen = rows.iter().skip(st.diff_scroll).take(vh);
+    // The rows down to the stop name the diff lines to color: the reveal can
+    // still carry the scroll on to them.
+    let end = target.map_or(scroll, |(_, hi)| hi.max(scroll)) + vh;
+    let seen = rows.iter().take(end);
     let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
     let hl = st.highlight.paint(path, diff_lines, info_here, &st.blobs, upto);
     // The local diff already is the edits, so there is nothing to overlay on it.
@@ -915,80 +924,92 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     };
 
     let mut out: Vec<Line> = Vec::new();
-    let mut top_done = false;
-    // A thread the diff cannot anchor any more reads at the top of the file.
-    if scroll == 0 {
-        for (ti, t) in &top {
-            push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+    for _ in 0..REVEAL_TRIES {
+        out = Vec::new();
+        let mut top_done = false;
+        let mut drawn = scroll;
+        // A thread the diff cannot anchor any more reads at the top of the file.
+        if scroll == 0 {
+            for (ti, t) in &top {
+                push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+            }
         }
-    }
-    for row in rows.iter().skip(scroll) {
-        if out.len() >= vh {
-            break;
-        }
-        // Local additions anchored before the first head line show once, up top.
-        if let (Some(ov), false) = (&overlay, top_done) {
-            if row.right.and_then(new_side).is_some() {
-                for add in &ov.adds_top {
+        for (r, row) in rows.iter().enumerate().skip(scroll) {
+            if out.len() >= vh {
+                break;
+            }
+            drawn = r + 1;
+            // Local additions anchored before the first head line show once, up top.
+            if let (Some(ov), false) = (&overlay, top_done) {
+                if row.right.and_then(new_side).is_some() {
+                    for add in &ov.adds_top {
+                        push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
+                    }
+                    top_done = true;
+                }
+            }
+            if row.wide {
+                let Some(i) = row.line() else { continue };
+                let ln = &diff_lines[i];
+                let style = theme::diff_line_style(ln, false);
+                let tw = iw.saturating_sub(1 + gw);
+                for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
+                    if out.len() >= vh {
+                        break;
+                    }
+                    out.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(gutter(&[None], nw), theme::dim()),
+                        Span::styled(pad(&chunk, tw), style),
+                    ]));
+                }
+            } else {
+                push_sbs_row(
+                    &mut out,
+                    vh,
+                    (ltw, rtw),
+                    cell(row.left, ltw, false),
+                    cell(row.right, rtw, true),
+                );
+            }
+            // Local additions inserted after this head line (orange, new side).
+            if let (Some(ov), Some(l)) = (&overlay, row.right.and_then(new_side)) {
+                for add in ov.adds_after.get(&l).into_iter().flatten() {
                     push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
                 }
-                top_done = true;
             }
-        }
-        if row.wide {
-            let Some(i) = row.line() else { continue };
-            let ln = &diff_lines[i];
-            let style = theme::diff_line_style(ln, false);
-            let tw = iw.saturating_sub(1 + gw);
-            for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
-                if out.len() >= vh {
-                    break;
+            // Comments anchored to either side, spanning both columns.
+            let mut seen = None;
+            for i in [row.left, row.right].into_iter().flatten() {
+                if seen == Some(i) {
+                    continue;
                 }
-                out.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(gutter(&[None], nw), theme::dim()),
-                    Span::styled(pad(&chunk, tw), style),
-                ]));
-            }
-        } else {
-            push_sbs_row(
-                &mut out,
-                vh,
-                (ltw, rtw),
-                cell(row.left, ltw, false),
-                cell(row.right, rtw, true),
-            );
-        }
-        // Local additions inserted after this head line (orange, new side).
-        if let (Some(ov), Some(l)) = (&overlay, row.right.and_then(new_side)) {
-            for add in ov.adds_after.get(&l).into_iter().flatten() {
-                push_sbs_row(&mut out, vh, (ltw, rtw), SbsCell::blank(nw), local_cell(add));
-            }
-        }
-        // Comments anchored to either side, spanning both columns.
-        let mut seen = None;
-        for i in [row.left, row.right].into_iter().flatten() {
-            if seen == Some(i) {
-                continue;
-            }
-            seen = Some(i);
-            let Some(&(old, new)) = info_here.and_then(|inf| inf.get(i)) else { continue };
-            let hit = |line: Option<i64>, side: &str| match side {
-                "LEFT" => old == line,
-                _ => new == line,
-            };
-            for (ci, c) in &pending_here {
-                if hit(Some(c.line), &c.side) {
-                    push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
+                seen = Some(i);
+                let Some(&(old, new)) = info_here.and_then(|inf| inf.get(i)) else { continue };
+                let hit = |line: Option<i64>, side: &str| match side {
+                    "LEFT" => old == line,
+                    _ => new == line,
+                };
+                for (ci, c) in &pending_here {
+                    if hit(Some(c.line), &c.side) {
+                        push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
+                    }
+                }
+                for (ti, t) in &threads_here {
+                    if t.line.is_some() && hit(t.line, &t.side) {
+                        push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+                    }
                 }
             }
-            for (ti, t) in &threads_here {
-                if t.line.is_some() && hit(t.line, &t.side) {
-                    push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
-                }
-            }
+        }
+        let drawn = if out.len() >= vh { drawn.saturating_sub(1) } else { drawn };
+        match target.and_then(|t| reveal_again(scroll, t, drawn)) {
+            Some(next) => scroll = next,
+            None => break,
         }
     }
+    st.diff_scroll = scroll;
+    st.diff_reveal_pending = false;
     f.render_widget(Paragraph::new(out), inner);
 }
 
@@ -1196,18 +1217,17 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         false => None,
     };
     // Only recenter after a keyboard navigation; mouse/PgUp/Dn scroll freely.
-    if st.diff_reveal_pending {
-        if st.comment_mode {
-            st.diff_scroll = reveal_scroll(st.diff_scroll, st.comment_line, st.comment_line + 1, vh);
-        } else if let Some((s, e)) = path.as_ref().filter(|_| focused).and_then(|p| stop_reveal(st, p)) {
-            st.diff_scroll = reveal_scroll(st.diff_scroll, s, e, vh);
-        }
-        st.diff_reveal_pending = false;
-    }
+    let target = if !st.diff_reveal_pending {
+        None
+    } else if st.comment_mode {
+        Some((st.comment_line, st.comment_line + 1))
+    } else {
+        path.as_ref().filter(|_| focused).and_then(|p| stop_reveal(st, p))
+    };
     // Scroll is by diff-line index; allow reaching the last line (which may wrap
     // into several rows) rather than clamping to len - vh.
     let n_lines = path.as_ref().and_then(|p| source_maps(st, p).0.get(p)).map_or(0, Vec::len);
-    st.diff_scroll = st.diff_scroll.min(n_lines.saturating_sub(1));
+    let mut scroll = reveal_start(st.diff_scroll, target, n_lines);
 
     let empty = Vec::new();
     let lines_vec = path.as_ref().and_then(|p| source_maps(st, p).0.get(p)).unwrap_or(&empty);
@@ -1264,8 +1284,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         .map(|l| &l[1..])
         .collect();
 
+    // The lines down to the stop want their colors too: the reveal can still
+    // carry the scroll on to them.
+    let upto = target.map_or(scroll, |(_, hi)| hi.max(scroll)) + vh;
     let hl = match &path {
-        Some(p) => st.highlight.paint(p, diff_lines, info_here, &st.blobs, st.diff_scroll + vh),
+        Some(p) => st.highlight.paint(p, diff_lines, info_here, &st.blobs, upto),
         None => Painted::default(),
     };
 
@@ -1298,69 +1321,79 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     };
 
     let mut out: Vec<Line> = Vec::new();
-    let mut top_done = false;
-    let mut i = st.diff_scroll;
-    // A thread the diff cannot anchor any more reads at the top of the file.
-    if i == 0 {
-        for (ti, t) in &top {
-            push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
-        }
-    }
-    while out.len() < vh && i < diff_lines.len() {
-        let ln = &diff_lines[i];
-        let new_side = info_here.and_then(|info| info.get(i)).and_then(|&(_, n)| n);
-        let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
-        let selected = sel_lo <= i && i <= sel_hi;
-        // A head line removed locally: draw it struck-through in orange.
-        let local_del = overlay
-            .as_ref()
-            .zip(new_side)
-            .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
-
-        // Local additions anchored before the first head line show once, up top.
-        if let (Some(ov), false) = (&overlay, top_done) {
-            if new_side.is_some() {
-                push_adds(&mut out, &ov.adds_top);
-                top_done = true;
+    for _ in 0..REVEAL_TRIES {
+        out = Vec::new();
+        let mut top_done = false;
+        let mut i = scroll;
+        // A thread the diff cannot anchor any more reads at the top of the file.
+        if i == 0 {
+            for (ti, t) in &top {
+                push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
             }
         }
+        while out.len() < vh && i < diff_lines.len() {
+            let ln = &diff_lines[i];
+            let new_side = info_here.and_then(|info| info.get(i)).and_then(|&(_, n)| n);
+            let current = cur_hr.map_or(false, |(s, e)| s <= i && i < e);
+            let selected = sel_lo <= i && i <= sel_hi;
+            // A head line removed locally: draw it struck-through in orange.
+            let local_del = overlay
+                .as_ref()
+                .zip(new_side)
+                .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
 
-        // Long lines wrap onto continuation rows so nothing is cut off.
-        let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
-        let row = DiffRow {
-            line: ln,
-            hl: hl.row(i),
-            nos: &[nos.0, nos.1],
-            current,
-            selected,
-            local_del,
-        };
-        push_diff_rows(&mut out, vh, &row, nw, tw, true);
-        // Local additions inserted after this head line (orange).
-        if let (Some(ov), Some(l)) = (&overlay, new_side) {
-            if let Some(adds) = ov.adds_after.get(&l) {
-                push_adds(&mut out, adds);
+            // Local additions anchored before the first head line show once, up top.
+            if let (Some(ov), false) = (&overlay, top_done) {
+                if new_side.is_some() {
+                    push_adds(&mut out, &ov.adds_top);
+                    top_done = true;
+                }
             }
-        }
-        // Inline any comment or thread anchored to this line.
-        if let Some(&(old, new)) = info_here.and_then(|info| info.get(i)) {
-            let hit = |line: Option<i64>, side: &str| match side {
-                "LEFT" => old == line,
-                _ => new == line,
+
+            // Long lines wrap onto continuation rows so nothing is cut off.
+            let nos = info_here.and_then(|info| info.get(i)).copied().unwrap_or((None, None));
+            let row = DiffRow {
+                line: ln,
+                hl: hl.row(i),
+                nos: &[nos.0, nos.1],
+                current,
+                selected,
+                local_del,
             };
-            for (ci, c) in &pending_here {
-                if hit(Some(c.line), &c.side) {
-                    push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
+            push_diff_rows(&mut out, vh, &row, nw, tw, true);
+            // Local additions inserted after this head line (orange).
+            if let (Some(ov), Some(l)) = (&overlay, new_side) {
+                if let Some(adds) = ov.adds_after.get(&l) {
+                    push_adds(&mut out, adds);
                 }
             }
-            for (ti, t) in &threads_here {
-                if t.line.is_some() && hit(t.line, &t.side) {
-                    push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+            // Inline any comment or thread anchored to this line.
+            if let Some(&(old, new)) = info_here.and_then(|info| info.get(i)) {
+                let hit = |line: Option<i64>, side: &str| match side {
+                    "LEFT" => old == line,
+                    _ => new == line,
+                };
+                for (ci, c) in &pending_here {
+                    if hit(Some(c.line), &c.side) {
+                        push_rows(&mut out, vh, pending_rows(c, iw, sel == Some(Stop::Pending(*ci))));
+                    }
+                }
+                for (ti, t) in &threads_here {
+                    if t.line.is_some() && hit(t.line, &t.side) {
+                        push_rows(&mut out, vh, thread_rows(t, iw, sel == Some(Stop::Thread(*ti)), now));
+                    }
                 }
             }
+            i += 1;
         }
-        i += 1;
+        let drawn = if out.len() >= vh { i.saturating_sub(1) } else { i };
+        match target.and_then(|t| reveal_again(scroll, t, drawn)) {
+            Some(next) => scroll = next,
+            None => break,
+        }
     }
+    st.diff_scroll = scroll;
+    st.diff_reveal_pending = false;
     f.render_widget(Paragraph::new(out), inner);
 }
 
@@ -1811,11 +1844,22 @@ mod tests {
     }
 
     #[test]
-    fn reveal_minimal() {
-        assert_eq!(reveal_scroll(8, 10, 13, 10), 8); // visible → unchanged
-        assert_eq!(reveal_scroll(20, 5, 8, 10), 5); // above → to it
-        assert_eq!(reveal_scroll(0, 15, 18, 10), 8); // below → end at bottom
-        assert_eq!(reveal_scroll(0, 5, 40, 10), 5); // taller than viewport → top
+    fn reveal_asks_for_more_scroll_until_the_stop_shows() {
+        // The draw stopped short of the stop: scroll on by what it missed.
+        assert_eq!(reveal_again(0, (15, 18), 12), Some(6));
+        // The stop is drawn: nothing more to do.
+        assert_eq!(reveal_again(6, (15, 18), 20), None);
+        // A stop taller than the pane keeps its first line at the top.
+        assert_eq!(reveal_again(0, (5, 40), 20), Some(5));
+        assert_eq!(reveal_again(5, (5, 40), 20), None);
+    }
+
+    #[test]
+    fn reveal_starts_no_further_down_than_the_stop() {
+        assert_eq!(reveal_start(20, Some((5, 8)), 100), 5); // above → to it
+        assert_eq!(reveal_start(3, Some((5, 8)), 100), 3); // below → the draw moves it
+        assert_eq!(reveal_start(9, None, 100), 9);
+        assert_eq!(reveal_start(9, None, 4), 3); // clamped to the last line
     }
 
     #[test]
