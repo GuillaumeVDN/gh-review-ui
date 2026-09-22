@@ -65,6 +65,14 @@ pub fn cur_file_path(st: &State) -> Option<String> {
     }
 }
 
+/// The file the Pending-edits pane [4] previews in [0]: its selected file row.
+pub fn edit_preview_path(st: &State) -> Option<String> {
+    match st.edit_tree.get(st.edit_idx) {
+        Some(TreeRow::File { index, .. }) => st.edit_files.get(*index).map(|e| e.path.clone()),
+        _ => None,
+    }
+}
+
 /// Whether the [0] pane is currently showing `path`'s *local* diff (from [4])
 /// rather than the PR review diff.
 pub fn is_local_diff(st: &State, path: &str) -> bool {

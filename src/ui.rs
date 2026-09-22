@@ -14,8 +14,8 @@ use crate::models::{
     SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff, source_maps,
-    stage_state, stop_reveal, thread_anchor, Stop,
+    current_hunk_range, diff_path, edit_preview_path, focused_stop, hunk_for_comment, is_local_diff,
+    source_maps, stage_state, stop_reveal, thread_anchor, Stop,
 };
 use crate::syntax::{Painted, StyledLine};
 use crate::textbuffer;
@@ -37,8 +37,11 @@ pub struct PaneRects {
 /// width from the left column.
 pub fn shows_sbs_diff(st: &State) -> bool {
     st.side_by_side
-        && matches!(st.focus, Focus::Diff | Focus::Files | Focus::Edits)
-        && diff_path(st).is_some()
+        && match st.focus {
+            Focus::Diff | Focus::Files => diff_path(st).is_some(),
+            Focus::Edits => edit_preview_path(st).is_some(),
+            _ => false,
+        }
 }
 
 pub fn compute_layout(area: Rect, st: &State) -> (PaneRects, Rect, Rect) {
@@ -436,7 +439,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · gg/G · {common}"),
-        Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
+        Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")
         }
@@ -778,6 +781,33 @@ fn push_sbs_row(out: &mut Vec<Line<'static>>, vh: usize, w: (usize, usize), l: S
     }
 }
 
+/// Push a row that spans both columns: a file or `@@` header.
+fn push_sbs_wide(out: &mut Vec<Line<'static>>, vh: usize, ln: &str, iw: usize, gw: usize, nw: usize) {
+    let style = theme::diff_line_style(ln, false);
+    let tw = iw.saturating_sub(1 + gw);
+    for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
+        if out.len() >= vh {
+            break;
+        }
+        out.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(gutter(&[None], nw), theme::dim()),
+            Span::styled(pad(&chunk, tw), style),
+        ]));
+    }
+}
+
+/// The column widths of a side-by-side diff: one marker column, the gutter and
+/// the text on each side, with a 1-column separator between them. Returns
+/// `(gutter width, left text width, right text width, number width)`.
+fn sbs_widths(iw: usize, info: Option<&Vec<LineInfo>>) -> (usize, usize, usize, usize) {
+    let half = iw.saturating_sub(1) / 2;
+    let (lw, rw) = (half, iw.saturating_sub(1 + half));
+    let nw = fit_num_width(num_width(info), 1, lw.min(rw).saturating_sub(1), 12);
+    let gw = if nw == 0 { 0 } else { nw + 1 };
+    (gw, lw.saturating_sub(1 + gw), rw.saturating_sub(1 + gw), nw)
+}
+
 /// The review diff side by side: the old side left, the new side right.
 ///
 /// Deletions pair with the additions that replace them, so a rewritten line
@@ -856,13 +886,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         .map(|l| &l[1..])
         .collect();
 
-    // One marker column, the line-number gutter and text on each side, with a
-    // 1-column separator between them.
-    let half = iw.saturating_sub(1) / 2;
-    let (lw, rw) = (half, iw.saturating_sub(1 + half));
-    let nw = fit_num_width(num_width(info_here), 1, lw.min(rw).saturating_sub(1), 12);
-    let gw = if nw == 0 { 0 } else { nw + 1 };
-    let (ltw, rtw) = (lw.saturating_sub(1 + gw), rw.saturating_sub(1 + gw));
+    let (gw, ltw, rtw, nw) = sbs_widths(iw, info_here);
 
     let new_side = |i: usize| info_here.and_then(|inf| inf.get(i)).and_then(|&(_, n)| n);
     let cell = |idx: Option<usize>, tw: usize, is_new: bool| -> SbsCell {
@@ -950,19 +974,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             }
             if row.wide {
                 let Some(i) = row.line() else { continue };
-                let ln = &diff_lines[i];
-                let style = theme::diff_line_style(ln, false);
-                let tw = iw.saturating_sub(1 + gw);
-                for chunk in wrap_hard(&ln.replace('\t', "    "), tw.max(1)) {
-                    if out.len() >= vh {
-                        break;
-                    }
-                    out.push(Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled(gutter(&[None], nw), theme::dim()),
-                        Span::styled(pad(&chunk, tw), style),
-                    ]));
-                }
+                push_sbs_wide(&mut out, vh, &diff_lines[i], iw, gw, nw);
             } else {
                 push_sbs_row(
                     &mut out,
@@ -1486,12 +1498,10 @@ fn render_pending_detail(f: &mut Frame, st: &State, area: Rect) {
 /// same number and the same focus at once. It is the same content hunk mode
 /// shows, so it wears the same name.
 fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
-    let path = match st.edit_tree.get(st.edit_idx) {
-        Some(TreeRow::File { index, .. }) => st.edit_files.get(*index).map(|e| e.path.clone()),
-        _ => None,
-    };
+    let path = edit_preview_path(st);
+    let sbs = st.side_by_side && path.is_some();
     let title = match &path {
-        Some(p) => format!("[0] Local diff — {p}"),
+        Some(p) => format!("[0] Local diff — {p}{}", if sbs { "  · HEAD | worktree" } else { "" }),
         None => "[0] Local diff".to_string(),
     };
     let b = block(&title, false, false);
@@ -1507,6 +1517,13 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
         return;
     }
     let info = path.as_ref().and_then(|p| st.edit_info_by_file.get(p));
+    if sbs {
+        let rows = crate::diff::side_by_side(lines_vec);
+        let scroll = st.edit_diff_scroll.min(rows.len().saturating_sub(1));
+        st.edit_diff_scroll = scroll;
+        render_sbs_edit_diff(f, st, inner, path.as_deref().unwrap_or(""), lines_vec, info, &rows, scroll);
+        return;
+    }
     let nw = fit_num_width(num_width(info), 2, iw, 16);
     let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
     let tw = iw.saturating_sub(gw);
@@ -1529,6 +1546,56 @@ fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
         };
         push_diff_rows(&mut out, vh, &row, nw, tw, false);
         i += 1;
+    }
+    f.render_widget(Paragraph::new(out), inner);
+}
+
+/// The [4] preview side by side: HEAD on the left, the worktree on the right.
+/// No stop, no comment and no overlay here: the diff already is the local edit.
+/// `edit_diff_scroll` counts rows here, not diff lines.
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_edit_diff(
+    f: &mut Frame,
+    st: &State,
+    inner: Rect,
+    path: &str,
+    lines: &[String],
+    info: Option<&Vec<LineInfo>>,
+    rows: &[crate::diff::SbsRow],
+    scroll: usize,
+) {
+    let (vh, iw) = (inner.height as usize, inner.width as usize);
+    let seen = rows.iter().take(scroll + vh);
+    let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
+    let hl = st.highlight.paint(path, lines, info, &st.blobs, upto);
+    let (gw, ltw, rtw, nw) = sbs_widths(iw, info);
+
+    let cell = |idx: Option<usize>, tw: usize, is_new: bool| -> SbsCell {
+        let Some(i) = idx else { return SbsCell::blank(nw) };
+        let ln = &lines[i];
+        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
+        let kind = theme::classify_diff_line(ln);
+        let bg = theme::diff_row_style(kind, false);
+        SbsCell {
+            gutter: gutter(&[if is_new { new } else { old }], nw),
+            num_style: theme::diff_number_style(kind, false).patch(bg),
+            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), false), tw.max(1)),
+            row_style: bg,
+            marker: " ",
+            m_style: bg,
+        }
+    };
+    let mut out: Vec<Line> = Vec::new();
+    for row in rows.iter().skip(scroll) {
+        if out.len() >= vh {
+            break;
+        }
+        if row.wide {
+            let Some(i) = row.line() else { continue };
+            push_sbs_wide(&mut out, vh, &lines[i], iw, gw, nw);
+        } else {
+            push_sbs_row(&mut out, vh, (ltw, rtw), cell(row.left, ltw, false), cell(row.right, rtw, true));
+        }
     }
     f.render_widget(Paragraph::new(out), inner);
 }

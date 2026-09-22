@@ -10,8 +10,8 @@ use crate::models::{
     State, TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    cur_file_path, current_hunk_range, diff_path, first_change_index, hunk_comment_indices,
-    is_local_diff, line_target, stage_state, Stop,
+    cur_file_path, current_hunk_range, diff_path, edit_preview_path, first_change_index,
+    hunk_comment_indices, is_local_diff, line_target, stage_state, Stop,
 };
 use crate::textbuffer::TextArea;
 use crate::tree;
@@ -1050,7 +1050,8 @@ fn build_review_prompt(st: &State, body: &str) -> String {
         .unwrap_or((0, String::new()));
     let mut s = format!(
         "I'm reviewing GitHub PR #{num} ({title}). You're in the checkout for it. \
-         Please address these review comments by editing the code:\n\n"
+         Please address these review comments by editing the code, or answer a comment when it is \
+         a question rather than a clear request for a change:\n\n"
     );
     if !body.trim().is_empty() {
         s.push_str(&format!("Overall note: {}\n\n", body.trim()));
@@ -1358,17 +1359,27 @@ pub fn begin_discard_hunk(st: &mut State) {
 /// `s`: old side on the left, new side on the right, for the diff on screen.
 pub fn toggle_side_by_side(st: &mut State) {
     let sbs = !st.side_by_side;
-    if let Some(path) = diff_path(st) {
-        if let Some(lines) = crate::navigation::diff_lines(st, &path) {
-            let rows = crate::diff::side_by_side(lines);
-            st.diff_scroll = if sbs {
-                crate::diff::sbs_row_by_line(&rows, lines.len())
-                    .get(st.diff_scroll)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                rows.get(st.diff_scroll).and_then(|r| r.line()).unwrap_or(0)
-            };
+    let carry = |lines: &[String], scroll: usize| {
+        let rows = crate::diff::side_by_side(lines);
+        if sbs {
+            crate::diff::sbs_row_by_line(&rows, lines.len()).get(scroll).copied().unwrap_or(0)
+        } else {
+            rows.get(scroll).and_then(|r| r.line()).unwrap_or(0)
+        }
+    };
+    // The [4] preview scrolls on its own, so it carries its own position.
+    if st.focus == Focus::Edits {
+        let scroll = edit_preview_path(st)
+            .and_then(|p| st.edit_diff_by_file.get(&p))
+            .map(|lines| carry(lines, st.edit_diff_scroll));
+        if let Some(scroll) = scroll {
+            st.edit_diff_scroll = scroll;
+        }
+    } else {
+        let scroll = diff_path(st)
+            .and_then(|p| crate::navigation::diff_lines(st, &p).map(|lines| carry(lines, st.diff_scroll)));
+        if let Some(scroll) = scroll {
+            st.diff_scroll = scroll;
         }
     }
     st.side_by_side = sbs;
@@ -1865,6 +1876,35 @@ mod tests {
         toggle_side_by_side(&mut st);
         assert!(!st.side_by_side);
         assert_eq!(st.diff_scroll, rows[crate::diff::sbs_row_by_line(&rows, lines.len())[at]].line().unwrap());
+    }
+
+    /// The [4] preview has a scroll of its own, and `s` there carries that one
+    /// over, not the review diff's.
+    #[test]
+    fn the_side_by_side_toggle_carries_the_edit_preview_scroll() {
+        let mut st = State::default();
+        let lines: Vec<String> = ["@@ -1,3 +1,3 @@", " keep", "-old", "+new", " tail"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let rows = crate::diff::side_by_side(&lines);
+        st.edit_files = vec![edit("f")];
+        crate::tree::rebuild_edits(&mut st);
+        st.edit_diff_by_file.insert("f".into(), lines.clone());
+        st.focus = Focus::Edits;
+        let at = lines.iter().position(|l| l == "+new").expect("the added line");
+        st.edit_diff_scroll = at;
+        st.diff_scroll = 3;
+
+        toggle_side_by_side(&mut st);
+        assert!(st.side_by_side);
+        assert_eq!(st.edit_diff_scroll, crate::diff::sbs_row_by_line(&rows, lines.len())[at]);
+        assert_eq!(st.diff_scroll, 3);
+
+        toggle_side_by_side(&mut st);
+        assert!(!st.side_by_side);
+        let row = crate::diff::sbs_row_by_line(&rows, lines.len())[at];
+        assert_eq!(st.edit_diff_scroll, rows[row].line().unwrap());
     }
 
     /// Enter on a folder folds it, the way it does in the Files pane. A folder

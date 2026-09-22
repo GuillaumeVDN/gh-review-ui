@@ -410,6 +410,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 st.status = "Unfolded all folders.".into();
             }
             KeyCode::Char('e') => editor::open_current_edit_in_editor(st),
+            KeyCode::Char('s') => controller::toggle_side_by_side(st),
             _ => {}
         },
         Focus::Diff => match k.code {
