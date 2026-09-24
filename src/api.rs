@@ -252,14 +252,62 @@ pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> crate::syntax::Blob
 /// `wt` is that checkout, because the oids are the ones [`load_commits`] gave
 /// us: a branch rewritten since its last push has commits only its own
 /// worktree holds, and the cwd this process was started in is another branch.
+///
+/// A merge inside the range brings the other side's whole tree along, and a
+/// diff from the commit before the range would show everything it merged in.
+/// See [`range_bounds`] for how the range keeps to its own change.
 pub fn load_diff_range(wt: &str, first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> {
-    let raw = sh_cwd(wt, &[
-        "git", "diff",
-        &format!("-U{DIFF_CONTEXT}"),
-        "--src-prefix=a/", "--dst-prefix=b/",
-        &format!("{first_oid}^..{last_oid}"),
-    ])?;
+    let Some((from, paths)) = range_bounds(wt, first_oid, last_oid) else {
+        return Ok((Diff::new(), Info::new()));
+    };
+    let mut args: Vec<String> = vec![
+        "git".into(), "diff".into(),
+        format!("-U{DIFF_CONTEXT}"),
+        "--src-prefix=a/".into(), "--dst-prefix=b/".into(),
+        from, last_oid.into(),
+    ];
+    if let Some(paths) = paths {
+        args.push("--".into());
+        args.extend(paths);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw = sh_cwd(wt, &args)?;
     Ok(parse_diff(&raw))
+}
+
+/// What to diff for `first_oid..last_oid`: the commit to start from, and the
+/// paths to keep to, when the range needs that.
+///
+/// Without a merge on the range's own line, the start is the commit before it.
+/// When the range holds a merge and starts before the side that merge brought
+/// in, the start is that side, the way GitHub diffs a branch from its fork
+/// with the base. When the range holds a merge but starts after that side,
+/// no single start excludes what was merged in, so the diff keeps to the
+/// paths the range's own commits touched. A merge alone touches none, and
+/// `None` says there is nothing to show.
+fn range_bounds(wt: &str, first_oid: &str, last_oid: &str) -> Option<(String, Option<Vec<String>>)> {
+    let before = format!("{first_oid}^");
+    let span = format!("{before}..{last_oid}");
+    let merges = sh_cwd(wt, &["git", "rev-list", "--first-parent", "--merges", &span]).unwrap_or_default();
+    let Some(merge) = merges.split_whitespace().next() else {
+        return Some((before, None));
+    };
+    let merged_in = format!("{merge}^2");
+    let starts_before = sh_cwd(wt, &["git", "merge-base", "--is-ancestor", &before, &merged_in]).is_ok();
+    if starts_before {
+        return Some((merged_in, None));
+    }
+    let touched = sh_cwd(wt, &[
+        "git", "log", "--first-parent", "--no-merges", "--name-only", "--format=", &span,
+    ])
+    .unwrap_or_default();
+    let mut paths: Vec<String> = touched.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return None;
+    }
+    Some((before, Some(paths)))
 }
 
 /// The commits under review, newest first.
@@ -1786,6 +1834,90 @@ mod worktree_sharing_tests {
         assert_eq!(commits.len(), 1, "only what the branch added to dev");
         assert_eq!(commits[0].headline, "feat: local work");
         assert!(!commits[0].pushed, "no remote has it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod range_diff_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit(dir: &std::path::Path, file: &str, text: &str, msg: &str) -> String {
+        std::fs::write(dir.join(file), text).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-qm", msg]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A branch of two commits, with `dev` merged into it between them. Dev
+    /// meanwhile changed two files of its own. Returns the branch's commits,
+    /// oldest first, with the merge in the middle.
+    fn fixture(name: &str) -> (std::path::PathBuf, [String; 3]) {
+        let root = std::env::temp_dir().join(format!("ghr-range-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "--initial-branch=dev"]);
+        commit(&root, "shared.txt", "v1\n", "initial");
+        git(&root, &["checkout", "-qb", "feat"]);
+        let first = commit(&root, "feat.txt", "feat\n", "feat: one");
+        git(&root, &["checkout", "-q", "dev"]);
+        commit(&root, "dev1.txt", "dev\n", "dev: one");
+        commit(&root, "dev2.txt", "dev\n", "dev: two");
+        git(&root, &["checkout", "-q", "feat"]);
+        git(&root, &["merge", "-q", "--no-edit", "--no-ff", "dev"]);
+        let merge = git(&root, &["rev-parse", "HEAD"]);
+        let last = commit(&root, "shared.txt", "v2\n", "feat: two");
+        (root, [first, merge, last])
+    }
+
+    #[test]
+    fn the_whole_branch_diffs_from_what_it_merged_in() {
+        let (root, [first, _, last]) = fixture("whole");
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &last).unwrap();
+        let mut files: Vec<&String> = diff.keys().collect();
+        files.sort();
+        assert_eq!(files, ["feat.txt", "shared.txt"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_range_after_the_merge_side_keeps_to_its_own_paths() {
+        let (root, [_, merge, last]) = fixture("partial");
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &last).unwrap();
+        let files: Vec<&String> = diff.keys().collect();
+        assert_eq!(files, ["shared.txt"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_merge_alone_shows_nothing_of_the_other_side() {
+        let (root, [_, merge, _]) = fixture("merge");
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &merge).unwrap();
+        assert!(diff.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_range_without_a_merge_diffs_from_the_commit_before() {
+        let (root, [first, _, _]) = fixture("plain");
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &first).unwrap();
+        let files: Vec<&String> = diff.keys().collect();
+        assert_eq!(files, ["feat.txt"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
