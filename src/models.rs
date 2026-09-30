@@ -115,6 +115,16 @@ pub struct PendingComment {
     pub start_side: String,
 }
 
+/// The comments one submit, refusal, or hand-off wrote to the PR's archive.
+#[derive(Clone, Debug)]
+pub struct ArchiveBatch {
+    /// Seconds since the epoch when the batch was archived.
+    pub at: i64,
+    /// Why it was archived: `posted`, `refused`, `dropped`, or `claude`.
+    pub kind: String,
+    pub comments: Vec<PendingComment>,
+}
+
 /// One comment inside a GitHub review thread.
 #[derive(Clone, Debug)]
 pub struct ThreadComment {
@@ -228,6 +238,9 @@ pub enum Overlay {
     Ask { ta: TextArea },
     /// A yes/no confirmation before a destructive action.
     Confirm { prompt: String, kind: ConfirmKind },
+    /// The PR's archived comments, newest batch first; Enter puts a batch
+    /// back in the pending review.
+    Archive { batches: Vec<ArchiveBatch>, idx: usize, scroll: usize },
 }
 
 /// What a commit message overlay will produce.

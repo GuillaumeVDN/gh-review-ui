@@ -129,6 +129,10 @@ Pending comments pane:
 - `Enter` — open the submit-review modal
 - `e` — edit the highlighted comment (reopens the editor, updates it on GitHub)
 - `d` — discard the highlighted pending comment (deleted from the draft review on GitHub)
+- `H` — open the comment history: every batch the app archived for this PR
+  (posted, refused by GitHub, dropped at submit, or handed to Claude). `j`/`k`
+  picks a batch, `J`/`K` scrolls its comments, `Enter` puts the batch back in
+  the pending review so a submit that went wrong can go out again.
 
 While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.

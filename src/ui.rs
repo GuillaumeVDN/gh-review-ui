@@ -10,8 +10,8 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    CommitKind, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State, TreeRow,
-    SUBMIT_CHOICES,
+    ArchiveBatch, CommitKind, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State,
+    TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
     current_hunk_range, diff_path, edit_preview_path, focused_stop, hunk_for_comment, is_local_diff,
@@ -437,7 +437,7 @@ fn shortcuts_for(st: &State) -> String {
     match st.focus {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · g: open web · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
-        Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · {common}"),
+        Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
         Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · gg/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
@@ -654,7 +654,7 @@ fn render_pending(f: &mut Frame, st: &mut State, area: Rect) {
     f.render_widget(b, area);
     let focused = st.focus == Focus::Pending;
     if st.pending.is_empty() {
-        let msg = if is_loading(st) { "Loading…" } else { "No pending comments" };
+        let msg = if is_loading(st) { "Loading…" } else { "No pending comments · H: history" };
         f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
         return;
     }
@@ -1044,6 +1044,27 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// The `y-m-d` of a day count from 1970-01-01, the inverse of [`days_from_civil`].
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// An epoch stamp as `2024-05-01 12:34` UTC.
+pub fn format_stamp(at: i64) -> String {
+    let (y, m, d) = civil_from_days(at.div_euclid(86_400));
+    let secs = at.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
 /// Seconds since the epoch of an ISO-8601 UTC stamp (`2024-05-01T12:34:56Z`).
@@ -1679,6 +1700,70 @@ fn render_hooks(f: &mut Frame, area: Rect, title: &str, lines: &[String], failed
     );
 }
 
+/// The archive modal: the batches on the left, the selected batch's comments
+/// on the right.
+fn render_archive(f: &mut Frame, area: Rect, batches: &[ArchiveBatch], idx: usize, scroll: usize) {
+    let rect = centered(area, 110.min(area.width.saturating_sub(4)), 30.min(area.height.saturating_sub(4)));
+    let b = block("Comment history", true, false);
+    let inner = b.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(b, rect);
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let list_w = 34.min(inner.width / 2);
+    let list = Rect { width: list_w, height: body_h as u16, ..inner };
+    let detail_x = inner.x + list_w + 1;
+    let detail = Rect { x: detail_x, width: inner.width.saturating_sub(list_w + 1), height: body_h as u16, ..inner };
+
+    let idx = idx.min(batches.len().saturating_sub(1));
+    let first = idx.saturating_sub(body_h.saturating_sub(1));
+    let mut rows = Vec::new();
+    for (i, batch) in batches.iter().enumerate().skip(first).take(body_h) {
+        let n = batch.comments.len();
+        let text = format!("{} {:<7} {n}", format_stamp(batch.at), batch.kind);
+        let style = if i == idx { theme::selection() } else { archive_kind_style(&batch.kind) };
+        rows.push(Line::styled(pad(&text, list_w as usize), style));
+    }
+    f.render_widget(Paragraph::new(rows), list);
+    for y in inner.y..inner.y + body_h as u16 {
+        f.render_widget(
+            Paragraph::new(Line::styled("│", theme::dim())),
+            Rect { x: inner.x + list_w, y, width: 1, height: 1 },
+        );
+    }
+
+    if let Some(batch) = batches.get(idx) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for c in &batch.comments {
+            let loc = match c.start_line {
+                Some(s) => format!("{}:{s}-{}", c.path, c.line),
+                None => format!("{}:{}", c.path, c.line),
+            };
+            lines.push(Line::styled(loc, theme::focus()));
+            for (text, style) in thread_body_rows(&c.body, "  ", detail.width.max(1) as usize) {
+                lines.push(Line::styled(text, style));
+            }
+            lines.push(Line::from(""));
+        }
+        let scroll = scroll.min(lines.len().saturating_sub(1));
+        let shown: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(body_h).collect();
+        f.render_widget(Paragraph::new(shown), detail);
+    }
+
+    let help_y = inner.y + inner.height.saturating_sub(1);
+    f.render_widget(
+        Paragraph::new("j/k: batch · J/K: scroll · Enter: restore to pending · Esc: close").style(theme::keys()),
+        Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
+    );
+}
+
+fn archive_kind_style(kind: &str) -> Style {
+    match kind {
+        "posted" => theme::local_add(),
+        "refused" | "dropped" => theme::local_del(),
+        _ => theme::dim(),
+    }
+}
+
 fn render_overlay(f: &mut Frame, st: &State) {
     let area = f.area();
     match &st.overlay {
@@ -1726,6 +1811,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
                 Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
             );
         }
+        Overlay::Archive { batches, idx, scroll } => render_archive(f, area, batches, *idx, *scroll),
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));
             let title = format!("Finish review · {} pending comment{}", st.pending.len(), if st.pending.len() == 1 { "" } else { "s" });
@@ -1792,6 +1878,13 @@ mod tests {
         // Fractional seconds and a stamp we cannot read.
         assert_eq!(relative_time("2024-05-01T12:00:00.250Z", t0 + 60), "1m ago");
         assert_eq!(relative_time("yesterday", t0), "");
+    }
+
+    #[test]
+    fn an_archive_stamp_reads_as_a_date_and_time() {
+        assert_eq!(format_stamp(1_714_564_800), "2024-05-01 12:00");
+        assert_eq!(format_stamp(0), "1970-01-01 00:00");
+        assert_eq!(format_stamp(epoch_seconds("2031-12-31T23:59:59Z").unwrap()), "2031-12-31 23:59");
     }
 
     #[test]

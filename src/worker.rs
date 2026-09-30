@@ -28,6 +28,8 @@ pub enum Job {
     AddPending { owner: String, name: String, number: i64, login: String, pr_id: String, comment: PendingComment },
     DiscardPending { owner: String, name: String, number: i64, login: String, comment_id: String },
     EditPending { owner: String, name: String, number: i64, login: String, comment_id: String, body: String },
+    /// Put archived comments back on the pending review.
+    RestorePending { owner: String, name: String, number: i64, login: String, pr_id: String, comments: Vec<PendingComment> },
     SubmitReview { owner: String, name: String, number: i64, login: String, pr_id: String, event: String, body: String },
     PostLocalReview {
         owner: String,
@@ -111,6 +113,7 @@ pub fn job_tag(job: &Job) -> &'static str {
         Job::MarkViewed { .. } | Job::MarkViewedBulk { .. } => "viewed",
         Job::LoadPrDetails(_) => "details",
         Job::AddPending { .. } | Job::DiscardPending { .. } | Job::EditPending { .. } => "pending",
+        Job::RestorePending { .. } => "pending",
         Job::SubmitReview { .. } | Job::PostLocalReview { .. } => "review",
         Job::LoadEdits { .. } | Job::DiscardEdit { .. } | Job::Stage { .. } => "edits",
         Job::RevertHunk { .. } => "edits",
@@ -222,6 +225,24 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             api::update_pending_comment_api(comment_id, body)?;
             let pending = api::load_pending_comments(owner, name, *number, login)?;
             Msg::PendingList { pending, status: "Comment updated".into() }
+        }
+        Job::RestorePending { owner, name, number, login, pr_id, comments } => {
+            let review_id = api::ensure_pending_review(owner, name, *number, login, pr_id)?;
+            let (posted, refused) = api::post_review_comments(&review_id, comments);
+            let pending = api::load_pending_comments(owner, name, *number, login)?;
+            let status = if refused.is_empty() {
+                format!("Restored {} comment(s) to the pending review", posted.len())
+            } else {
+                let kept: Vec<PendingComment> = refused.iter().map(|(c, _)| c.clone()).collect();
+                let archive = api::archive_comments(owner, name, *number, "refused", &kept);
+                format!(
+                    "Restored {} comment(s), GitHub refused {} — kept in {}",
+                    posted.len(),
+                    refused.len(),
+                    archive.display()
+                )
+            };
+            Msg::PendingList { pending, status }
         }
         Job::SubmitReview { owner, name, number, login, pr_id, event, body } => {
             api::submit_review_api(owner, name, *number, login, pr_id, event, body)?;

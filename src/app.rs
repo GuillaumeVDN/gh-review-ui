@@ -231,7 +231,7 @@ fn overlay_ta(st: &mut State) -> Option<&mut TextArea> {
         | Overlay::Review { ta, .. }
         | Overlay::CommitMsg { ta, .. }
         | Overlay::Ask { ta } => Some(ta),
-        Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } => None,
+        Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } | Overlay::Archive { .. } => None,
     }
 }
 
@@ -352,6 +352,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('d') => controller::discard_selected_comment(st, tx),
+            KeyCode::Char('H') => controller::open_archive(st),
             _ => {}
         },
         Focus::Files => match k.code {
@@ -505,6 +506,19 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
         }
         return;
     }
+    // Archive: a list to walk, nothing to type into.
+    if matches!(st.overlay, Overlay::Archive { .. }) {
+        match k.code {
+            KeyCode::Enter => controller::restore_archive_batch(st, tx),
+            KeyCode::Down | KeyCode::Char('j') => controller::archive_move(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => controller::archive_move(st, -1),
+            KeyCode::PageDown | KeyCode::Char('J') => controller::archive_scroll(st, 10),
+            KeyCode::PageUp | KeyCode::Char('K') => controller::archive_scroll(st, -10),
+            KeyCode::Char('q') => st.overlay = Overlay::None,
+            _ => {}
+        }
+        return;
+    }
     // Yes/no confirmation.
     if matches!(st.overlay, Overlay::Confirm { .. }) {
         match k.code {
@@ -556,7 +570,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
                             *editing = false;
                         }
                     }
-                    Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } => {}
+                    Overlay::None | Overlay::Confirm { .. } | Overlay::Hooks { .. } | Overlay::Archive { .. } => {}
                 }
             }
         }

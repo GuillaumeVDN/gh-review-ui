@@ -984,6 +984,67 @@ pub fn delete_editing_comment(st: &mut State, tx: &Sender<Job>) {
     st.status = format!("Deleting comment on {path}:{line}…");
 }
 
+// ---- archive ----
+
+/// Open the PR's archive: every comment a submit, a refusal, or a hand-off to
+/// Claude wrote to disk.
+pub fn open_archive(st: &mut State) {
+    let Some(pr) = st.active_pr.as_ref() else {
+        st.status = "No active PR.".into();
+        return;
+    };
+    let batches = api::load_archive(&st.repo_owner, &st.repo_name, pr.number);
+    if batches.is_empty() {
+        st.status = "No archived comments for this PR.".into();
+        return;
+    }
+    st.overlay = Overlay::Archive { batches, idx: 0, scroll: 0 };
+}
+
+pub fn archive_move(st: &mut State, delta: i64) {
+    if let Overlay::Archive { batches, idx, scroll } = &mut st.overlay {
+        let last = batches.len().saturating_sub(1) as i64;
+        *idx = (*idx as i64 + delta).clamp(0, last) as usize;
+        *scroll = 0;
+    }
+}
+
+pub fn archive_scroll(st: &mut State, delta: i64) {
+    if let Overlay::Archive { scroll, .. } = &mut st.overlay {
+        *scroll = (*scroll as i64 + delta).max(0) as usize;
+    }
+}
+
+/// Put the selected batch back in the pending review, so a submit that went
+/// wrong can go out again.
+pub fn restore_archive_batch(st: &mut State, tx: &Sender<Job>) {
+    let overlay = std::mem::replace(&mut st.overlay, Overlay::None);
+    let Overlay::Archive { batches, idx, .. } = overlay else { return };
+    let Some(batch) = batches.into_iter().nth(idx) else { return };
+    let Some(pr) = st.active_pr.clone() else { return };
+    let n = batch.comments.len();
+    if st.local_mode {
+        for mut c in batch.comments {
+            c.comment_id = local_comment_id();
+            st.pending.push(c);
+        }
+        save_local(st);
+        st.status = format!("Restored {n} archived comment(s)");
+        return;
+    }
+    let comments: Vec<PendingComment> = batch
+        .comments
+        .into_iter()
+        .map(|mut c| {
+            c.comment_id = String::new();
+            c
+        })
+        .collect();
+    let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
+    st.status = format!("Restoring {n} archived comment(s) to the pending review…");
+    submit(st, tx, Job::RestorePending { owner, name, number: pr.number, login, pr_id: pr.node_id, comments });
+}
+
 // ---- finish review ----
 
 pub fn begin_review(st: &mut State) {
@@ -2196,6 +2257,53 @@ mod tests {
         assert!(st.pending.is_empty());
         assert_eq!(st.pending_idx, 0);
         assert_eq!(rx.try_iter().count(), 0, "a local store needs no API call");
+    }
+
+    fn archive_overlay(comments: Vec<PendingComment>) -> Overlay {
+        let batch = crate::models::ArchiveBatch { at: 10, kind: "posted".into(), comments };
+        Overlay::Archive { batches: vec![batch], idx: 0, scroll: 0 }
+    }
+
+    /// An archived comment carries the id of a comment that is gone. Restored
+    /// locally it needs a fresh local id, or an edit would look for the old one.
+    #[test]
+    fn a_restored_batch_joins_the_local_drafts_under_new_ids() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.local_mode = true;
+        st.repo_owner = "o".into();
+        st.repo_name = "n".into();
+        st.pending = vec![comment("a.rs", 1)];
+        st.overlay = archive_overlay(vec![comment("b.rs", 2), comment("c.rs", 3)]);
+
+        restore_archive_batch(&mut st, &tx);
+        assert!(matches!(st.overlay, Overlay::None));
+        let paths: Vec<&str> = st.pending.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+        assert!(st.pending[1].comment_id.starts_with("local-"), "{}", st.pending[1].comment_id);
+        assert_eq!(rx.try_iter().count(), 0, "a local store needs no API call");
+    }
+
+    /// On GitHub the batch goes back through the API, as new comments.
+    #[test]
+    fn a_restored_batch_is_posted_to_the_pending_review() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.local_mode = false;
+        st.overlay = archive_overlay(vec![comment("b.rs", 2), comment("c.rs", 3)]);
+
+        restore_archive_batch(&mut st, &tx);
+        assert!(matches!(st.overlay, Overlay::None));
+        assert!(st.busy.contains("pending"));
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        let [Job::RestorePending { number, comments, .. }] = jobs.as_slice() else {
+            panic!("one restore job, got {}", jobs.len());
+        };
+        assert_eq!(*number, 7);
+        assert_eq!(comments.len(), 2);
+        assert!(comments.iter().all(|c| c.comment_id.is_empty()), "GitHub assigns the ids");
     }
 
     /// A GitHub-side draft is not ours to just forget: clearing the list alone

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::diff::parse_diff;
 use crate::gh::{gh_graphql, gh_json, sh, sh_cwd, Var};
 use crate::models::{
-    Category, Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr, ReviewThread,
+    ArchiveBatch, Category, Commit, CommitKind, FileEntry, LineInfo, PendingComment, Pr, ReviewThread,
     ThreadComment,
 };
 
@@ -1337,6 +1337,31 @@ pub fn archive_comments(
     path
 }
 
+/// The PR's archive, one batch per archive call, newest first.
+pub fn load_archive(owner: &str, name: &str, number: i64) -> Vec<ArchiveBatch> {
+    let Ok(text) = std::fs::read_to_string(archive_path(owner, name, number)) else { return Vec::new() };
+    batches_from_jsonl(&text)
+}
+
+/// Group archive lines into batches. One archive call stamps all its lines
+/// with the same second and kind, so consecutive lines that share both belong
+/// together.
+fn batches_from_jsonl(text: &str) -> Vec<ArchiveBatch> {
+    let mut out: Vec<ArchiveBatch> = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(comment) = comment_from_json(&v["comment"]) else { continue };
+        let at = v["at"].as_i64().unwrap_or(0);
+        let kind = v["kind"].as_str().unwrap_or("").to_string();
+        match out.last_mut() {
+            Some(b) if b.at == at && b.kind == kind => b.comments.push(comment),
+            _ => out.push(ArchiveBatch { at, kind, comments: vec![comment] }),
+        }
+    }
+    out.reverse();
+    out
+}
+
 pub fn save_local_comments(owner: &str, name: &str, number: i64, comments: &[PendingComment]) {
     let path = local_comments_path(owner, name, number);
     if let Some(parent) = path.parent() {
@@ -1409,6 +1434,23 @@ mod tests {
         assert!(lines[2].contains("\"path\":\"c\""), "{}", lines[2]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_archive_reads_back_as_batches_newest_first() {
+        let text = concat!(
+            "{\"at\":10,\"kind\":\"posted\",\"comment\":{\"path\":\"a\",\"line\":1,\"body\":\"x\"}}\n",
+            "{\"at\":10,\"kind\":\"posted\",\"comment\":{\"path\":\"b\",\"line\":2,\"body\":\"y\"}}\n",
+            "{\"at\":10,\"kind\":\"refused\",\"comment\":{\"path\":\"c\",\"line\":3,\"body\":\"z\"}}\n",
+            "not json\n",
+            "{\"at\":20,\"kind\":\"claude\",\"comment\":{\"path\":\"d\",\"line\":4,\"body\":\"w\"}}\n",
+        );
+        let batches = batches_from_jsonl(text);
+        let shape: Vec<(i64, &str, usize)> =
+            batches.iter().map(|b| (b.at, b.kind.as_str(), b.comments.len())).collect();
+        assert_eq!(shape, vec![(20, "claude", 1), (10, "refused", 1), (10, "posted", 2)]);
+        assert_eq!(batches[2].comments[1].path, "b");
+        assert_eq!(batches[2].comments[1].body, "y");
     }
 
     #[test]
