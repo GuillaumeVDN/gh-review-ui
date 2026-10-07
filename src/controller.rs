@@ -291,8 +291,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             for p in &paths {
                 st.viewed_by_path.insert(p.clone(), viewed);
             }
-            st.viewed_inflight = None;
-            st.busy.remove("viewed");
+            st.viewed_inflight.pop_front();
+            settle_viewed(st);
             st.status = format!("{} {} file{}", if viewed { "Marked" } else { "Unmarked" }, paths.len(), if paths.len() == 1 { "" } else { "s" });
         }
         Msg::ViewedBulk { done, viewed, errs } => {
@@ -304,20 +304,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             for p in &done {
                 st.viewed_by_path.insert(p.clone(), viewed);
             }
-            // Revert any optimistically-marked path that didn't actually succeed.
-            if let Some((paths, target)) = st.viewed_inflight.take() {
-                for f in st.files.iter_mut() {
-                    if paths.contains(&f.path) && !done.contains(&f.path) {
-                        f.viewed = !target;
-                    }
-                }
-                for p in &paths {
-                    if !done.contains(p) {
-                        st.viewed_by_path.insert(p.clone(), !target);
-                    }
-                }
+            if let Some((paths, target)) = st.viewed_inflight.pop_front() {
+                let failed: Vec<String> = paths.into_iter().filter(|p| !done.contains(p)).collect();
+                revert_viewed(st, &failed, target);
             }
-            st.busy.remove("viewed");
+            settle_viewed(st);
             st.status = format!("{} {}, {} failed", if viewed { "Marked" } else { "Unmarked" }, done.len(), errs);
         }
         Msg::PrDetails { number, data } => {
@@ -449,7 +440,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             }
         }
         Msg::Error { kind, msg } => {
-            st.busy.remove(&kind);
+            if kind != "viewed" {
+                st.busy.remove(&kind);
+            }
             if kind == "edits" {
                 st.stage_advance = false;
             }
@@ -461,18 +454,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     *title = msg.clone();
                 }
             }
-            // Roll back an optimistic viewed change that failed on the server.
             if kind == "viewed" {
-                if let Some((paths, target)) = st.viewed_inflight.take() {
-                    for f in st.files.iter_mut() {
-                        if paths.contains(&f.path) {
-                            f.viewed = !target;
-                        }
-                    }
-                    for p in &paths {
-                        st.viewed_by_path.insert(p.clone(), !target);
-                    }
+                if let Some((paths, target)) = st.viewed_inflight.pop_front() {
+                    revert_viewed(st, &paths, target);
                 }
+                settle_viewed(st);
             }
             st.status = format!("[{kind}] {msg}");
         }
@@ -1187,7 +1173,7 @@ pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
 /// The mark itself. `Some(true)` when it turned the target viewed, which is
 /// what makes the cursor move on.
 fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
-    if st.file_idx >= st.tree.len() || st.active_pr.is_none() || st.busy.contains("viewed") {
+    if st.file_idx >= st.tree.len() || st.active_pr.is_none() {
         return None;
     }
     let pr_id = st.active_pr.as_ref().unwrap().node_id.clone();
@@ -1206,7 +1192,7 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
                 );
                 return Some(new_v);
             }
-            st.viewed_inflight = Some((vec![path.clone()], new_v));
+            st.viewed_inflight.push_back((vec![path.clone()], new_v));
             st.status = format!("{} {path}…", if new_v { "Marking" } else { "Unmarking" });
             submit(st, tx, Job::MarkViewed { pr_id, path, viewed: new_v });
             Some(new_v)
@@ -1246,11 +1232,32 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
                 st.status = format!("{verb} {} files in {path}/{note}", local_only.len());
                 return Some(new_v);
             }
-            st.viewed_inflight = Some((on_pr.clone(), new_v));
+            st.viewed_inflight.push_back((on_pr.clone(), new_v));
             st.status = format!("{verb} {} files in {path}/…{note}", on_pr.len());
             submit(st, tx, Job::MarkViewedBulk { pr_id, paths: on_pr, viewed: new_v });
             Some(new_v)
         }
+    }
+}
+
+/// Undo the optimistic mark on `paths` that the server refused. A mark still
+/// queued for a path is the newer intent, so it keeps its value.
+fn revert_viewed(st: &mut State, paths: &[String], target: bool) {
+    let queued: std::collections::HashSet<&String> = st.viewed_inflight.iter().flat_map(|(p, _)| p).collect();
+    let failed: Vec<String> = paths.iter().filter(|p| !queued.contains(p)).cloned().collect();
+    for f in st.files.iter_mut() {
+        if failed.contains(&f.path) {
+            f.viewed = !target;
+        }
+    }
+    for p in failed {
+        st.viewed_by_path.insert(p, !target);
+    }
+}
+
+fn settle_viewed(st: &mut State) {
+    if st.viewed_inflight.is_empty() {
+        st.busy.remove("viewed");
     }
 }
 
@@ -2108,7 +2115,7 @@ mod tests {
         assert!(st.files[1].viewed, "the mark still lands");
         assert_eq!(st.viewed_by_path.get("local.rs"), Some(&true));
         assert!(rx.try_iter().next().is_none(), "and nothing was sent to GitHub");
-        assert!(st.viewed_inflight.is_none(), "so there is nothing to revert");
+        assert!(st.viewed_inflight.is_empty(), "so there is nothing to revert");
 
         st.file_idx = st
             .tree
@@ -2121,6 +2128,44 @@ mod tests {
             jobs.iter().any(|j| matches!(j, Job::MarkViewed { path, .. } if path == "on_pr.rs")),
             "a file the PR has goes to the API as before"
         );
+    }
+
+    /// A mark does not wait for the one before it: both go to the worker, and
+    /// a refusal reverts only the mark it answers.
+    #[test]
+    fn marks_queue_while_one_is_in_flight() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.pr_paths = ["a.rs".to_string(), "b.rs".to_string()].into_iter().collect();
+        st.files = vec![
+            FileEntry { path: "a.rs".into(), viewed: false },
+            FileEntry { path: "b.rs".into(), viewed: false },
+        ];
+        st.tree = vec![
+            TreeRow::File { index: 0, depth: 0, name: "a.rs".into() },
+            TreeRow::File { index: 1, depth: 0, name: "b.rs".into() },
+        ];
+
+        for i in 0..2 {
+            st.file_idx = st
+                .tree
+                .iter()
+                .position(|r| matches!(r, TreeRow::File { index, .. } if *index == i))
+                .unwrap();
+            mark_viewed(&mut st, &tx);
+        }
+        assert_eq!(rx.try_iter().count(), 2);
+        assert_eq!(st.viewed_inflight.len(), 2);
+
+        apply_msg(&mut st, Msg::Error { kind: "viewed".into(), msg: "boom".into() }, &tx);
+        assert!(!st.files[0].viewed, "the refused mark is reverted");
+        assert!(st.files[1].viewed, "the queued mark stands");
+        assert!(st.busy.contains("viewed"));
+
+        apply_msg(&mut st, Msg::ViewedOk { paths: vec!["b.rs".into()], viewed: true }, &tx);
+        assert!(st.files[1].viewed);
+        assert!(!st.busy.contains("viewed"));
     }
 
     /// git decides what is staged, so the jump waits for the reload the stage

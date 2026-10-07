@@ -313,9 +313,9 @@ pub struct State {
     /// these can be marked viewed there, and that answer must not move.
     pub pr_paths: HashSet<String>,
     pub viewed_by_path: HashMap<String, bool>,
-    /// In-flight optimistic viewed change: (paths, target value), so a failed
-    /// mark can be reverted.
-    pub viewed_inflight: Option<(Vec<String>, bool)>,
+    /// In-flight optimistic viewed changes, oldest first: (paths, target value),
+    /// so a failed mark can be reverted. The single worker answers them in order.
+    pub viewed_inflight: std::collections::VecDeque<(Vec<String>, bool)>,
     pub collapsed_dirs: HashSet<String>,
     pub tree: Vec<TreeRow>,
     pub file_idx: usize,
