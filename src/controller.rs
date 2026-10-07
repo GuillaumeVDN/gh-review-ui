@@ -1109,10 +1109,10 @@ fn build_review_prompt(st: &State, body: &str) -> String {
             None => c.line.to_string(),
         };
         s.push_str(&format!("### {}:{loc}\n", c.path));
-        let (hunk, _) = crate::navigation::hunk_for_comment(st, c);
-        if !hunk.is_empty() {
+        let excerpt = diff_excerpt(st, c);
+        if !excerpt.is_empty() {
             s.push_str("```diff\n");
-            for l in &hunk {
+            for l in &excerpt {
                 s.push_str(l);
                 s.push('\n');
             }
@@ -1121,6 +1121,28 @@ fn build_review_prompt(st: &State, body: &str) -> String {
         s.push_str(&format!("Comment: {}\n\n", c.body));
     }
     s
+}
+
+/// Lines of diff kept on each side of a comment in the prompt.
+const PROMPT_CONTEXT: usize = 3;
+
+/// The commented lines with a few lines of diff around them. A whole hunk is
+/// mostly noise to Claude, and a long one buries the comment.
+fn diff_excerpt(st: &State, c: &PendingComment) -> Vec<String> {
+    let (hunk, Some(end)) = crate::navigation::hunk_for_comment(st, c) else { return Vec::new() };
+    let start = match c.start_line {
+        Some(sl) => {
+            let first = PendingComment { line: sl, side: c.start_side.clone(), ..c.clone() };
+            match crate::navigation::hunk_for_comment(st, &first) {
+                (h, Some(i)) if h.len() == hunk.len() && h[0] == hunk[0] => i.min(end),
+                _ => end,
+            }
+        }
+        None => end,
+    };
+    let lo = start.saturating_sub(PROMPT_CONTEXT);
+    let hi = (end + PROMPT_CONTEXT + 1).min(hunk.len());
+    hunk[lo..hi].to_vec()
 }
 
 // ---- files pane helpers ----
@@ -2781,6 +2803,42 @@ mod tests {
         assert!(p.contains("overall note"));
         assert!(p.contains("x.rs:10") && p.contains("fix this"));
         assert!(p.contains("y.rs:3-5") && p.contains("and that"));
+    }
+
+    /// The prompt shows the commented lines and a few around them, never the
+    /// whole hunk.
+    #[test]
+    fn review_prompt_trims_the_hunk_around_the_comment() {
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        let lines: Vec<String> = std::iter::once("@@ -1,20 +1,20 @@".to_string())
+            .chain((1..=20).map(|i| format!(" line{i}")))
+            .collect();
+        let info: Vec<(Option<i64>, Option<i64>)> =
+            std::iter::once((None, None)).chain((1..=20).map(|i| (Some(i), Some(i)))).collect();
+        st.diff_by_file.insert("x.rs".into(), lines);
+        st.info_by_file.insert("x.rs".into(), info);
+        st.hunks_by_file.insert("x.rs".into(), vec![(0, 21)]);
+        st.pending = vec![
+            PendingComment {
+                path: "x.rs".into(), body: "fix".into(), line: 10,
+                side: "RIGHT".into(), comment_id: String::new(),
+                start_line: None, start_side: String::new(),
+            },
+            PendingComment {
+                path: "x.rs".into(), body: "range".into(), line: 16,
+                side: "RIGHT".into(), comment_id: String::new(),
+                start_line: Some(14), start_side: "RIGHT".into(),
+            },
+        ];
+        let p = build_review_prompt(&st, "");
+        let first = p.split("### ").nth(1).unwrap();
+        assert!(first.contains(" line7\n") && first.contains(" line13\n"));
+        assert!(!first.contains(" line6\n") && !first.contains(" line14\n"));
+        assert!(!first.contains("@@"));
+        let second = p.split("### ").nth(2).unwrap();
+        assert!(second.contains(" line11\n") && second.contains(" line19\n"));
+        assert!(!second.contains(" line10\n") && !second.contains(" line20\n"));
     }
 
     /// The socket hands us a path; finding its row is what turns that into a
