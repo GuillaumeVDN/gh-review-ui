@@ -215,6 +215,9 @@ whitespace stays in the tree with an empty diff. The local diff of the Pending
 edits pane always keeps its whitespace, because its hunks are staged and
 reverted as they are.
 
+The app remembers the `s` and `w` modes across sessions, in
+`~/.cache/gh-review-ui/view.json`.
+
 `s` draws the diff side by side: the old side on the left, the new side on the
 right, and the left panes shrink to make room. Each deletion sits across from
 the addition that replaces it; an unpaired change leaves the other column empty.

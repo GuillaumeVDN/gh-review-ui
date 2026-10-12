@@ -65,6 +65,8 @@ fn event_loop(
     }
     st.repo_root = api::get_repo_root();
     st.viewer = api::get_viewer_login();
+    let mut prev_view = api::load_view_modes();
+    (st.side_by_side, st.ignore_whitespace) = prev_view;
 
     // Listen for another tool asking us to show a file. Held for the whole run:
     // dropping it removes the socket.
@@ -125,6 +127,10 @@ fn event_loop(
         }
         prev_pr = st.pr_idx;
         prev_focus = Some(st.focus);
+        if (st.side_by_side, st.ignore_whitespace) != prev_view {
+            prev_view = (st.side_by_side, st.ignore_whitespace);
+            api::save_view_modes(prev_view);
+        }
 
         // Detect a closed per-worktree editor; ungroup once the last one is gone.
         poll_worktree_editors(&mut st);

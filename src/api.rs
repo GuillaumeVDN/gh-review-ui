@@ -1417,6 +1417,27 @@ pub fn load_last_pr(owner: &str, name: &str) -> Option<i64> {
     data.get(format!("{owner}/{name}")).and_then(|v| v.as_i64())
 }
 
+fn view_file() -> PathBuf {
+    session_file().with_file_name("view.json")
+}
+
+/// The diff modes the last session left on: side by side, and whitespace hidden.
+pub fn load_view_modes() -> (bool, bool) {
+    let data: Option<Value> =
+        std::fs::read_to_string(view_file()).ok().and_then(|s| serde_json::from_str(&s).ok());
+    let flag = |key: &str| data.as_ref().and_then(|d| d[key].as_bool()).unwrap_or(false);
+    (flag("side_by_side"), flag("ignore_whitespace"))
+}
+
+pub fn save_view_modes((side_by_side, ignore_whitespace): (bool, bool)) {
+    let path = view_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let data = json!({ "side_by_side": side_by_side, "ignore_whitespace": ignore_whitespace });
+    std::fs::write(&path, data.to_string()).ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
