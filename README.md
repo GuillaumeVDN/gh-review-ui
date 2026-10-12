@@ -64,6 +64,7 @@ Global:
 - `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending edits → Pending comments → Diff)
 - `0`…`5` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending edits, `5` Pending comments)
 - `q` — quit
+- `g` — open the PR on GitHub: the selected PR in the PRs pane, the open PR elsewhere
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
   focused, otherwise the diff (works from any pane)

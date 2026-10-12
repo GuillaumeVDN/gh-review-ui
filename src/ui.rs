@@ -433,12 +433,12 @@ pub fn render(f: &mut Frame, st: &mut State) {
 }
 
 fn shortcuts_for(st: &State) -> String {
-    let common = "r: refresh · q: quit";
+    let common = "g: open web · r: refresh · q: quit";
     match st.focus {
-        Focus::Prs => format!("Enter: open (worktree) · C: checkout local · g: open web · {common}"),
+        Focus::Prs => format!("Enter: open (worktree) · C: checkout local · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · gg/G · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · Home/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")

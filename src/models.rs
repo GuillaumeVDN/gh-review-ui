@@ -345,9 +345,6 @@ pub struct State {
     /// Path → local change kind, for coloring edited files in [3] and [4].
     pub edit_kind_by_path: HashMap<String, EditKind>,
 
-    /// First `g` of a pending `gg` (jump-to-top) chord, in the tree panes.
-    pub pending_g: bool,
-
     /// Per-worktree Neovim sockets we launched (value = confirmed-alive at least
     /// once), and whether we created the Hyprland window group ourselves — both
     /// used to tear things down on exit / when the editor is closed.

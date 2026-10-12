@@ -244,10 +244,6 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         handle_comment_mode(st, tx, k);
         return;
     }
-    // Reset a half-typed `gg` chord on any other key.
-    if !matches!(k.code, KeyCode::Char('g')) {
-        st.pending_g = false;
-    }
     match k.code {
         KeyCode::Char('q') => st.should_quit = true,
         KeyCode::Char(c @ '0'..='5') => {
@@ -272,6 +268,7 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         KeyCode::Tab => st.focus = st.focus.next(),
         KeyCode::BackTab => st.focus = st.focus.prev(),
         KeyCode::Char('r') => refresh(st, tx),
+        KeyCode::Char('g') => open_pr_browser(st),
         _ => handle_pane_key(st, tx, k, area),
     }
 }
@@ -326,7 +323,6 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('C') => checkout_local(st, tx),
-            KeyCode::Char('g') => open_pr_browser(st),
             _ => {}
         },
         Focus::Commits => match k.code {
@@ -360,14 +356,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char('k') if alt => jump_file(st, -1),
             KeyCode::Down | KeyCode::Char('j') => set_file_idx(st, st.file_idx + 1),
             KeyCode::Up | KeyCode::Char('k') => set_file_idx(st, st.file_idx.saturating_sub(1)),
-            KeyCode::Char('g') => {
-                if st.pending_g {
-                    set_file_idx(st, 0);
-                    st.pending_g = false;
-                } else {
-                    st.pending_g = true;
-                }
-            }
+            KeyCode::Home => set_file_idx(st, 0),
             KeyCode::Char('G') => set_file_idx(st, st.tree.len().saturating_sub(1)),
             KeyCode::Enter => open_file_or_dir(st),
             KeyCode::Char(' ') => controller::mark_viewed(st, tx),
@@ -386,14 +375,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char('k') if alt => jump_edit_file(st, -1),
             KeyCode::Down | KeyCode::Char('j') => set_edit_idx(st, st.edit_idx + 1),
             KeyCode::Up | KeyCode::Char('k') => set_edit_idx(st, st.edit_idx.saturating_sub(1)),
-            KeyCode::Char('g') => {
-                if st.pending_g {
-                    set_edit_idx(st, 0);
-                    st.pending_g = false;
-                } else {
-                    st.pending_g = true;
-                }
-            }
+            KeyCode::Home => set_edit_idx(st, 0),
             KeyCode::Char('G') => set_edit_idx(st, st.edit_tree.len().saturating_sub(1)),
             KeyCode::Char('z') => controller::fold_staged(st),
             KeyCode::PageDown => st.edit_diff_scroll += page,
@@ -764,10 +746,11 @@ fn open_file_or_dir(st: &mut State) {
 }
 
 fn open_pr_browser(st: &mut State) {
-    if st.prs.is_empty() {
-        return;
-    }
-    let number = st.prs[st.pr_idx].number;
+    let number = match (&st.active_pr, st.prs.get(st.pr_idx)) {
+        (Some(active), _) if st.focus != Focus::Prs => active.number,
+        (_, Some(selected)) => selected.number,
+        _ => return,
+    };
     editor::open_pr_in_browser(&st.repo_owner, &st.repo_name, number);
     st.status = format!("Opening #{number} in browser…");
 }
