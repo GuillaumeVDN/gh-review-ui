@@ -380,6 +380,8 @@ pub struct State {
     /// The review diff draws side by side (old left, new right) instead of
     /// inline. `diff_scroll` counts side-by-side rows while this is set.
     pub side_by_side: bool,
+    /// The review diff hides the changes that only touch whitespace.
+    pub ignore_whitespace: bool,
 
     // In-hunk comment picker.
     pub comment_mode: bool,

@@ -107,6 +107,7 @@ Files pane:
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
 - `e` — open the selected file in the editor (top of file)
 - `s` — switch the diff between inline and side by side
+- `w` — hide / show the changes that only touch whitespace
 - `Enter` — open file in the diff pane (folder: collapse / expand)
 
 Pending edits pane (local, uncommitted changes in the worktree). `--edits`
@@ -144,6 +145,7 @@ Diff pane:
 - `PgDn` / `PgUp` — page down / up
 - `c` — start the comment line picker on the enclosing block (see below)
 - `s` — switch the diff between inline and side by side
+- `w` — hide / show the changes that only touch whitespace (review diff only)
 - `e` — open the file in the editor at the current block's line
 - `Esc` — back to the files pane
 - on a **pending comment** of yours:
@@ -205,6 +207,13 @@ light set:
   question is asked before the first key is read;
 - else it reads `COLORFGBG` (`fg;bg`), which some terminals export;
 - else it takes the dark set.
+
+`w` hides the changes that only touch whitespace, like GitHub's "Hide
+whitespace". Git diffs the selected commits again with `-w`, so a re-indented
+block reads as the lines that really changed. A file whose whole change is
+whitespace stays in the tree with an empty diff. The local diff of the Pending
+edits pane always keeps its whitespace, because its hunks are staged and
+reverted as they are.
 
 `s` draws the diff side by side: the old side on the left, the new side on the
 right, and the left panes shrink to make room. Each deletion sits across from

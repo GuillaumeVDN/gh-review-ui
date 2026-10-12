@@ -256,23 +256,41 @@ pub fn parse_cat_file_batch(out: &[u8], asked: &[String]) -> crate::syntax::Blob
 /// A merge inside the range brings the other side's whole tree along, and a
 /// diff from the commit before the range would show everything it merged in.
 /// See [`range_bounds`] for how the range keeps to its own change.
-pub fn load_diff_range(wt: &str, first_oid: &str, last_oid: &str) -> Result<(Diff, Info)> {
+///
+/// `ignore_ws` hides the changes that only touch whitespace, the way GitHub's
+/// "Hide whitespace" does. A file whose whole change is whitespace keeps its
+/// header, so the tree still lists it and its viewed mark.
+pub fn load_diff_range(wt: &str, first_oid: &str, last_oid: &str, ignore_ws: bool) -> Result<(Diff, Info)> {
     let Some((from, paths)) = range_bounds(wt, first_oid, last_oid) else {
         return Ok((Diff::new(), Info::new()));
     };
-    let mut args: Vec<String> = vec![
-        "git".into(), "diff".into(),
-        format!("-U{DIFF_CONTEXT}"),
-        "--src-prefix=a/".into(), "--dst-prefix=b/".into(),
-        from, last_oid.into(),
-    ];
-    if let Some(paths) = paths {
-        args.push("--".into());
-        args.extend(paths);
+    let diff = |extra: &[&str]| -> Result<(Diff, Info)> {
+        let mut args: Vec<&str> = vec!["git", "diff"];
+        let context = format!("-U{DIFF_CONTEXT}");
+        args.extend([context.as_str(), "--src-prefix=a/", "--dst-prefix=b/"]);
+        args.extend_from_slice(extra);
+        args.extend([from.as_str(), last_oid]);
+        if let Some(paths) = &paths {
+            args.push("--");
+            args.extend(paths.iter().map(String::as_str));
+        }
+        Ok(parse_diff(&sh_cwd(wt, &args)?))
+    };
+    let (full, full_info) = diff(&[])?;
+    if !ignore_ws {
+        return Ok((full, full_info));
     }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw = sh_cwd(wt, &args)?;
-    Ok(parse_diff(&raw))
+    let (mut shown, mut shown_info) = diff(&["-w"])?;
+    for (path, lines) in full {
+        if shown.contains_key(&path) {
+            continue;
+        }
+        let header = lines.iter().take_while(|l| !l.starts_with("@@")).count();
+        let info = full_info.get(&path).map(|i| i[..header.min(i.len())].to_vec()).unwrap_or_default();
+        shown_info.insert(path.clone(), info);
+        shown.insert(path, lines[..header].to_vec());
+    }
+    Ok((shown, shown_info))
 }
 
 /// What to diff for `first_oid..last_oid`: the commit to start from, and the
@@ -1930,7 +1948,7 @@ mod range_diff_tests {
     #[test]
     fn the_whole_branch_diffs_from_what_it_merged_in() {
         let (root, [first, _, last]) = fixture("whole");
-        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &last).unwrap();
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &last, false).unwrap();
         let mut files: Vec<&String> = diff.keys().collect();
         files.sort();
         assert_eq!(files, ["feat.txt", "shared.txt"]);
@@ -1940,7 +1958,7 @@ mod range_diff_tests {
     #[test]
     fn a_range_after_the_merge_side_keeps_to_its_own_paths() {
         let (root, [_, merge, last]) = fixture("partial");
-        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &last).unwrap();
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &last, false).unwrap();
         let files: Vec<&String> = diff.keys().collect();
         assert_eq!(files, ["shared.txt"]);
         let _ = std::fs::remove_dir_all(&root);
@@ -1949,7 +1967,7 @@ mod range_diff_tests {
     #[test]
     fn a_merge_alone_shows_nothing_of_the_other_side() {
         let (root, [_, merge, _]) = fixture("merge");
-        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &merge).unwrap();
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &merge, &merge, false).unwrap();
         assert!(diff.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1957,9 +1975,35 @@ mod range_diff_tests {
     #[test]
     fn a_range_without_a_merge_diffs_from_the_commit_before() {
         let (root, [first, _, _]) = fixture("plain");
-        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &first).unwrap();
+        let (diff, _) = load_diff_range(root.to_str().unwrap(), &first, &first, false).unwrap();
         let files: Vec<&String> = diff.keys().collect();
         assert_eq!(files, ["feat.txt"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hiding_whitespace_keeps_a_whitespace_only_file_as_a_header() {
+        let root = std::env::temp_dir().join(format!("ghr-range-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(root.join("code.py"), "if x:\n    a()\n").unwrap();
+        commit(&root, "indent.txt", "a\n", "initial");
+        std::fs::write(root.join("code.py"), "if x:\n    if y:\n        a()\n").unwrap();
+        let last = commit(&root, "indent.txt", "  a\n", "indent");
+        let wt = root.to_str().unwrap();
+
+        let (diff, info) = load_diff_range(wt, &last, &last, true).unwrap();
+        let changed = |p: &str| -> Vec<String> {
+            diff[p].iter().filter(|l| crate::diff::is_add(l) || crate::diff::is_del(l)).cloned().collect()
+        };
+        assert_eq!(changed("code.py"), ["+    if y:"]);
+        assert!(changed("indent.txt").is_empty());
+        assert!(diff["indent.txt"][0].starts_with("diff --git "));
+        assert_eq!(diff["indent.txt"].len(), info["indent.txt"].len());
+
+        let (full, _) = load_diff_range(wt, &last, &last, false).unwrap();
+        assert_eq!(full["code.py"].iter().filter(|l| crate::diff::is_del(l)).count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

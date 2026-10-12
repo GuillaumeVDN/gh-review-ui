@@ -283,7 +283,8 @@ fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
             if !st.busy.contains("active") {
                 let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
                 let wt = st.active_worktree.clone();
-                controller::submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true });
+                let ignore_ws = st.ignore_whitespace;
+                controller::submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true, ignore_ws });
             }
         } else if !st.busy.contains("worktree") && !st.busy.contains("active") {
             let (repo_root, owner, name) = (st.repo_root.clone(), st.repo_owner.clone(), st.repo_name.clone());
@@ -368,6 +369,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             }
             KeyCode::Char('e') => editor::open_current_in_editor(st, true),
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
+            KeyCode::Char('w') => controller::toggle_whitespace(st, tx),
             _ => {}
         },
         Focus::Edits => match k.code {
@@ -416,6 +418,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 }
             }
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
+            KeyCode::Char('w') if st.local_diff_path.is_none() => controller::toggle_whitespace(st, tx),
             KeyCode::Esc => {
                 if st.local_diff_path.take().is_some() {
                     st.focus = Focus::Edits; // came from [4]

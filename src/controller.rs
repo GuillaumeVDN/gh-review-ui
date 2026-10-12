@@ -107,7 +107,8 @@ pub fn begin_open_local_pr(st: &mut State, tx: &Sender<Job>, pr: Pr) {
     st.status = format!("Reviewing #{} locally…", pr.number);
     let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
     let wt = st.active_worktree.clone();
-    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true });
+    let ignore_ws = st.ignore_whitespace;
+    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local: true, ignore_ws });
 }
 
 pub fn maybe_load_details(st: &mut State, tx: &Sender<Job>) {
@@ -151,7 +152,8 @@ pub fn apply_commit_selection(st: &mut State, tx: &Sender<Job>) {
         newest.short()
     );
     let wt = st.active_worktree.clone();
-    submit(st, tx, Job::LoadCommitDiff { wt, first: oldest.oid, last: newest.oid });
+    let ignore_ws = st.ignore_whitespace;
+    submit(st, tx, Job::LoadCommitDiff { wt, first: oldest.oid, last: newest.oid, ignore_ws });
 }
 
 pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
@@ -257,6 +259,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         }
         Msg::Painted(painting) => st.highlight.absorb(painting),
         Msg::CommitDiff { diff, info } => {
+            let here = cur_file_path(st);
             st.busy.remove("commitdiff");
             let mut paths: Vec<String> = diff.keys().cloned().collect();
             paths.sort();
@@ -267,9 +270,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.pr_files = st.files.clone();
             set_diff(st, diff, info);
             request_blobs(st, tx);
-            st.file_idx = 0;
             st.file_offset = 0;
             tree::rebuild(st);
+            st.file_idx = here.and_then(|p| file_row(st, &p)).unwrap_or(0);
             st.status = format!("Reviewing {} file{} in selected commits", st.files.len(), if st.files.len() == 1 { "" } else { "s" });
         }
         Msg::PrOpened { number, path } => {
@@ -279,7 +282,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             api::save_last_pr(&st.repo_owner, &st.repo_name, number);
             let (owner, name, login) = (st.repo_owner.clone(), st.repo_name.clone(), st.viewer.clone());
             let wt = st.active_worktree.clone();
-            submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(number), local: false });
+            let ignore_ws = st.ignore_whitespace;
+            submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(number), local: false, ignore_ws });
         }
         Msg::ViewedOk { paths, viewed } => {
             // Optimistic state already matches; just confirm and clear the record.
@@ -1477,6 +1481,22 @@ pub fn toggle_side_by_side(st: &mut State) {
     st.status = if sbs { "Diff side by side." } else { "Diff inline." }.into();
 }
 
+/// `w`: hide or show the changes that only touch whitespace in the review diff.
+///
+/// The diff comes from git again, for the commits the pane has selected.
+pub fn toggle_whitespace(st: &mut State, tx: &Sender<Job>) {
+    if st.active_pr.is_none() || st.busy.contains("active") || st.busy.contains("commitdiff") {
+        return;
+    }
+    st.ignore_whitespace = !st.ignore_whitespace;
+    st.status = if st.ignore_whitespace { "Hiding whitespace changes…" } else { "Showing whitespace changes…" }.into();
+    if st.commit_selected.len() < st.commits.len() {
+        apply_commit_selection(st, tx);
+    } else {
+        reload_active(st, tx);
+    }
+}
+
 /// Show the selected pending-edit file's local diff in [0] with hunk navigation.
 /// Enter in the Pending-edits pane: a file opens its diff, a folder folds.
 ///
@@ -1531,7 +1551,8 @@ pub fn reload_active(st: &mut State, tx: &Sender<Job>) {
         st.viewer.clone(),
     );
     let local = st.local_mode;
-    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local });
+    let ignore_ws = st.ignore_whitespace;
+    submit(st, tx, Job::LoadActive { wt, owner, name, login, number: Some(pr.number), local, ignore_ws });
 }
 
 /// Ask to revert the selected file's local change (confirmation before the
@@ -1822,7 +1843,8 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
             let first = wanted.last().cloned().unwrap_or_default();
             let last = wanted.first().cloned().unwrap_or_default();
             let wt = st.active_worktree.clone();
-            submit(st, tx, Job::LoadCommitDiff { wt, first, last });
+            let ignore_ws = st.ignore_whitespace;
+            submit(st, tx, Job::LoadCommitDiff { wt, first, last, ignore_ws });
         }
     }
 }
@@ -2706,6 +2728,28 @@ mod tests {
                 if first == "ffffff" && last == "ffffff")),
             "the diff was asked for from the checkout"
         );
+    }
+
+    #[test]
+    fn the_whitespace_toggle_reloads_the_whole_pr_or_the_selected_range() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(1));
+        st.commits = vec![commit("aaaaaaaaaaaa"), commit("bbbbbbbbbbbb")];
+        st.commit_selected = st.commits.iter().map(|c| c.oid.clone()).collect();
+
+        toggle_whitespace(&mut st, &tx);
+        assert!(st.ignore_whitespace);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(jobs.iter().any(|j| matches!(j, Job::LoadActive { ignore_ws: true, .. })));
+
+        st.busy.clear();
+        st.commit_selected = ["bbbbbbbbbbbb".to_string()].into_iter().collect();
+        toggle_whitespace(&mut st, &tx);
+        assert!(!st.ignore_whitespace);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(jobs.iter().any(|j| matches!(j, Job::LoadCommitDiff { first, ignore_ws: false, .. }
+            if first == "bbbbbbbbbbbb")));
     }
 
     /// A diff that shows every one of `paths`, which is what puts a file in

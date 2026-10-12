@@ -17,8 +17,8 @@ type Info = HashMap<String, Vec<LineInfo>>;
 pub enum Job {
     LoadPrs { repo_root: String },
     /// `wt` is the checkout under review: the worktree the PR was opened in.
-    LoadActive { wt: String, owner: String, name: String, login: String, number: Option<i64>, local: bool },
-    LoadCommitDiff { wt: String, first: String, last: String },
+    LoadActive { wt: String, owner: String, name: String, login: String, number: Option<i64>, local: bool, ignore_ws: bool },
+    LoadCommitDiff { wt: String, first: String, last: String, ignore_ws: bool },
     /// The file contents the diff's `index` lines name, for highlighting.
     LoadBlobs { wt: String, hashes: Vec<String> },
     OpenPr { repo_root: String, owner: String, name: String, number: i64, head: String },
@@ -127,7 +127,7 @@ pub fn job_tag(job: &Job) -> &'static str {
 fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
     Ok(match job {
         Job::LoadPrs { repo_root } => Msg::Prs(api::load_prs(repo_root)?),
-        Job::LoadActive { wt, owner, name, login, number, local } => match number {
+        Job::LoadActive { wt, owner, name, login, number, local, ignore_ws } => match number {
             None => Msg::Active {
                 number: None,
                 pr_id: String::new(),
@@ -143,7 +143,7 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 let (pr_id, files) = api::load_files(owner, name, *n)?;
                 let commits = api::load_commits(wt, *n).unwrap_or_default();
                 let (diff, info) = if let (Some(oldest), Some(newest)) = (commits.last(), commits.first()) {
-                    api::load_diff_range(wt, &oldest.oid, &newest.oid)?
+                    api::load_diff_range(wt, &oldest.oid, &newest.oid, *ignore_ws)?
                 } else {
                     api::load_diff(*n)?
                 };
@@ -151,7 +151,14 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
                 // then can what we show differ from what the PR has. It costs
                 // a second diff fetch, so it is not asked for otherwise.
                 let stale_viewed = if commits.iter().any(|c| !c.pushed) {
-                    api::diverged_from_pr(&diff, *n)
+                    // GitHub's diff keeps the whitespace, so the comparison needs it too.
+                    match (*ignore_ws, commits.last(), commits.first()) {
+                        (true, Some(oldest), Some(newest)) => {
+                            let (full, _) = api::load_diff_range(wt, &oldest.oid, &newest.oid, false)?;
+                            api::diverged_from_pr(&full, *n)
+                        }
+                        _ => api::diverged_from_pr(&diff, *n),
+                    }
                 } else {
                     HashSet::new()
                 };
@@ -180,8 +187,8 @@ fn run(job: &Job, tx: &Sender<Msg>) -> anyhow::Result<Msg> {
             }
         },
         Job::LoadBlobs { wt, hashes } => Msg::Blobs(api::load_blobs(wt, hashes)?),
-        Job::LoadCommitDiff { wt, first, last } => {
-            let (diff, info) = api::load_diff_range(wt, first, last)?;
+        Job::LoadCommitDiff { wt, first, last, ignore_ws } => {
+            let (diff, info) = api::load_diff_range(wt, first, last, *ignore_ws)?;
             Msg::CommitDiff { diff, info }
         }
         Job::OpenPr { repo_root, owner, name, number, head } => {

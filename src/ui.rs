@@ -438,19 +438,19 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · e: editor · z/Z: fold/unfold · Home/G · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · w: whitespace · e: editor · z/Z: fold/unfold · Home/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")
         }
         Focus::Diff => match focused_stop(st) {
             Some(Stop::Pending(_)) => {
-                format!("j/k: stop · Enter/e: edit comment · d: discard · c: comment · s: side by side · Esc: back · {common}")
+                format!("j/k: stop · Enter/e: edit comment · d: discard · c: comment · s: side by side · w: whitespace · Esc: back · {common}")
             }
             Some(Stop::Thread(_)) => {
-                format!("j/k: stop · Enter: answer · o: open in browser · c: comment · s: side by side · Esc: back · {common}")
+                format!("j/k: stop · Enter: answer · o: open in browser · c: comment · s: side by side · w: whitespace · Esc: back · {common}")
             }
-            _ => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+            _ => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · w: whitespace · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
         },
     }
 }
@@ -1215,8 +1215,9 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         (Some(p), false) => {
             let threads = st.threads.iter().filter(|t| &t.path == p).count();
             format!(
-                "[0] Diff — {p}{}{}{}",
+                "[0] Diff — {p}{}{}{}{}",
                 if sbs { "  · old | new" } else { "" },
+                if st.ignore_whitespace { "  · whitespace hidden" } else { "" },
                 if has_overlay { "  · +local edits" } else { "" },
                 match threads {
                     0 => String::new(),
