@@ -739,11 +739,13 @@ fn open_file_or_dir(st: &mut State) {
     match st.tree.get(st.file_idx).cloned() {
         Some(TreeRow::File { .. }) => {
             st.focus = Focus::Diff;
-            st.diff_scroll = 0;
-            st.diff_hunk_idx = 0;
-            st.diff_stop_idx = 0;
+            // `J` / `K` from this pane already move through the file's diff.
+            if st.local_diff_path.take().is_some() {
+                st.diff_scroll = 0;
+                st.diff_hunk_idx = 0;
+                st.diff_stop_idx = 0;
+            }
             st.diff_reveal_pending = true;
-            st.local_diff_path = None;
         }
         Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
         None => {}
