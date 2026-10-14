@@ -281,6 +281,13 @@ pub fn step_stop(st: &mut State, direction: i64) {
             st.diff_scroll = st.diff_scroll.saturating_sub(STOP_SCROLL);
             return;
         }
+        // The reveal of a tall stop puts its top on screen, so the last stop
+        // stays put rather than jump back to its start.
+        let last = diff_stops(st, &path).len().saturating_sub(1);
+        let at_edge = if direction > 0 { st.diff_stop_idx >= last } else { st.diff_stop_idx == 0 };
+        if at_edge && lo < v.end_line && hi > v.start_line {
+            return;
+        }
     }
     jump_stop(st, direction);
 }
@@ -442,6 +449,18 @@ mod tests {
         st.diff_view = DiffView { start_line: 25, end_line: 35 };
         step_stop(&mut st, 1);
         assert_eq!((st.diff_scroll, st.diff_stop_idx), (25, 1));
+    }
+
+    #[test]
+    fn the_last_tall_stop_keeps_its_scroll() {
+        let mut st = diff_state();
+        st.hunks_by_file.insert("f.py".into(), vec![(0, 35)]);
+        st.diff_by_file.get_mut("f.py").unwrap().resize(35, " x".into());
+        st.info_by_file.get_mut("f.py").unwrap().resize(35, (Some(1), Some(1)));
+        st.diff_scroll = 25;
+        st.diff_view = DiffView { start_line: 25, end_line: 35 };
+        step_stop(&mut st, 1);
+        assert_eq!((st.diff_scroll, st.diff_stop_idx, st.diff_reveal_pending), (25, 0, false));
     }
 
     #[test]
