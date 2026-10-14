@@ -10,7 +10,7 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    ArchiveBatch, CommitKind, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State,
+    ArchiveBatch, CommitKind, DiffView, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State,
     TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
@@ -122,6 +122,11 @@ fn reveal_again(scroll: usize, (lo, hi): (usize, usize), drawn: usize) -> Option
     }
     let next = (scroll + (hi - drawn)).min(lo);
     (next != scroll).then_some(next)
+}
+
+/// `J` / `K` move the diff stop from the Files pane too.
+fn reveals_stop(st: &State) -> bool {
+    matches!(st.focus, Focus::Diff | Focus::Files)
 }
 
 /// The scroll a stop starts its reveal from: the draw itself moves it on.
@@ -841,7 +846,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         None
     } else if st.comment_mode {
         Some((st.comment_line, st.comment_line + 1))
-    } else if focused {
+    } else if reveals_stop(st) {
         stop_reveal(st, path)
     } else {
         None
@@ -948,6 +953,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     };
 
     let mut out: Vec<Line> = Vec::new();
+    let mut whole = scroll;
     for _ in 0..REVEAL_TRIES {
         out = Vec::new();
         let mut top_done = false;
@@ -1015,11 +1021,18 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
             }
         }
         let drawn = if out.len() >= vh { drawn.saturating_sub(1) } else { drawn };
+        whole = drawn;
         match target.and_then(|t| reveal_again(scroll, t, drawn)) {
             Some(next) => scroll = next,
             None => break,
         }
     }
+    let first_line = |r: usize| rows.get(r).and_then(|r| [r.left, r.right].into_iter().flatten().min());
+    st.diff_view = DiffView {
+        start_line: first_line(scroll).unwrap_or(0),
+        end_line: first_line(whole).unwrap_or(n_lines),
+        next_scroll: whole,
+    };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
     f.render_widget(Paragraph::new(out), inner);
@@ -1256,7 +1269,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     } else if st.comment_mode {
         Some((st.comment_line, st.comment_line + 1))
     } else {
-        path.as_ref().filter(|_| focused).and_then(|p| stop_reveal(st, p))
+        path.as_ref().filter(|_| reveals_stop(st)).and_then(|p| stop_reveal(st, p))
     };
     // Scroll is by diff-line index; allow reaching the last line (which may wrap
     // into several rows) rather than clamping to len - vh.
@@ -1355,6 +1368,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     };
 
     let mut out: Vec<Line> = Vec::new();
+    let mut whole = scroll;
     for _ in 0..REVEAL_TRIES {
         out = Vec::new();
         let mut top_done = false;
@@ -1421,11 +1435,13 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
             i += 1;
         }
         let drawn = if out.len() >= vh { i.saturating_sub(1) } else { i };
+        whole = drawn;
         match target.and_then(|t| reveal_again(scroll, t, drawn)) {
             Some(next) => scroll = next,
             None => break,
         }
     }
+    st.diff_view = DiffView { start_line: scroll, end_line: whole, next_scroll: whole };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
     f.render_widget(Paragraph::new(out), inner);

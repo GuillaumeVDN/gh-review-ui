@@ -283,6 +283,17 @@ pub enum ConfirmKind {
     RevertHunk { path: String, patch: String, staged: bool },
 }
 
+/// What the last render of the review diff showed.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DiffView {
+    /// First diff line on screen.
+    pub start_line: usize,
+    /// First diff line not drawn whole.
+    pub end_line: usize,
+    /// The `diff_scroll` that puts `end_line` at the top.
+    pub next_scroll: usize,
+}
+
 #[derive(Default)]
 pub struct State {
     pub repo_owner: String,
@@ -377,6 +388,7 @@ pub struct State {
     /// Set when a keyboard action should scroll the selected hunk/comment into
     /// view on the next render; free scrolling (mouse/PgUp/Dn) leaves it unset.
     pub diff_reveal_pending: bool,
+    pub diff_view: DiffView,
     /// The review diff draws side by side (old left, new right) instead of
     /// inline. `diff_scroll` counts side-by-side rows while this is set.
     pub side_by_side: bool,

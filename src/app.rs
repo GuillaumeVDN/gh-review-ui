@@ -259,12 +259,12 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         }
         KeyCode::Char('J') => match st.focus {
             Focus::Prs => st.details_scroll += 1,
-            Focus::Files => nav::jump_stop(st, 1),
+            Focus::Files => nav::step_stop(st, 1),
             _ => nav::scroll_diff(st, 1),
         },
         KeyCode::Char('K') => match st.focus {
             Focus::Prs => st.details_scroll = st.details_scroll.saturating_sub(1),
-            Focus::Files => nav::jump_stop(st, -1),
+            Focus::Files => nav::step_stop(st, -1),
             _ => nav::scroll_diff(st, -1),
         },
         KeyCode::Tab => st.focus = st.focus.next(),
@@ -401,8 +401,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Diff => match k.code {
-            KeyCode::Down | KeyCode::Char('j') => nav::jump_stop(st, 1),
-            KeyCode::Up | KeyCode::Char('k') => nav::jump_stop(st, -1),
+            KeyCode::Down | KeyCode::Char('j') => nav::step_stop(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => nav::step_stop(st, -1),
             KeyCode::Char('d') => {
                 if !controller::discard_focused_comment(st, tx) {
                     controller::begin_discard_hunk(st);
