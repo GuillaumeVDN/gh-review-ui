@@ -290,8 +290,6 @@ pub struct DiffView {
     pub start_line: usize,
     /// First diff line not drawn whole.
     pub end_line: usize,
-    /// The `diff_scroll` that puts `end_line` at the top.
-    pub next_scroll: usize,
 }
 
 #[derive(Default)]

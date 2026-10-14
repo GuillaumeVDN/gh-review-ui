@@ -265,19 +265,20 @@ pub fn jump_stop(st: &mut State, direction: i64) {
     st.diff_reveal_pending = true;
 }
 
-/// `jump_stop`, except that a stop taller than the pane pages through itself
+const STOP_SCROLL: usize = 3;
+
+/// `jump_stop`, except that a stop taller than the pane scrolls through itself
 /// before the move to the next one.
 pub fn step_stop(st: &mut State, direction: i64) {
     let Some(path) = diff_path(st) else { return };
     let v = st.diff_view;
     if let Some((lo, hi)) = stop_reveal(st, &path) {
         if direction > 0 && lo < v.end_line && hi > v.end_line {
-            st.diff_scroll = v.next_scroll.max(st.diff_scroll + 1);
+            st.diff_scroll += STOP_SCROLL;
             return;
         }
         if direction < 0 && lo < v.start_line && hi > v.start_line {
-            let page = v.next_scroll.saturating_sub(st.diff_scroll).max(1);
-            st.diff_scroll = st.diff_scroll.saturating_sub(page);
+            st.diff_scroll = st.diff_scroll.saturating_sub(STOP_SCROLL);
             return;
         }
     }
@@ -426,19 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_taller_than_the_pane_pages_before_the_next_stop() {
+    fn a_stop_taller_than_the_pane_scrolls_before_the_next_stop() {
         let mut st = diff_state();
         st.hunks_by_file.insert("f.py".into(), vec![(0, 30), (30, 35)]);
         st.diff_by_file.get_mut("f.py").unwrap().resize(35, " x".into());
         st.info_by_file.get_mut("f.py").unwrap().resize(35, (Some(1), Some(1)));
-        st.diff_view = DiffView { start_line: 0, end_line: 10, next_scroll: 10 };
+        st.diff_view = DiffView { start_line: 0, end_line: 10 };
         step_stop(&mut st, 1);
-        assert_eq!((st.diff_scroll, st.diff_stop_idx), (10, 0));
-        st.diff_view = DiffView { start_line: 10, end_line: 20, next_scroll: 20 };
+        assert_eq!((st.diff_scroll, st.diff_stop_idx), (3, 0));
+        st.diff_view = DiffView { start_line: 3, end_line: 13 };
         step_stop(&mut st, -1);
         assert_eq!((st.diff_scroll, st.diff_stop_idx), (0, 0));
         st.diff_scroll = 25;
-        st.diff_view = DiffView { start_line: 25, end_line: 35, next_scroll: 35 };
+        st.diff_view = DiffView { start_line: 25, end_line: 35 };
         step_stop(&mut st, 1);
         assert_eq!((st.diff_scroll, st.diff_stop_idx), (25, 1));
     }

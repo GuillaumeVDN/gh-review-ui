@@ -143,7 +143,7 @@ target hunk (with the anchored line marked) and the comment body below it.
 Diff pane:
 - `j` / `k` / arrows — jump to next / previous **stop**: the change blocks and
   the comments drawn inline, in the order they read. A block taller than the
-  pane pages through itself first.
+  pane scrolls through itself first, three lines per press.
 - `PgDn` / `PgUp` — page down / up
 - `c` — start the comment line picker on the enclosing block (see below)
 - `s` — switch the diff between inline and side by side

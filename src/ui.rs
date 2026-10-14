@@ -1031,7 +1031,6 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     st.diff_view = DiffView {
         start_line: first_line(scroll).unwrap_or(0),
         end_line: first_line(whole).unwrap_or(n_lines),
-        next_scroll: whole,
     };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
@@ -1441,7 +1440,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
             None => break,
         }
     }
-    st.diff_view = DiffView { start_line: scroll, end_line: whole, next_scroll: whole };
+    st.diff_view = DiffView { start_line: scroll, end_line: whole };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
     f.render_widget(Paragraph::new(out), inner);
