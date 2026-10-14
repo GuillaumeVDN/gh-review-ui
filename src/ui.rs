@@ -124,8 +124,8 @@ fn reveal_again(scroll: usize, (lo, hi): (usize, usize), drawn: usize) -> Option
     (next != scroll).then_some(next)
 }
 
-/// `J` / `K` move the diff stop from the Files pane too.
-fn reveals_stop(st: &State) -> bool {
+/// `J` / `K` move the diff stop from the Files pane, so the stop shows there too.
+fn shows_stop(st: &State) -> bool {
     matches!(st.focus, Focus::Diff | Focus::Files)
 }
 
@@ -834,10 +834,10 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     let rows = crate::diff::side_by_side(diff_lines);
     let row_by_line = crate::diff::sbs_row_by_line(&rows, n_lines);
 
-    let focused = st.focus == Focus::Diff;
-    let sel = if focused && !st.comment_mode { focused_stop(st) } else { None };
+    let stop_shown = shows_stop(st);
+    let sel = if stop_shown && !st.comment_mode { focused_stop(st) } else { None };
     let on_comment = matches!(sel, Some(Stop::Pending(_) | Stop::Thread(_)));
-    let cur_hr = match focused && !on_comment {
+    let cur_hr = match stop_shown && !on_comment {
         true => current_hunk_range(st, path),
         false => None,
     };
@@ -846,7 +846,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         None
     } else if st.comment_mode {
         Some((st.comment_line, st.comment_line + 1))
-    } else if reveals_stop(st) {
+    } else if stop_shown {
         stop_reveal(st, path)
     } else {
         None
@@ -1254,11 +1254,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         return;
     }
 
-    let focused = st.focus == Focus::Diff;
+    let stop_shown = shows_stop(st);
     // The picker runs inside the selected block, so the block keeps the band.
-    let sel = if focused && !st.comment_mode { focused_stop(st) } else { None };
+    let sel = if stop_shown && !st.comment_mode { focused_stop(st) } else { None };
     let on_comment = matches!(sel, Some(Stop::Pending(_) | Stop::Thread(_)));
-    let cur_hr = match focused && !on_comment {
+    let cur_hr = match stop_shown && !on_comment {
         true => path.as_ref().and_then(|p| current_hunk_range(st, p)),
         false => None,
     };
@@ -1268,7 +1268,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     } else if st.comment_mode {
         Some((st.comment_line, st.comment_line + 1))
     } else {
-        path.as_ref().filter(|_| reveals_stop(st)).and_then(|p| stop_reveal(st, p))
+        path.as_ref().filter(|_| stop_shown).and_then(|p| stop_reveal(st, p))
     };
     // Scroll is by diff-line index; allow reaching the last line (which may wrap
     // into several rows) rather than clamping to len - vh.
