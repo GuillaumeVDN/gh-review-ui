@@ -67,8 +67,8 @@ Global:
 - `g` — open the PR on GitHub: the selected PR in the PRs pane, the open PR elsewhere
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
-  focused, otherwise the diff (works from any pane). From the Files pane, the
-  diff scrolls three lines per press.
+  focused, otherwise the diff (works from any pane). From the Files pane, they
+  jump to the next / previous stop in the diff, like `j` / `k` in the Diff pane.
 - `c` — comment on the current hunk (opens the line picker)
 - finish review — `Enter` in the Pending pane
 - mouse wheel — scroll the pane under the cursor (stops at the content edge)

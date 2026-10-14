@@ -257,30 +257,22 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
                 st.focus = f;
             }
         }
-        KeyCode::Char('J') => {
-            if st.focus == Focus::Prs {
-                st.details_scroll += 1;
-            } else {
-                nav::scroll_diff(st, shift_scroll_step(st.focus));
-            }
-        }
-        KeyCode::Char('K') => {
-            if st.focus == Focus::Prs {
-                st.details_scroll = st.details_scroll.saturating_sub(1);
-            } else {
-                nav::scroll_diff(st, -shift_scroll_step(st.focus));
-            }
-        }
+        KeyCode::Char('J') => match st.focus {
+            Focus::Prs => st.details_scroll += 1,
+            Focus::Files => nav::jump_stop(st, 1),
+            _ => nav::scroll_diff(st, 1),
+        },
+        KeyCode::Char('K') => match st.focus {
+            Focus::Prs => st.details_scroll = st.details_scroll.saturating_sub(1),
+            Focus::Files => nav::jump_stop(st, -1),
+            _ => nav::scroll_diff(st, -1),
+        },
         KeyCode::Tab => st.focus = st.focus.next(),
         KeyCode::BackTab => st.focus = st.focus.prev(),
         KeyCode::Char('r') => refresh(st, tx),
         KeyCode::Char('g') => open_pr_browser(st),
         _ => handle_pane_key(st, tx, k, area),
     }
-}
-
-fn shift_scroll_step(focus: Focus) -> i64 {
-    if focus == Focus::Files { 3 } else { 1 }
 }
 
 fn refresh(st: &mut State, tx: &mpsc::Sender<Job>) {
