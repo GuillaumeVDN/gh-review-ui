@@ -369,7 +369,15 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 crate::tree::rebuild(st);
                 st.status = "Unfolded all folders.".into();
             }
+            KeyCode::Char('e') if selected_is_file(st) => {
+                open_file_or_dir(st);
+                edit_focused_stop(st);
+            }
             KeyCode::Char('e') => editor::open_current_in_editor(st, true),
+            KeyCode::Char('c') if selected_is_file(st) => {
+                open_file_or_dir(st);
+                controller::enter_comment_mode(st);
+            }
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Char('w') => controller::toggle_whitespace(st, tx),
             _ => {}
@@ -414,11 +422,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Char('c') => controller::enter_comment_mode(st),
             KeyCode::Char('a') => controller::begin_ask(st),
-            KeyCode::Char('e') => {
-                if !controller::edit_focused_comment(st) {
-                    editor::open_current_in_editor(st, false);
-                }
-            }
+            KeyCode::Char('e') => edit_focused_stop(st),
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Char('w') if st.local_diff_path.is_none() => controller::toggle_whitespace(st, tx),
             KeyCode::Esc => {
@@ -733,6 +737,16 @@ fn pending_jump_file(st: &mut State, direction: i64) {
         }
         st.pending_idx = order[ps];
     }
+}
+
+fn edit_focused_stop(st: &mut State) {
+    if !controller::edit_focused_comment(st) {
+        editor::open_current_in_editor(st, false);
+    }
+}
+
+fn selected_is_file(st: &State) -> bool {
+    matches!(st.tree.get(st.file_idx), Some(TreeRow::File { .. }))
 }
 
 fn open_file_or_dir(st: &mut State) {
