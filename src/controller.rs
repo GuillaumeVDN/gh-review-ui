@@ -528,6 +528,53 @@ pub fn confirm_ask(st: &mut State) {
     }
 }
 
+const DEEP_REVIEW: &str = "\
+I'm reviewing GitHub PR #{num} ({title}). You run in the PR's checked-out worktree. \
+Change nothing: report only.
+
+# 1. The context
+
+Read the PR with `gh pr view {num} --comments`: the description, the base branch and the \
+linked issues. Fetch the base, then read the whole diff with `git diff origin/<base>...HEAD`. \
+Open the touched files for the full picture.
+
+Explain what problem the PR solves and why. Then explain how the change is organised: the main \
+pieces, how they fit together, and the order in which to read the files.
+
+# 2. The deep review
+
+Audit the changes for implementation quality. Flag first the correctness bugs you are \
+confident about, with the failing scenario.
+
+Look for restructurings that keep the behaviour and make the code dramatically simpler: whole \
+branches, helpers, modes or layers disappearing. Prefer deleting complexity to rearranging it.
+
+Be demanding about new ad-hoc conditionals and one-off special cases bolted onto unrelated \
+flows: that is a design problem, not a nit. Be demanding about a file crossing 1k lines without \
+a compelling reason. Be demanding about unnecessary optionality, `any`, cast-heavy code, and \
+silent fallbacks papering over unclear invariants. Be demanding about feature logic leaking into \
+shared paths, and bespoke code duplicating an existing helper.
+
+Order findings by severity: bugs, then structural regressions, then missed simplifications, \
+then spaghetti growth, then boundaries and types, then file size, then legibility. A few \
+high-conviction findings beat a long list of nits. Give each one a file and line, and a \
+concrete remedy.
+";
+
+/// Launch Claude on the whole open PR: explain its context, then review it.
+pub fn deep_review(st: &mut State) {
+    let Some(pr) = st.active_pr.as_ref() else {
+        st.status = "No PR open.".into();
+        return;
+    };
+    let prompt = DEEP_REVIEW.replace("{num}", &pr.number.to_string()).replace("{title}", &pr.title);
+    let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
+    match editor::ask_claude(st, &prompt, &cwd) {
+        Ok(()) => st.status = "Launched a deep review in a new terminal…".into(),
+        Err(e) => st.status = format!("Failed to launch Claude: {e}"),
+    }
+}
+
 // ---- comment line picker ----
 
 /// From the picker, confirm on the current line: edit the comment anchored on

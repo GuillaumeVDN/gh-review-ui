@@ -271,6 +271,7 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         KeyCode::BackTab => st.focus = st.focus.prev(),
         KeyCode::Char('r') => refresh(st, tx),
         KeyCode::Char('g') => open_pr_browser(st),
+        KeyCode::Char('D') => controller::deep_review(st),
         _ => handle_pane_key(st, tx, k, area),
     }
 }

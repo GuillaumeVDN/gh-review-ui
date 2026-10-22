@@ -438,7 +438,7 @@ pub fn render(f: &mut Frame, st: &mut State) {
 }
 
 fn shortcuts_for(st: &State) -> String {
-    let common = "g: open web · r: refresh · q: quit";
+    let common = "g: open web · D: deep review · r: refresh · q: quit";
     match st.focus {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
