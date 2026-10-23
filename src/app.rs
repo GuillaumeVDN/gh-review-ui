@@ -379,6 +379,10 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 open_file_or_dir(st);
                 controller::enter_comment_mode(st);
             }
+            KeyCode::Char('a') if selected_is_file(st) => {
+                open_file_or_dir(st);
+                controller::begin_ask(st);
+            }
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Char('w') => controller::toggle_whitespace(st, tx),
             _ => {}

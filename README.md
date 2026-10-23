@@ -108,7 +108,10 @@ Files pane:
   what `z` does next: it folds every fully-viewed folder and jumps to the first
   unviewed file.
 - `z` — fold every fully-viewed folder, then jump to the first unviewed file
-- `e` — open the selected file in the editor (top of file)
+- `e` — on a file, enter the diff on the selected stop and edit it, like `e` in
+  the Diff pane
+- `c` — on a file, enter the diff and comment on the selected stop
+- `a` — on a file, enter the diff and ask Claude about the selected stop
 - `s` — switch the diff between inline and side by side
 - `w` — hide / show the changes that only touch whitespace
 - `Enter` — open file in the diff pane (folder: collapse / expand)

@@ -443,7 +443,7 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · w: whitespace · e: editor · c: comment · z/Z: fold/unfold · Home/G · {common}"),
+        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · w: whitespace · e: editor · c: comment · a: ask Claude · z/Z: fold/unfold · Home/G · {common}"),
         Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
         Focus::Diff if st.local_diff_path.is_some() => {
             format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")
