@@ -364,7 +364,11 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
         }
         Msg::Edits(edits) => {
             st.busy.remove("edits");
-            let api::Edits { files, combined, unstaged, staged } = edits;
+            let api::Edits { files, combined, unstaged, staged, head } = edits;
+            let seen = std::mem::replace(&mut st.edits_head, (st.active_worktree.clone(), head));
+            if seen.0 == st.edits_head.0 && !seen.1.is_empty() && seen.1 != st.edits_head.1 {
+                reload_active(st, tx);
+            }
             st.edit_hunks_by_file = combined.0.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
             st.edit_kind_by_path = files.iter().map(|e| (e.path.clone(), e.kind)).collect();
             st.edit_files = files;
@@ -2271,6 +2275,24 @@ mod tests {
         assert!(!st.busy.contains("viewed"));
     }
 
+    /// A commit made in another window moves HEAD, and the next edits scan
+    /// reads the PR again.
+    #[test]
+    fn an_outside_commit_reloads_the_pr() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut st = State::default();
+        st.active_pr = Some(pr(7));
+        st.active_worktree = "/tmp/wt".into();
+        let scan = |head: &str| Msg::Edits(crate::api::Edits { head: head.into(), ..Default::default() });
+
+        apply_msg(&mut st, scan("aaa"), &tx);
+        apply_msg(&mut st, scan("aaa"), &tx);
+        assert_eq!(rx.try_iter().count(), 0, "the first scan and a same HEAD read nothing");
+
+        apply_msg(&mut st, scan("bbb"), &tx);
+        assert!(matches!(rx.try_iter().collect::<Vec<_>>()[..], [Job::LoadActive { .. }]));
+    }
+
     /// git decides what is staged, so the jump waits for the reload the stage
     /// job sends back.
     #[test]
@@ -2296,6 +2318,7 @@ mod tests {
                 combined: Default::default(),
                 unstaged: Default::default(),
                 staged: ["a.rs".to_string()].into_iter().collect(),
+                head: String::new(),
             }),
             &tx,
         );

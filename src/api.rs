@@ -609,6 +609,7 @@ fn diff_with_untracked(wt: &str, extra: &[&str]) -> String {
 }
 
 /// The three views of the local changes in `wt`, each parsed per file.
+#[derive(Default)]
 pub struct Edits {
     /// Changed files (sorted, with kinds) — the union of staged and unstaged.
     pub files: Vec<crate::models::EditEntry>,
@@ -617,6 +618,7 @@ pub struct Edits {
     /// Paths with a change on that side of the index.
     pub unstaged: HashSet<String>,
     pub staged: HashSet<String>,
+    pub head: String,
 }
 
 /// Load the local changes of `wt` split by index side, plus the combined view
@@ -648,6 +650,7 @@ pub fn load_edits(wt: &str) -> Edits {
         combined: parse_diff(&combined_raw),
         unstaged: paths(&sides[1]),
         staged: paths(&sides[0]),
+        head: sh(&["git", "-C", wt, "rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default(),
     }
 }
 

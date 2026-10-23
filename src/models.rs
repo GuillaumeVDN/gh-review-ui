@@ -347,6 +347,9 @@ pub struct State {
     /// Paths with something on one side of the index, for the [4] marks.
     pub unstaged_paths: HashSet<String>,
     pub staged_paths: HashSet<String>,
+    /// The worktree and its HEAD at the last edits scan. A commit made
+    /// outside the TUI moves HEAD, and the PR has to be read again.
+    pub edits_head: (String, String),
     pub edit_diff_scroll: usize,
     /// When set, the [0] pane shows this file's *local* diff (from [4]) with hunk
     /// navigation instead of the PR review diff.
