@@ -198,7 +198,7 @@ fn a_thread_without_a_line_reads_at_the_top() {
 #[test]
 fn the_focused_comment_stop_wears_the_side_bar() {
     let mut st = review_state();
-    st.focus = Focus::Diff;
+    st.focus = Focus::Files;
     st.pending = vec![pending_on_9()];
     // The block first, then the comment hanging under its last line.
     let out = screen(&mut st, 160, 30);
@@ -214,7 +214,7 @@ fn the_focused_comment_stop_wears_the_side_bar() {
 fn a_long_thread_folds_until_it_is_the_stop() {
     let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
     let mut st = review_state();
-    st.focus = Focus::Diff;
+    st.focus = Focus::Files;
     st.threads = vec![thread_on(Some(9), &[&body])];
     let out = screen(&mut st, 160, 40);
     assert!(out.contains("more lines"), "folded: {out}");
@@ -249,8 +249,9 @@ fn the_local_diff_reads_side_by_side_too() {
         path: "f.txt".into(),
         kind: ghreview::models::EditKind::Modified,
     }];
-    st.local_diff_path = Some("f.txt".into());
-    st.focus = Focus::Diff;
+    ghreview::tree::rebuild_edits(&mut st);
+    st.edit_idx = 0;
+    st.focus = Focus::Edits;
     st.side_by_side = true;
 
     let out = screen(&mut st, 160, 30);

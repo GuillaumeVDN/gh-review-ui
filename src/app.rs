@@ -125,6 +125,13 @@ fn event_loop(
         if st.focus == Focus::Edits && prev_focus != Some(Focus::Edits) {
             controller::reload_edits(&mut st, &job_tx);
         }
+        // [3] and [4] each show their own file, so a switch between them, or
+        // a reload that moved the [4] cursor, starts on the first stop.
+        let shown = nav::diff_path(&st);
+        if shown != st.diff_shown_path {
+            st.diff_shown_path = shown;
+            reset_diff_cursor(&mut st);
+        }
         prev_pr = st.pr_idx;
         prev_focus = Some(st.focus);
         if (st.side_by_side, st.ignore_whitespace) != prev_view {
@@ -259,12 +266,14 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         }
         KeyCode::Char('J') => match st.focus {
             Focus::Prs => st.details_scroll += 1,
-            Focus::Files => nav::step_stop(st, 1),
+            Focus::Files => jump_file(st, 1),
+            Focus::Edits => jump_edit_file(st, 1),
             _ => nav::scroll_diff(st, 1),
         },
         KeyCode::Char('K') => match st.focus {
             Focus::Prs => st.details_scroll = st.details_scroll.saturating_sub(1),
-            Focus::Files => nav::step_stop(st, -1),
+            Focus::Files => jump_file(st, -1),
+            Focus::Edits => jump_edit_file(st, -1),
             _ => nav::scroll_diff(st, -1),
         },
         KeyCode::Tab => st.focus = st.focus.next(),
@@ -356,13 +365,22 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Files => match k.code {
-            KeyCode::Char('j') if alt => jump_file(st, 1),
-            KeyCode::Char('k') if alt => jump_file(st, -1),
-            KeyCode::Down | KeyCode::Char('j') => set_file_idx(st, st.file_idx + 1),
-            KeyCode::Up | KeyCode::Char('k') => set_file_idx(st, st.file_idx.saturating_sub(1)),
-            KeyCode::Home => set_file_idx(st, 0),
-            KeyCode::Char('G') => set_file_idx(st, st.tree.len().saturating_sub(1)),
-            KeyCode::Enter => open_file_or_dir(st),
+            KeyCode::Down | KeyCode::Char('j') => step_file_stop(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => step_file_stop(st, -1),
+            KeyCode::Home => {
+                set_file_idx(st, 0);
+                land_on_file(st, 1);
+            }
+            KeyCode::Char('G') => {
+                set_file_idx(st, st.tree.len().saturating_sub(1));
+                land_on_file(st, -1);
+            }
+            KeyCode::PageDown => nav::scroll_diff(st, page as i64),
+            KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
+            KeyCode::Enter => match st.tree.get(st.file_idx).cloned() {
+                Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
+                _ => controller::enter_focused_stop(st),
+            },
             KeyCode::Char(' ') => controller::mark_viewed(st, tx),
             KeyCode::Char('z') => controller::fold_viewed(st),
             KeyCode::Char('Z') => {
@@ -370,40 +388,40 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 crate::tree::rebuild(st);
                 st.status = "Unfolded all folders.".into();
             }
-            KeyCode::Char('e') if selected_is_file(st) => {
-                open_file_or_dir(st);
-                edit_focused_stop(st);
+            KeyCode::Char('d') => {
+                controller::discard_focused_comment(st, tx);
             }
+            KeyCode::Char('o') => controller::open_focused_thread(st),
+            KeyCode::Char('e') if selected_is_file(st) => edit_focused_stop(st),
             KeyCode::Char('e') => editor::open_current_in_editor(st, true),
-            KeyCode::Char('c') if selected_is_file(st) => {
-                open_file_or_dir(st);
-                controller::enter_comment_mode(st);
-            }
-            KeyCode::Char('a') if selected_is_file(st) => {
-                open_file_or_dir(st);
-                controller::begin_ask(st);
-            }
+            KeyCode::Char('c') if selected_is_file(st) => controller::enter_comment_mode(st),
+            KeyCode::Char('a') if selected_is_file(st) => controller::begin_ask(st),
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
             KeyCode::Char('w') => controller::toggle_whitespace(st, tx),
             _ => {}
         },
         Focus::Edits => match k.code {
-            KeyCode::Char('j') if alt => jump_edit_file(st, 1),
-            KeyCode::Char('k') if alt => jump_edit_file(st, -1),
-            KeyCode::Down | KeyCode::Char('j') => set_edit_idx(st, st.edit_idx + 1),
-            KeyCode::Up | KeyCode::Char('k') => set_edit_idx(st, st.edit_idx.saturating_sub(1)),
-            KeyCode::Home => set_edit_idx(st, 0),
-            KeyCode::Char('G') => set_edit_idx(st, st.edit_tree.len().saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => step_edit_stop(st, 1),
+            KeyCode::Up | KeyCode::Char('k') => step_edit_stop(st, -1),
+            KeyCode::Home => {
+                set_edit_idx(st, 0);
+                land_on_edit_file(st, 1);
+            }
+            KeyCode::Char('G') => {
+                set_edit_idx(st, st.edit_tree.len().saturating_sub(1));
+                land_on_edit_file(st, -1);
+            }
             KeyCode::Char('z') => controller::fold_staged(st),
-            KeyCode::PageDown => st.edit_diff_scroll += page,
-            KeyCode::PageUp => st.edit_diff_scroll = st.edit_diff_scroll.saturating_sub(page),
-            KeyCode::Enter => controller::enter_local_diff(st),
+            KeyCode::PageDown => nav::scroll_diff(st, page as i64),
+            KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
+            KeyCode::Enter => controller::fold_edit_dir(st),
             KeyCode::Char(' ') => controller::toggle_stage(st, tx),
             KeyCode::Char('c') => controller::begin_commit_edits(st, CommitKind::New),
             KeyCode::Char('w') => controller::begin_commit_edits(st, CommitKind::NoVerify),
             KeyCode::Char('A') => controller::begin_commit_edits(st, CommitKind::Amend),
             KeyCode::Char('P') => controller::push_edits(st, tx),
-            KeyCode::Char('d') => controller::begin_discard_edit(st),
+            KeyCode::Char('d') => controller::begin_discard_hunk(st),
+            KeyCode::Char('X') => controller::begin_discard_edit(st),
             KeyCode::Char('Z') => {
                 st.edit_collapsed.clear();
                 crate::tree::rebuild_edits(st);
@@ -411,32 +429,6 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             }
             KeyCode::Char('e') => editor::open_current_edit_in_editor(st),
             KeyCode::Char('s') => controller::toggle_side_by_side(st),
-            _ => {}
-        },
-        Focus::Diff => match k.code {
-            KeyCode::Down | KeyCode::Char('j') => nav::step_stop(st, 1),
-            KeyCode::Up | KeyCode::Char('k') => nav::step_stop(st, -1),
-            KeyCode::Char('d') => {
-                if !controller::discard_focused_comment(st, tx) {
-                    controller::begin_discard_hunk(st);
-                }
-            }
-            KeyCode::Enter => controller::enter_focused_stop(st),
-            KeyCode::Char('o') => controller::open_focused_thread(st),
-            KeyCode::PageDown => nav::scroll_diff(st, page as i64),
-            KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
-            KeyCode::Char('c') => controller::enter_comment_mode(st),
-            KeyCode::Char('a') => controller::begin_ask(st),
-            KeyCode::Char('e') => edit_focused_stop(st),
-            KeyCode::Char('s') => controller::toggle_side_by_side(st),
-            KeyCode::Char('w') if st.local_diff_path.is_none() => controller::toggle_whitespace(st, tx),
-            KeyCode::Esc => {
-                if st.local_diff_path.take().is_some() {
-                    st.focus = Focus::Edits; // came from [4]
-                } else {
-                    st.focus = Focus::Files;
-                }
-            }
             _ => {}
         },
     }
@@ -658,43 +650,75 @@ fn toggle_all_commits(st: &mut State) {
     }
 }
 
-fn set_file_idx(st: &mut State, idx: usize) {
-    st.file_idx = idx.min(st.tree.len().saturating_sub(1));
+fn reset_diff_cursor(st: &mut State) {
     st.diff_scroll = 0;
     st.diff_hunk_idx = 0;
     st.diff_stop_idx = 0;
-    st.local_diff_path = None; // back to the PR diff for the selected file
+    st.diff_reveal_pending = true;
+}
+
+fn set_file_idx(st: &mut State, idx: usize) {
+    st.file_idx = idx.min(st.tree.len().saturating_sub(1));
+    reset_diff_cursor(st);
 }
 
 fn set_edit_idx(st: &mut State, idx: usize) {
     st.edit_idx = idx.min(st.edit_tree.len().saturating_sub(1));
-    st.edit_diff_scroll = 0;
+    reset_diff_cursor(st);
 }
 
+/// Move to the next/previous file row in the Files tree, skipping folders.
 fn jump_file(st: &mut State, direction: i64) {
-    let mut i = st.file_idx as i64 + direction;
-    while i >= 0 && (i as usize) < st.tree.len() {
-        if matches!(st.tree[i as usize], TreeRow::File { .. }) {
-            st.file_idx = i as usize;
-            st.diff_scroll = 0;
-            st.diff_hunk_idx = 0;
-            st.diff_stop_idx = 0;
-            st.local_diff_path = None;
-            return;
-        }
-        i += direction;
+    if let Some(i) = next_file_row(&st.tree, st.file_idx, direction) {
+        set_file_idx(st, i);
     }
 }
 
-/// Move to the next/previous file row in the Pending-edits tree (skipping dirs).
+/// Move to the next/previous file row in the Pending-edits tree, skipping folders.
 fn jump_edit_file(st: &mut State, direction: i64) {
-    let mut i = st.edit_idx as i64 + direction;
-    while i >= 0 && (i as usize) < st.edit_tree.len() {
-        if matches!(st.edit_tree[i as usize], TreeRow::File { .. }) {
-            set_edit_idx(st, i as usize);
-            return;
+    if let Some(i) = next_file_row(&st.edit_tree, st.edit_idx, direction) {
+        set_edit_idx(st, i);
+    }
+}
+
+fn next_file_row(tree: &[TreeRow], from: usize, direction: i64) -> Option<usize> {
+    let mut i = from as i64 + direction;
+    while i >= 0 && (i as usize) < tree.len() {
+        if matches!(tree[i as usize], TreeRow::File { .. }) {
+            return Some(i as usize);
         }
         i += direction;
+    }
+    None
+}
+
+/// A folder row has no diff to walk, so the cursor moves on to a file.
+fn land_on_file(st: &mut State, direction: i64) {
+    if !selected_is_file(st) {
+        jump_file(st, direction);
+    }
+}
+
+fn land_on_edit_file(st: &mut State, direction: i64) {
+    if !matches!(st.edit_tree.get(st.edit_idx), Some(TreeRow::File { .. })) {
+        jump_edit_file(st, direction);
+    }
+}
+
+/// `j` / `k` in the Files pane: walk the stops of the selected file's diff.
+fn step_file_stop(st: &mut State, direction: i64) {
+    if selected_is_file(st) {
+        nav::step_stop(st, direction);
+    } else {
+        jump_file(st, direction);
+    }
+}
+
+fn step_edit_stop(st: &mut State, direction: i64) {
+    if matches!(st.edit_tree.get(st.edit_idx), Some(TreeRow::File { .. })) {
+        nav::step_stop(st, direction);
+    } else {
+        jump_edit_file(st, direction);
     }
 }
 
@@ -754,23 +778,6 @@ fn selected_is_file(st: &State) -> bool {
     matches!(st.tree.get(st.file_idx), Some(TreeRow::File { .. }))
 }
 
-fn open_file_or_dir(st: &mut State) {
-    match st.tree.get(st.file_idx).cloned() {
-        Some(TreeRow::File { .. }) => {
-            st.focus = Focus::Diff;
-            // `J` / `K` from this pane already move through the file's diff.
-            if st.local_diff_path.take().is_some() {
-                st.diff_scroll = 0;
-                st.diff_hunk_idx = 0;
-                st.diff_stop_idx = 0;
-            }
-            st.diff_reveal_pending = true;
-        }
-        Some(TreeRow::Dir { path, .. }) => controller::toggle_collapse(st, &path),
-        None => {}
-    }
-}
-
 fn open_pr_browser(st: &mut State) {
     let number = match (&st.active_pr, st.prs.get(st.pr_idx)) {
         (Some(active), _) if st.focus != Focus::Prs => active.number,
@@ -811,17 +818,24 @@ fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
         Some(Focus::Edits)
     } else if hit(rects.pending) {
         Some(Focus::Pending)
-    } else if hit(rects.right) {
-        Some(Focus::Diff)
     } else {
         None
     };
-    let Some(pane) = pane else { return };
-    match m.kind {
-        MouseEventKind::Down(MouseButton::Left) => st.focus = pane,
-        MouseEventKind::ScrollDown => scroll_pane(st, pane, 3),
-        MouseEventKind::ScrollUp => scroll_pane(st, pane, -3),
-        _ => {}
+    let delta = match m.kind {
+        MouseEventKind::ScrollDown => 3,
+        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(pane) = pane {
+                st.focus = pane;
+            }
+            return;
+        }
+        _ => return,
+    };
+    match pane {
+        Some(pane) => scroll_pane(st, pane, delta),
+        None if hit(rects.right) => scroll_right(st, delta),
+        None => {}
     }
 }
 
@@ -833,14 +847,13 @@ fn scroll_pane(st: &mut State, pane: Focus, delta: i64) {
         Focus::Files => bump(&mut st.file_offset, delta),
         Focus::Edits => bump(&mut st.edit_offset, delta),
         Focus::Pending => bump(&mut st.pending_offset, delta),
-        Focus::Diff => {
-            if st.focus == Focus::Prs {
-                bump(&mut st.details_scroll, delta);
-            } else if st.focus == Focus::Edits {
-                bump(&mut st.edit_diff_scroll, delta);
-            } else {
-                nav::scroll_diff(st, delta);
-            }
-        }
+    }
+}
+
+fn scroll_right(st: &mut State, delta: i64) {
+    if st.focus == Focus::Prs {
+        st.details_scroll = (st.details_scroll as i64 + delta).max(0) as usize;
+    } else {
+        nav::scroll_diff(st, delta);
     }
 }

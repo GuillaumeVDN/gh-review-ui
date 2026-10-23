@@ -10,7 +10,7 @@ use crate::models::{
     State, TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    cur_file_path, current_hunk_range, diff_path, edit_preview_path, first_change_index,
+    cur_file_path, current_hunk_range, diff_path, first_change_index,
     hunk_comment_indices, is_local_diff, line_target, stage_state, Stop,
 };
 use crate::textbuffer::TextArea;
@@ -374,19 +374,9 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             st.edit_files = files;
             (st.edit_diff_by_file, st.edit_info_by_file) = combined;
             (st.unstaged_paths, st.staged_paths) = (unstaged, staged);
-            st.edit_diff_scroll = 0;
             tree::rebuild_edits(st);
             if st.edit_idx >= st.edit_tree.len() {
                 st.edit_idx = st.edit_tree.len().saturating_sub(1);
-            }
-            // A file whose local diff is on screen may have just been committed away.
-            if let Some(p) = st.local_diff_path.clone() {
-                if !st.edit_diff_by_file.contains_key(&p) {
-                    st.local_diff_path = None;
-                    if st.focus == Focus::Diff {
-                        st.focus = Focus::Edits;
-                    }
-                }
             }
             // Merge edit-only files (new/deleted/renamed, not in the PR diff) into
             // the Files tree so [3] shows them too (item 7).
@@ -1407,7 +1397,6 @@ pub fn fold_staged(st: &mut State) {
     };
     if let Some(ti) = jumped {
         st.edit_idx = ti;
-        st.edit_diff_scroll = 0;
     }
     st.status = format!(
         "Folded {folded} staged folder{}{}",
@@ -1493,7 +1482,7 @@ pub fn begin_discard_hunk(st: &mut State) {
     }
     let Some(path) = diff_path(st) else { return };
     if !is_local_diff(st, &path) {
-        st.status = "Reverting a hunk only applies to the local diff (Enter from [4]).".into();
+        st.status = "Reverting a hunk only applies to the local diff of the [4] pane.".into();
         return;
     }
     let staged = stage_state(st, &path) != StageState::Unstaged;
@@ -1524,20 +1513,10 @@ pub fn toggle_side_by_side(st: &mut State) {
             rows.get(scroll).and_then(|r| r.line()).unwrap_or(0)
         }
     };
-    // The [4] preview scrolls on its own, so it carries its own position.
-    if st.focus == Focus::Edits {
-        let scroll = edit_preview_path(st)
-            .and_then(|p| st.edit_diff_by_file.get(&p))
-            .map(|lines| carry(lines, st.edit_diff_scroll));
-        if let Some(scroll) = scroll {
-            st.edit_diff_scroll = scroll;
-        }
-    } else {
-        let scroll = diff_path(st)
-            .and_then(|p| crate::navigation::diff_lines(st, &p).map(|lines| carry(lines, st.diff_scroll)));
-        if let Some(scroll) = scroll {
-            st.diff_scroll = scroll;
-        }
+    let scroll = diff_path(st)
+        .and_then(|p| crate::navigation::diff_lines(st, &p).map(|lines| carry(lines, st.diff_scroll)));
+    if let Some(scroll) = scroll {
+        st.diff_scroll = scroll;
     }
     st.side_by_side = sbs;
     st.diff_reveal_pending = true;
@@ -1560,31 +1539,11 @@ pub fn toggle_whitespace(st: &mut State, tx: &Sender<Job>) {
     }
 }
 
-/// Show the selected pending-edit file's local diff in [0] with hunk navigation.
-/// Enter in the Pending-edits pane: a file opens its diff, a folder folds.
-///
-/// The same key does both here as in the Files pane, since the two panes are
-/// the same shape of tree and a folder is not something to open.
-pub fn enter_local_diff(st: &mut State) {
-    let row = st.edit_tree.get(st.edit_idx).cloned();
-    if let Some(TreeRow::Dir { path, .. }) = row {
+/// Enter in the Pending-edits pane folds the folder under the cursor.
+pub fn fold_edit_dir(st: &mut State) {
+    if let Some(TreeRow::Dir { path, .. }) = st.edit_tree.get(st.edit_idx).cloned() {
         toggle_collapse_edit(st, &path);
-        return;
     }
-    let Some(TreeRow::File { index, .. }) = row else {
-        return;
-    };
-    let Some(entry) = st.edit_files.get(index) else { return };
-    let path = entry.path.clone();
-    if !st.edit_diff_by_file.contains_key(&path) {
-        return;
-    }
-    st.local_diff_path = Some(path);
-    st.focus = Focus::Diff;
-    st.diff_scroll = 0;
-    st.diff_hunk_idx = 0;
-    st.diff_stop_idx = 0;
-    st.diff_reveal_pending = true;
 }
 
 /// Refresh the pending-edits list from the worktree (no-op without a worktree).
@@ -1820,8 +1779,6 @@ pub fn try_open_pending_file(st: &mut State, tx: &std::sync::mpsc::Sender<Job>) 
         Some(idx) => {
             st.pending_open_file = None;
             st.edit_idx = idx;
-            st.edit_diff_scroll = 0;
-            enter_local_diff(st);
             st.status = format!("opened {wanted}");
         }
         None => {
@@ -1901,7 +1858,7 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
             // commit made locally is still one we can diff, since that diff
             // comes from this checkout rather than from GitHub.
             st.status = format!("{named} is not pushed yet — showing it from the checkout");
-            st.focus = Focus::Diff;
+            st.focus = Focus::Files;
             // Oldest to newest, the way a range is read.
             let first = wanted.last().cloned().unwrap_or_default();
             let last = wanted.first().cloned().unwrap_or_default();
@@ -2040,7 +1997,9 @@ mod tests {
             .collect();
         let rows = crate::diff::side_by_side(&lines);
         st.edit_diff_by_file.insert("f".into(), lines.clone());
-        st.local_diff_path = Some("f".into());
+        st.edit_files = vec![edit("f")];
+        crate::tree::rebuild_edits(&mut st);
+        st.focus = Focus::Edits;
         let at = lines.iter().position(|l| l == "+new").expect("the added line");
         st.diff_scroll = at;
 
@@ -2051,35 +2010,6 @@ mod tests {
         toggle_side_by_side(&mut st);
         assert!(!st.side_by_side);
         assert_eq!(st.diff_scroll, rows[crate::diff::sbs_row_by_line(&rows, lines.len())[at]].line().unwrap());
-    }
-
-    /// The [4] preview has a scroll of its own, and `s` there carries that one
-    /// over, not the review diff's.
-    #[test]
-    fn the_side_by_side_toggle_carries_the_edit_preview_scroll() {
-        let mut st = State::default();
-        let lines: Vec<String> = ["@@ -1,3 +1,3 @@", " keep", "-old", "+new", " tail"]
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
-        let rows = crate::diff::side_by_side(&lines);
-        st.edit_files = vec![edit("f")];
-        crate::tree::rebuild_edits(&mut st);
-        st.edit_diff_by_file.insert("f".into(), lines.clone());
-        st.focus = Focus::Edits;
-        let at = lines.iter().position(|l| l == "+new").expect("the added line");
-        st.edit_diff_scroll = at;
-        st.diff_scroll = 3;
-
-        toggle_side_by_side(&mut st);
-        assert!(st.side_by_side);
-        assert_eq!(st.edit_diff_scroll, crate::diff::sbs_row_by_line(&rows, lines.len())[at]);
-        assert_eq!(st.diff_scroll, 3);
-
-        toggle_side_by_side(&mut st);
-        assert!(!st.side_by_side);
-        let row = crate::diff::sbs_row_by_line(&rows, lines.len())[at];
-        assert_eq!(st.edit_diff_scroll, rows[row].line().unwrap());
     }
 
     /// Enter on a folder folds it, the way it does in the Files pane. A folder
@@ -2099,12 +2029,11 @@ mod tests {
             .expect("a folder row");
         let before = st.edit_tree.len();
 
-        enter_local_diff(&mut st);
+        fold_edit_dir(&mut st);
         assert!(st.edit_collapsed.contains("src"), "it folded");
         assert!(st.edit_tree.len() < before, "and its files went with it");
-        assert_ne!(st.focus, Focus::Diff, "a folder opens no diff");
 
-        enter_local_diff(&mut st);
+        fold_edit_dir(&mut st);
         assert!(!st.edit_collapsed.contains("src"), "and unfolds again");
         assert_eq!(st.edit_tree.len(), before);
     }

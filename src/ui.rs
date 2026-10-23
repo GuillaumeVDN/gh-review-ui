@@ -14,7 +14,7 @@ use crate::models::{
     TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
-    current_hunk_range, diff_path, edit_preview_path, focused_stop, hunk_for_comment, is_local_diff,
+    current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff,
     source_maps, stage_state, stop_reveal, thread_anchor, Stop,
 };
 use crate::syntax::{Painted, StyledLine};
@@ -38,17 +38,16 @@ pub struct PaneRects {
 pub fn shows_sbs_diff(st: &State) -> bool {
     st.side_by_side
         && match st.focus {
-            Focus::Diff | Focus::Files => diff_path(st).is_some(),
-            Focus::Edits => edit_preview_path(st).is_some(),
+            Focus::Files | Focus::Edits => diff_path(st).is_some(),
             _ => false,
         }
 }
 
 pub fn compute_layout(area: Rect, st: &State) -> (PaneRects, Rect, Rect) {
-    compute_layout_at(area, st.focus, st.local_diff_path.is_some(), shows_sbs_diff(st))
+    compute_layout_at(area, st.focus, shows_sbs_diff(st))
 }
 
-pub fn compute_layout_at(area: Rect, focus: Focus, local_diff: bool, split: bool) -> (PaneRects, Rect, Rect) {
+pub fn compute_layout_at(area: Rect, focus: Focus, split: bool) -> (PaneRects, Rect, Rect) {
     let root = Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     let (body, status, help) = (root[0], root[1], root[2]);
@@ -61,14 +60,12 @@ pub fn compute_layout_at(area: Rect, focus: Focus, local_diff: bool, split: bool
     .min(area.width.saturating_sub(20));
     let cols = Layout::horizontal([Constraint::Length(left_w), Constraint::Min(0)]).split(body);
     let (left, right) = (cols[0], cols[1]);
-    // The focused left pane (or Files while viewing the diff) expands to fill the
-    // column; the others shrink to a compact height. Left-pane order: PRs,
-    // Commits, Files, Edits, Pending. Viewing a *local* diff keeps [4] expanded.
+    // The focused left pane expands to fill the column; the others shrink to a
+    // compact height. Left-pane order: PRs, Commits, Files, Edits, Pending.
     let expanded = match focus {
         Focus::Prs => 0,
         Focus::Commits => 1,
         Focus::Files => 2,
-        Focus::Diff => if local_diff { 3 } else { 2 },
         Focus::Edits => 3,
         Focus::Pending => 4,
     };
@@ -114,19 +111,21 @@ const REVEAL_TRIES: usize = 6;
 /// A unit takes more rows than one: a line wraps, a local edit follows it and a
 /// comment hangs under it. So the draw reports `drawn`, the unit past the last
 /// one it finished, and the next scroll comes from that. The result stops at
-/// `lo`, so a stop taller than the pane starts at the top. `None` ends the
-/// retry: the stop is on screen, or the scroll cannot move any further.
-fn reveal_again(scroll: usize, (lo, hi): (usize, usize), drawn: usize) -> Option<usize> {
+/// `lo`, so a stop taller than the pane starts at the top, unless `tail` asks
+/// for its bottom. `None` ends the retry: the stop is on screen, or the scroll
+/// cannot move any further.
+fn reveal_again(scroll: usize, (lo, hi): (usize, usize), drawn: usize, tail: bool) -> Option<usize> {
     if drawn >= hi {
         return None;
     }
-    let next = (scroll + (hi - drawn)).min(lo);
+    let next = scroll + (hi - drawn);
+    let next = if tail { next } else { next.min(lo) };
     (next != scroll).then_some(next)
 }
 
-/// `J` / `K` move the diff stop from the Files pane, so the stop shows there too.
+/// `j` / `k` move the diff stop from the Files and Pending-edits panes.
 fn shows_stop(st: &State) -> bool {
-    matches!(st.focus, Focus::Diff | Focus::Files)
+    matches!(st.focus, Focus::Files | Focus::Edits)
 }
 
 /// The scroll a stop starts its reveal from: the draw itself moves it on.
@@ -426,7 +425,6 @@ pub fn render(f: &mut Frame, st: &mut State) {
         Focus::Prs => render_pr_details(f, st, rects.right),
         Focus::Commits => render_commit_detail(f, st, rects.right),
         Focus::Pending => render_pending_detail(f, st, rects.right),
-        Focus::Edits => render_edit_diff(f, st, rects.right),
         _ => render_diff(f, st, rects.right),
     }
 
@@ -443,20 +441,12 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Prs => format!("Enter: open (worktree) · C: checkout local · {common}"),
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
-        Focus::Files => format!("Enter: open/collapse · Space: viewed+next · s: side by side · w: whitespace · e: editor · c: comment · a: ask Claude · z/Z: fold/unfold · Home/G · {common}"),
-        Focus::Edits => format!("Enter: hunks/fold · Space: stage+next · s: side by side · z/Z: fold/unfold · c: commit+push · A: amend · w: no hooks · P: push · e: editor · d: revert · {common}"),
-        Focus::Diff if st.local_diff_path.is_some() => {
-            format!("j/k: block · d: revert block · s: side by side · e: editor · Esc: back · {common}")
-        }
-        Focus::Diff => match focused_stop(st) {
-            Some(Stop::Pending(_)) => {
-                format!("j/k: stop · Enter/e: edit comment · d: discard · c: comment · s: side by side · w: whitespace · Esc: back · {common}")
-            }
-            Some(Stop::Thread(_)) => {
-                format!("j/k: stop · Enter: answer · o: open in browser · c: comment · s: side by side · w: whitespace · Esc: back · {common}")
-            }
-            _ => format!("j/k: block · c: comment/edit · a: ask Claude · s: side by side · w: whitespace · e: editor · PgUp/Dn: scroll · Esc: back · {common}"),
+        Focus::Files => match focused_stop(st) {
+            Some(Stop::Pending(_)) => format!("j/k: stop · J/K: file · Enter/e: edit comment · d: discard · c: comment · Space: viewed+next · s/w · {common}"),
+            Some(Stop::Thread(_)) => format!("j/k: stop · J/K: file · Enter: answer · o: open in browser · c: comment · Space: viewed+next · s/w · {common}"),
+            _ => format!("j/k: block · J/K: file · Space: viewed+next · c: comment · a: ask Claude · e: editor · s: side by side · w: whitespace · z/Z: fold/unfold · {common}"),
         },
+        Focus::Edits => format!("j/k: block · J/K: file · Space: stage+next · d: revert block · X: revert file · c: commit+push · A: amend · w: no hooks · P: push · e: editor · s: side by side · z/Z · {common}"),
     }
 }
 
@@ -825,6 +815,8 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     if n_lines == 0 {
         st.diff_scroll = 0;
         st.diff_reveal_pending = false;
+        st.diff_reveal_tail = false;
+    st.diff_reveal_tail = false;
         let msg = Line::styled("(no diff — binary, removed, or too large)", theme::dim());
         f.render_widget(Paragraph::new(msg), inner);
         return;
@@ -1022,7 +1014,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         }
         let drawn = if out.len() >= vh { drawn.saturating_sub(1) } else { drawn };
         whole = drawn;
-        match target.and_then(|t| reveal_again(scroll, t, drawn)) {
+        match target.and_then(|t| reveal_again(scroll, t, drawn, st.diff_reveal_tail)) {
             Some(next) => scroll = next,
             None => break,
         }
@@ -1034,6 +1026,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
+    st.diff_reveal_tail = false;
     f.render_widget(Paragraph::new(out), inner);
 }
 
@@ -1239,7 +1232,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         }
         (None, _) => "[0] Diff".to_string(),
     };
-    let b = block(&title, st.focus == Focus::Diff, false);
+    let b = block(&title, false, false);
     let inner = b.inner(area);
     f.render_widget(b, area);
     if sbs && !(is_loading(st) && st.diff_by_file.is_empty()) {
@@ -1435,7 +1428,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         }
         let drawn = if out.len() >= vh { i.saturating_sub(1) } else { i };
         whole = drawn;
-        match target.and_then(|t| reveal_again(scroll, t, drawn)) {
+        match target.and_then(|t| reveal_again(scroll, t, drawn, st.diff_reveal_tail)) {
             Some(next) => scroll = next,
             None => break,
         }
@@ -1443,6 +1436,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     st.diff_view = DiffView { start_line: scroll, end_line: whole };
     st.diff_scroll = scroll;
     st.diff_reveal_pending = false;
+    st.diff_reveal_tail = false;
     f.render_widget(Paragraph::new(out), inner);
 }
 
@@ -1526,118 +1520,6 @@ fn render_pending_detail(f: &mut Frame, st: &State, area: Rect) {
     }
     f.render_widget(Paragraph::new(out), inner);
 }
-
-/// The right pane while the Pending-edits pane is focused: the local diff of the
-/// selected changed file (exactly what will be committed).
-///
-/// Named and framed as `[0]`, like every other thing that pane can show: it
-/// carried `[4] Pending edits` and the focus border, so two panes claimed the
-/// same number and the same focus at once. It is the same content hunk mode
-/// shows, so it wears the same name.
-fn render_edit_diff(f: &mut Frame, st: &mut State, area: Rect) {
-    let path = edit_preview_path(st);
-    let sbs = st.side_by_side && path.is_some();
-    let title = match &path {
-        Some(p) => format!("[0] Local diff — {p}{}", if sbs { "  · HEAD | worktree" } else { "" }),
-        None => "[0] Local diff".to_string(),
-    };
-    let b = block(&title, false, false);
-    let inner = b.inner(area);
-    f.render_widget(b, area);
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
-
-    let empty = Vec::new();
-    let lines_vec = path.as_ref().and_then(|p| st.edit_diff_by_file.get(p)).unwrap_or(&empty);
-    if lines_vec.is_empty() {
-        let msg = if path.is_some() { "(no diff)" } else { "Select a changed file (or edit one with 'e')" };
-        f.render_widget(Paragraph::new(Line::styled(msg, theme::dim())), inner);
-        return;
-    }
-    let info = path.as_ref().and_then(|p| st.edit_info_by_file.get(p));
-    if sbs {
-        let rows = crate::diff::side_by_side(lines_vec);
-        let scroll = st.edit_diff_scroll.min(rows.len().saturating_sub(1));
-        st.edit_diff_scroll = scroll;
-        render_sbs_edit_diff(f, st, inner, path.as_deref().unwrap_or(""), lines_vec, info, &rows, scroll);
-        return;
-    }
-    let nw = fit_num_width(num_width(info), 2, iw, 16);
-    let gw = if nw == 0 { 0 } else { 2 * (nw + 1) };
-    let tw = iw.saturating_sub(gw);
-    let hl = match &path {
-        Some(p) => st.highlight.paint(p, lines_vec, info, &st.blobs, st.edit_diff_scroll + vh),
-        None => Painted::default(),
-    };
-    st.edit_diff_scroll = st.edit_diff_scroll.min(lines_vec.len().saturating_sub(1));
-    let mut out: Vec<Line> = Vec::new();
-    let mut i = st.edit_diff_scroll;
-    while out.len() < vh && i < lines_vec.len() {
-        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
-        let row = DiffRow {
-            line: &lines_vec[i],
-            hl: hl.row(i),
-            nos: &[old, new],
-            current: false,
-            selected: false,
-            local_del: false,
-        };
-        push_diff_rows(&mut out, vh, &row, nw, tw, false);
-        i += 1;
-    }
-    f.render_widget(Paragraph::new(out), inner);
-}
-
-/// The [4] preview side by side: HEAD on the left, the worktree on the right.
-/// No stop, no comment and no overlay here: the diff already is the local edit.
-/// `edit_diff_scroll` counts rows here, not diff lines.
-#[allow(clippy::too_many_arguments)]
-fn render_sbs_edit_diff(
-    f: &mut Frame,
-    st: &State,
-    inner: Rect,
-    path: &str,
-    lines: &[String],
-    info: Option<&Vec<LineInfo>>,
-    rows: &[crate::diff::SbsRow],
-    scroll: usize,
-) {
-    let (vh, iw) = (inner.height as usize, inner.width as usize);
-    let seen = rows.iter().take(scroll + vh);
-    let upto = seen.flat_map(|r| [r.left, r.right]).flatten().max().map_or(0, |i| i + 1);
-    let hl = st.highlight.paint(path, lines, info, &st.blobs, upto);
-    let (gw, ltw, rtw, nw) = sbs_widths(iw, info);
-
-    let cell = |idx: Option<usize>, tw: usize, is_new: bool| -> SbsCell {
-        let Some(i) = idx else { return SbsCell::blank(nw) };
-        let ln = &lines[i];
-        let (old, new) = info.and_then(|inf| inf.get(i)).copied().unwrap_or((None, None));
-        let kind = theme::classify_diff_line(ln);
-        let bg = theme::diff_row_style(kind, false);
-        SbsCell {
-            gutter: gutter(&[if is_new { new } else { old }], nw),
-            num_style: theme::diff_number_style(kind, false).patch(bg),
-            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), false), tw.max(1)),
-            row_style: bg,
-            marker: " ",
-            m_style: bg,
-        }
-    };
-    let mut out: Vec<Line> = Vec::new();
-    for row in rows.iter().skip(scroll) {
-        if out.len() >= vh {
-            break;
-        }
-        if row.wide {
-            let Some(i) = row.line() else { continue };
-            push_sbs_wide(&mut out, vh, &lines[i], iw, gw, nw);
-        } else {
-            push_sbs_row(&mut out, vh, (ltw, rtw), cell(row.left, ltw, false), cell(row.right, rtw, true));
-        }
-    }
-    f.render_widget(Paragraph::new(out), inner);
-}
-
-// ---- overlays ----
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
@@ -2022,12 +1904,15 @@ mod tests {
     #[test]
     fn reveal_asks_for_more_scroll_until_the_stop_shows() {
         // The draw stopped short of the stop: scroll on by what it missed.
-        assert_eq!(reveal_again(0, (15, 18), 12), Some(6));
+        assert_eq!(reveal_again(0, (15, 18), 12, false), Some(6));
         // The stop is drawn: nothing more to do.
-        assert_eq!(reveal_again(6, (15, 18), 20), None);
+        assert_eq!(reveal_again(6, (15, 18), 20, false), None);
         // A stop taller than the pane keeps its first line at the top.
-        assert_eq!(reveal_again(0, (5, 40), 20), Some(5));
-        assert_eq!(reveal_again(5, (5, 40), 20), None);
+        assert_eq!(reveal_again(0, (5, 40), 20, false), Some(5));
+        assert_eq!(reveal_again(5, (5, 40), 20, false), None);
+        // A move up into it shows its last line instead.
+        assert_eq!(reveal_again(5, (5, 40), 20, true), Some(25));
+        assert_eq!(reveal_again(25, (5, 40), 40, true), None);
     }
 
     #[test]

@@ -61,16 +61,16 @@ of the file, and worktrees are reused/refreshed on subsequent opens and on `r`.
 ## Keys
 
 Global:
-- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending edits → Pending comments → Diff)
-- `0`…`5` — focus a pane directly (`0` Diff, `1` PRs, `2` Commits, `3` Files, `4` Pending edits, `5` Pending comments)
+- `Tab` / `Shift-Tab` — cycle panes (PRs → Commits → Files → Pending edits → Pending comments)
+- `1`…`5` — focus a pane directly (`1` PRs, `2` Commits, `3` Files, `4` Pending edits, `5` Pending comments)
 - `q` — quit
 - `g` — open the PR on GitHub: the selected PR in the PRs pane, the open PR elsewhere
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `D` — deep review: launch Claude in the PR worktree. It explains the PR context, then
   reviews the whole branch for bugs and implementation quality.
-- `Shift+J` / `Shift+K` — scroll one line: the PR summary when the PRs pane is
-  focused, otherwise the diff (works from any pane). From the Files pane, they
-  jump to the next / previous stop in the diff, like `j` / `k` in the Diff pane.
+- `Shift+J` / `Shift+K` — in the Files and Pending edits panes, jump to the next /
+  previous file. In the PRs pane, scroll the PR summary one line. Elsewhere,
+  scroll the diff one line.
 - `c` — comment on the current hunk (opens the line picker)
 - finish review — `Enter` in the Pending pane
 - mouse wheel — scroll the pane under the cursor (stops at the content edge)
@@ -101,36 +101,52 @@ at, it is what GitHub has.
 
 The right pane shows the selected commit's short SHA, author, date, and message.
 
-Files pane:
-- `j` / `k` — move (over files *and* folders)
-- `Alt+j` / `Alt+k` — jump to the next / previous file, skipping folder rows
-- `Space` — toggle viewed on file, or on all files under a folder. A mark does
-  what `z` does next: it folds every fully-viewed folder and jumps to the first
-  unviewed file.
-- `z` — fold every fully-viewed folder, then jump to the first unviewed file
-- `e` — on a file, enter the diff on the selected stop and edit it, like `e` in
-  the Diff pane
-- `c` — on a file, enter the diff and comment on the selected stop
-- `a` — on a file, enter the diff and ask Claude about the selected stop
+The Files and Pending edits panes walk the diff in [0] directly. The tree
+cursor stays on a file, and `j` / `k` move through the stops of its diff:
+
+- `j` / `k` / arrows — jump to the next / previous **stop**: the change blocks
+  and the comments drawn inline, in the order they read. A block taller than the
+  pane scrolls through itself first, three lines per press. A move up into a
+  tall block shows its bottom. The move stops at the first and the last stop of
+  the file.
+- `Shift+J` / `Shift+K` — jump to the next / previous file, skipping folder rows
+- `Home` / `G` — first / last file
+- `PgDn` / `PgUp` — page down / up in the diff
 - `s` — switch the diff between inline and side by side
+- `z` / `Z` — fold the done folders and jump to the first file left / unfold all
+
+Files pane:
+- `Space` — toggle viewed on the file. A mark does what `z` does next: it folds
+  every fully-viewed folder and jumps to the first unviewed file.
+- `z` — fold every fully-viewed folder, then jump to the first unviewed file
+- `Enter` — on a folder row, collapse / expand it
+- `c` — start the comment line picker on the selected block (see below)
+- `a` — ask Claude about the selected stop
+- `e` — open the file in the editor at the selected block's line
 - `w` — hide / show the changes that only touch whitespace
-- `Enter` — open file in the diff pane (folder: collapse / expand)
+- on a **pending comment** of yours:
+  - `Enter` / `e` — edit it (the same editor the Pending pane opens)
+  - `d` — discard it, from the draft review on GitHub too
+- on an **unresolved review thread** (read-only):
+  - `Enter` — answer it: a new comment of yours, on the same line
+  - `o` — open the thread on github.com
 
 Pending edits pane (local, uncommitted changes in the worktree). `--edits`
 lands here when there is something uncommitted, and on the Files pane when the
-tree is clean:
-- `j` / `k` — move (`Alt+j` / `Alt+k` skip folder rows)
-- `Space` — stage / unstage the file (or every file under a folder). The mark on
-  the left is the pane's "viewed" equivalent: `[ ]` unstaged, `[~]` partly
-  staged, `[✔]` fully staged (dimmed). Staging does what `z` does next: it folds
-  every fully-staged folder and jumps to the first unstaged file.
-- `Enter` — show the file's local diff in the diff pane, with block navigation.
-  It is the whole change against HEAD, however much of it is staged.
+tree is clean. The diff in [0] is the whole change against HEAD, however much
+of it is staged.
+- `Space` — stage / unstage the file. The mark on the left is the pane's
+  "viewed" equivalent: `[ ]` unstaged, `[~]` partly staged, `[✔]` fully staged
+  (dimmed). Staging does what `z` does next: it folds every fully-staged folder
+  and jumps to the first unstaged file.
+- `Enter` — on a folder row, collapse / expand it
 - `c` — commit; what is staged is what gets committed. With an empty index the
   whole list is committed, as before.
 - `P` — push the commits to the PR branch
-- `d` — revert the file (worktree *and* index, back to the PR head)
-- `e` — open the file in the editor
+- `d` — revert the selected change block, back to what HEAD holds. A file with
+  something staged loses the block from the index as well as from the disk.
+- `X` — revert the file (worktree *and* index, back to the PR head)
+- `e` — open the file in the editor at the selected block's line
 
 Pending comments pane:
 - `j` / `k` — move
@@ -144,26 +160,6 @@ Pending comments pane:
 
 While the Pending pane is focused the right pane shows the selected comment's
 target hunk (with the anchored line marked) and the comment body below it.
-
-Diff pane:
-- `j` / `k` / arrows — jump to next / previous **stop**: the change blocks and
-  the comments drawn inline, in the order they read. A block taller than the
-  pane scrolls through itself first, three lines per press.
-- `PgDn` / `PgUp` — page down / up
-- `c` — start the comment line picker on the enclosing block (see below)
-- `s` — switch the diff between inline and side by side
-- `w` — hide / show the changes that only touch whitespace (review diff only)
-- `e` — open the file in the editor at the current block's line
-- `Esc` — back to the files pane
-- on a **pending comment** of yours:
-  - `Enter` / `e` — edit it (the same editor the Pending pane opens)
-  - `d` — discard it, from the draft review on GitHub too
-- on an **unresolved review thread** (read-only):
-  - `Enter` — answer it: a new comment of yours, on the same line
-  - `o` — open the thread on github.com
-- on a **local** diff (opened with `Enter` from the pending-edits pane):
-  - `d` — revert the selected change block, back to what HEAD holds. A file with
-    something staged loses the block from the index as well as from the disk.
 
 Every diff carries a line-number gutter, dimmed on the left of the code: the old
 number then the new one inline, and one number per column side by side. A pane

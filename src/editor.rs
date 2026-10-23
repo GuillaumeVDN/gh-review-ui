@@ -469,8 +469,9 @@ pub fn open_current_edit_in_editor(st: &mut State) {
     }
     let wt = st.active_worktree.trim_end_matches('/').to_string();
     let abs = format!("{}/{}", wt, entry.path);
-    open_in_dedicated_editor(st, &wt, &abs, 1);
-    st.status = format!("Opening {} in editor…", entry.path);
+    let line = current_hunk_editor_line(st, &entry.path);
+    open_in_dedicated_editor(st, &wt, &abs, line);
+    st.status = format!("Opening {}:{line} in editor…", entry.path);
 }
 
 /// Open the selected file — at the top, or at the current hunk's line.

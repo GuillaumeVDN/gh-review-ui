@@ -27,7 +27,7 @@ fn wrapped_state() -> State {
     let (d, i) = parse_diff(&raw);
     st.hunks_by_file = d.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
     (st.diff_by_file, st.info_by_file) = (d, i);
-    st.focus = Focus::Diff;
+    st.focus = Focus::Files;
     st
 }
 
@@ -56,5 +56,47 @@ fn the_last_hunk_of_a_wrapped_diff_shows_on_screen() {
         nav::jump_stop(&mut st, -1);
         let out = screen(&mut st, 160, 30);
         assert!(out.contains("FIRST_NEW"), "the jump back is on screen (sbs={sbs}):\n{out}");
+    }
+}
+
+/// A block taller than the pane, then a short one.
+fn tall_state() -> State {
+    let mut raw = String::from("diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,42 @@\n");
+    raw.push_str("+TALL_TOP\n");
+    for i in 0..38 {
+        raw.push_str(&format!("+tall {i}\n"));
+    }
+    raw.push_str("+TALL_END\n ctx\n-old\n+SHORT_NEW\n");
+    let mut st = State::default();
+    st.files = vec![FileEntry { path: "f.txt".into(), viewed: false }];
+    st.tree = vec![TreeRow::File { depth: 0, name: "f.txt".into(), index: 0 }];
+    let (d, i) = parse_diff(&raw);
+    st.hunks_by_file = d.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+    (st.diff_by_file, st.info_by_file) = (d, i);
+    st.focus = Focus::Files;
+    st
+}
+
+#[test]
+fn a_move_up_into_a_tall_block_shows_its_end() {
+    for sbs in [false, true] {
+        let mut st = tall_state();
+        st.side_by_side = sbs;
+        screen(&mut st, 160, 20);
+        while nav::focused_stop(&st) == Some(nav::Stop::Block(0)) {
+            nav::step_stop(&mut st, 1);
+            screen(&mut st, 160, 20);
+        }
+        let out = screen(&mut st, 160, 20);
+        assert!(out.contains("SHORT_NEW"), "the second block is on screen (sbs={sbs}):\n{out}");
+
+        nav::step_stop(&mut st, -1);
+        let out = screen(&mut st, 160, 20);
+        assert_eq!(nav::focused_stop(&st), Some(nav::Stop::Block(0)));
+        assert!(out.contains("TALL_END"), "the end of the tall block shows (sbs={sbs}):\n{out}");
+        assert!(!out.contains("TALL_TOP"), "not its top (sbs={sbs}):\n{out}");
+
+        nav::step_stop(&mut st, -1);
+        assert_eq!(nav::focused_stop(&st), Some(nav::Stop::Block(0)), "k scrolls up through it");
     }
 }

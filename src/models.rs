@@ -172,12 +172,10 @@ pub enum Focus {
     Files,
     Edits,
     Pending,
-    Diff,
 }
 
-/// Tab-cycle order (matches top-to-bottom pane layout, diff last).
-pub const FOCUS_ORDER: [Focus; 6] =
-    [Focus::Prs, Focus::Commits, Focus::Files, Focus::Edits, Focus::Pending, Focus::Diff];
+/// Tab-cycle order (matches top-to-bottom pane layout).
+pub const FOCUS_ORDER: [Focus; 5] = [Focus::Prs, Focus::Commits, Focus::Files, Focus::Edits, Focus::Pending];
 
 impl Focus {
     pub fn next(self) -> Focus {
@@ -190,7 +188,6 @@ impl Focus {
     }
     pub fn from_digit(d: char) -> Option<Focus> {
         match d {
-            '0' => Some(Focus::Diff),
             '1' => Some(Focus::Prs),
             '2' => Some(Focus::Commits),
             '3' => Some(Focus::Files),
@@ -350,10 +347,6 @@ pub struct State {
     /// The worktree and its HEAD at the last edits scan. A commit made
     /// outside the TUI moves HEAD, and the PR has to be read again.
     pub edits_head: (String, String),
-    pub edit_diff_scroll: usize,
-    /// When set, the [0] pane shows this file's *local* diff (from [4]) with hunk
-    /// navigation instead of the PR review diff.
-    pub local_diff_path: Option<String>,
     /// Path → local change kind, for coloring edited files in [3] and [4].
     pub edit_kind_by_path: HashMap<String, EditKind>,
 
@@ -389,6 +382,12 @@ pub struct State {
     /// Set when a keyboard action should scroll the selected hunk/comment into
     /// view on the next render; free scrolling (mouse/PgUp/Dn) leaves it unset.
     pub diff_reveal_pending: bool,
+    /// The reveal shows the bottom of the stop: a move up lands on the end of
+    /// a tall block, which is the part next to where the move came from.
+    pub diff_reveal_tail: bool,
+    /// The file the diff pane showed at the last draw. Another file starts
+    /// again on its first stop.
+    pub diff_shown_path: Option<String>,
     pub diff_view: DiffView,
     /// The review diff draws side by side (old left, new right) instead of
     /// inline. `diff_scroll` counts side-by-side rows while this is set.

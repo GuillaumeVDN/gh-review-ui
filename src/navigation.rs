@@ -5,7 +5,7 @@
 //! (they skip `(None, None)` rows), so they work either way.
 
 use crate::models::{
-    DiffMap, HunkMap, InfoMap, LineInfo, PendingComment, Range, ReviewThread, StageState, State,
+    DiffMap, Focus, HunkMap, InfoMap, LineInfo, PendingComment, Range, ReviewThread, StageState, State,
     TreeRow,
 };
 
@@ -73,17 +73,25 @@ pub fn edit_preview_path(st: &State) -> Option<String> {
     }
 }
 
+/// The file of the Pending-edits pane, while that pane has the focus.
+fn local_diff_path(st: &State) -> Option<String> {
+    (st.focus == Focus::Edits).then(|| edit_preview_path(st)).flatten()
+}
+
 /// Whether the [0] pane is currently showing `path`'s *local* diff (from [4])
 /// rather than the PR review diff.
 pub fn is_local_diff(st: &State, path: &str) -> bool {
-    st.local_diff_path.as_deref() == Some(path)
+    local_diff_path(st).as_deref() == Some(path)
         || (!st.diff_by_file.contains_key(path) && st.edit_diff_by_file.contains_key(path))
 }
 
-/// The path whose diff the [0] pane shows: the pinned local file, else the
-/// selected Files-pane file.
+/// The path whose diff the [0] pane shows: the selected file of the
+/// Pending-edits pane while it has the focus, else the Files-pane one.
 pub fn diff_path(st: &State) -> Option<String> {
-    st.local_diff_path.clone().or_else(|| cur_file_path(st))
+    if st.focus == Focus::Edits {
+        return local_diff_path(st);
+    }
+    cur_file_path(st)
 }
 
 pub fn current_hunk_range(st: &State, path: &str) -> Option<Range> {
@@ -263,6 +271,7 @@ pub fn jump_stop(st: &mut State, direction: i64) {
         st.diff_hunk_idx = b;
     }
     st.diff_reveal_pending = true;
+    st.diff_reveal_tail = direction < 0;
 }
 
 const STOP_SCROLL: usize = 3;
@@ -368,7 +377,15 @@ pub fn hunk_for_comment(st: &State, c: &PendingComment) -> (Vec<String>, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DiffView, FileEntry, PendingComment, ReviewThread, TreeRow};
+    use crate::models::{DiffView, EditEntry, EditKind, FileEntry, PendingComment, ReviewThread, TreeRow};
+
+    /// Focus the Pending-edits pane on `path`, which shows its local diff.
+    pub(crate) fn show_local(st: &mut State, path: &str) {
+        st.focus = Focus::Edits;
+        st.edit_files = vec![EditEntry { path: path.into(), kind: EditKind::Modified }];
+        crate::tree::rebuild_edits(st);
+        st.edit_idx = st.edit_tree.iter().position(|r| matches!(r, TreeRow::File { .. })).unwrap();
+    }
 
     /// However much of a file is staged, its local diff is the whole change
     /// against HEAD.
@@ -377,7 +394,7 @@ mod tests {
         let mut st = State::default();
         let combined = vec!["@@ -1,2 +1,2 @@".to_string(), "-old".to_string(), "+new".to_string()];
         st.edit_diff_by_file.insert("f.rs".into(), combined.clone());
-        st.local_diff_path = Some("f.rs".into());
+        show_local(&mut st, "f.rs");
         st.staged_paths.insert("f.rs".into());
         st.unstaged_paths.insert("f.rs".into());
 
@@ -385,7 +402,7 @@ mod tests {
         assert_eq!(diff_lines(&st, "f.rs"), Some(&combined));
         // The review diff of the same path is another thing entirely.
         st.diff_by_file.insert("f.rs".into(), vec!["@@ -1 +1 @@".to_string()]);
-        st.local_diff_path = None;
+        st.focus = Focus::Files;
         assert_eq!(diff_lines(&st, "f.rs").map(Vec::len), Some(1));
     }
 
@@ -419,7 +436,7 @@ mod tests {
         st.edit_diff_by_file.insert("pr.rs".into(), vec![]); // also has local edits
         assert!(!is_local_diff(&st, "pr.rs")); // a PR file, no pin → PR diff
         assert!(is_local_diff(&st, "new.rs")); // not in PR diff → local
-        st.local_diff_path = Some("pr.rs".into());
+        show_local(&mut st, "pr.rs");
         assert!(is_local_diff(&st, "pr.rs")); // pinned from [4] → local
     }
 
@@ -612,7 +629,7 @@ mod tests {
         st.edit_diff_by_file.insert("f.py".into(), st.diff_by_file["f.py"].clone());
         st.edit_info_by_file.insert("f.py".into(), st.info_by_file["f.py"].clone());
         st.edit_hunks_by_file.insert("f.py".into(), st.hunks_by_file["f.py"].clone());
-        st.local_diff_path = Some("f.py".into());
+        show_local(&mut st, "f.py");
         assert_eq!(diff_stops(&st, "f.py"), vec![Stop::Block(0), Stop::Block(1)]);
     }
 
