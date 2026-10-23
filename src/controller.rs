@@ -480,7 +480,8 @@ pub fn begin_ask(st: &mut State) {
     st.overlay = Overlay::Ask { ta: TextArea::new("") };
 }
 
-/// Build a prompt from the selected hunk + question and launch Claude in a new
+/// Build a prompt from the selected hunk + question and hand it to the
+/// manager's chat when a card is open on this checkout, else to Claude in a new
 /// Ghostty window.
 pub fn confirm_ask(st: &mut State) {
     let Overlay::Ask { ta } = &st.overlay else { return };
@@ -521,6 +522,17 @@ pub fn confirm_ask(st: &mut State) {
          ```diff\n{snippet}```\n\n\
          My question:\n{question}\n"
     );
+    match editor::send_to_manager(st, &prompt, "ask-latest.txt") {
+        Ok(true) => {
+            st.status = "Sent the question to the manager's chat.".into();
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            st.status = format!("Failed to send to the manager: {e}");
+            return;
+        }
+    }
     let cwd = if st.active_worktree.is_empty() { st.repo_root.clone() } else { st.active_worktree.clone() };
     match editor::ask_claude(st, &prompt, &cwd) {
         Ok(()) => st.status = "Launched Claude in a new terminal…".into(),

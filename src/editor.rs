@@ -95,6 +95,23 @@ fn window_exists(title: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Hand `prompt` to the chat of a dashdoc-manager card open on this checkout.
+///
+/// A card open on this checkout means an agent is already working in it.
+/// A second window would be a second agent on the same worktree, which is
+/// how two of them end up editing the same file.
+pub fn send_to_manager(st: &State, prompt: &str, file_name: &str) -> Result<bool, String> {
+    let manager = [st.active_worktree.as_str(), st.repo_root.as_str()]
+        .into_iter()
+        .find(|root| !root.is_empty() && crate::ipc::manager_listening(root));
+    let Some(root) = manager else { return Ok(false) };
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join(file_name);
+    std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
+    Ok(crate::ipc::send_prompt(root, &file.display().to_string()))
+}
+
 /// Hand a whole review (all pending comments) to a local Claude.
 ///
 /// In order: a dashdoc-manager with this card open already has a Claude in its
@@ -106,18 +123,8 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<&'static st
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    // A card open on this checkout means an agent is already working in it.
-    // A second window would be a second agent on the same worktree, which is
-    // how two of them end up editing the same file.
-    let manager = [st.active_worktree.as_str(), st.repo_root.as_str()]
-        .into_iter()
-        .find(|root| !root.is_empty() && crate::ipc::manager_listening(root));
-    if let Some(root) = manager {
-        let file = dir.join("review-latest.txt");
-        std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
-        if crate::ipc::send_prompt(root, &file.display().to_string()) {
-            return Ok("the manager's chat");
-        }
+    if send_to_manager(st, prompt, "review-latest.txt")? {
+        return Ok("the manager's chat");
     }
 
     // Reuse a running review window if we can drive the keyboard.
