@@ -68,8 +68,8 @@ Global:
 - `r` — refresh PR list + active PR (also reloads details when on the PRs pane)
 - `D` — deep review: launch Claude in the PR worktree. It explains the PR context, then
   reviews the whole branch for bugs and implementation quality.
-- `Shift+J` / `Shift+K` — in the Files and Pending edits panes, jump to the next /
-  previous file. In the PRs pane, scroll the PR summary one line. Elsewhere,
+- `Shift+J` / `Shift+K` — in the Files and Pending edits panes, move to the next /
+  previous row of the tree, file or folder. In the PRs pane, scroll the PR summary one line. Elsewhere,
   scroll the diff one line.
 - `c` — comment on the current hunk (opens the line picker)
 - finish review — `Enter` in the Pending pane
@@ -101,15 +101,16 @@ at, it is what GitHub has.
 
 The right pane shows the selected commit's short SHA, author, date, and message.
 
-The Files and Pending edits panes walk the diff in [0] directly. The tree
-cursor stays on a file, and `j` / `k` move through the stops of its diff:
+The Files and Pending edits panes walk the diff in [0] directly. On a file,
+`j` / `k` move through the stops of its diff. On a folder, they move to the
+next / previous file:
 
 - `j` / `k` / arrows — jump to the next / previous **stop**: the change blocks
   and the comments drawn inline, in the order they read. A block taller than the
   pane scrolls through itself first, three lines per press. A move up into a
   tall block shows its bottom. The move stops at the first and the last stop of
   the file.
-- `Shift+J` / `Shift+K` — jump to the next / previous file, skipping folder rows
+- `Shift+J` / `Shift+K` — move to the next / previous row of the tree, file or folder
 - `Home` / `G` — first / last file
 - `PgDn` / `PgUp` — page down / up in the diff
 - `s` — switch the diff between inline and side by side

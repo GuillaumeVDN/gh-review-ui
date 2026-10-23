@@ -442,11 +442,11 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Commits => format!("Space: toggle · a: all/none · Enter: apply range · {common}"),
         Focus::Pending => format!("j/k · Alt+j/k/z: next file · Enter: submit · e: edit · d: delete · H: history · {common}"),
         Focus::Files => match focused_stop(st) {
-            Some(Stop::Pending(_)) => format!("j/k: stop · J/K: file · Enter/e: edit comment · d: discard · c: comment · Space: viewed+next · s/w · {common}"),
-            Some(Stop::Thread(_)) => format!("j/k: stop · J/K: file · Enter: answer · o: open in browser · c: comment · Space: viewed+next · s/w · {common}"),
-            _ => format!("j/k: block · J/K: file · Space: viewed+next · c: comment · a: ask Claude · e: editor · s: side by side · w: whitespace · z/Z: fold/unfold · {common}"),
+            Some(Stop::Pending(_)) => format!("j/k: stop · J/K: row · Enter/e: edit comment · d: discard · c: comment · Space: viewed+next · s/w · {common}"),
+            Some(Stop::Thread(_)) => format!("j/k: stop · J/K: row · Enter: answer · o: open in browser · c: comment · Space: viewed+next · s/w · {common}"),
+            _ => format!("j/k: block · J/K: row · Space: viewed+next · c: comment · a: ask Claude · e: editor · s: side by side · w: whitespace · z/Z: fold/unfold · {common}"),
         },
-        Focus::Edits => format!("j/k: block · J/K: file · Space: stage+next · d: revert block · X: revert file · c: commit+push · A: amend · w: no hooks · P: push · e: editor · s: side by side · z/Z · {common}"),
+        Focus::Edits => format!("j/k: block · J/K: row · Space: stage+next · d: revert block · X: revert file · c: commit+push · A: amend · w: no hooks · P: push · e: editor · s: side by side · z/Z · {common}"),
     }
 }
 

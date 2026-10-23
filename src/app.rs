@@ -266,14 +266,14 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         }
         KeyCode::Char('J') => match st.focus {
             Focus::Prs => st.details_scroll += 1,
-            Focus::Files => jump_file(st, 1),
-            Focus::Edits => jump_edit_file(st, 1),
+            Focus::Files => set_file_idx(st, st.file_idx + 1),
+            Focus::Edits => set_edit_idx(st, st.edit_idx + 1),
             _ => nav::scroll_diff(st, 1),
         },
         KeyCode::Char('K') => match st.focus {
             Focus::Prs => st.details_scroll = st.details_scroll.saturating_sub(1),
-            Focus::Files => jump_file(st, -1),
-            Focus::Edits => jump_edit_file(st, -1),
+            Focus::Files => set_file_idx(st, st.file_idx.saturating_sub(1)),
+            Focus::Edits => set_edit_idx(st, st.edit_idx.saturating_sub(1)),
             _ => nav::scroll_diff(st, -1),
         },
         KeyCode::Tab => st.focus = st.focus.next(),
