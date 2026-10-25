@@ -221,17 +221,21 @@ struct DiffRow<'a> {
     current: bool,
     selected: bool,
     local_del: bool,
+    /// A changed line looked at before: it reads like context.
+    seen: bool,
 }
 
 /// Emit the display rows of one diff line: the marker column, the line-number
 /// gutter, then the code wrapped to `tw`. The background carries the `+`/`-`
 /// meaning, so the code keeps its syntax colors.
 fn push_diff_rows(out: &mut Vec<Line<'static>>, vh: usize, row: &DiffRow, nw: usize, tw: usize, with_marker: bool) {
-    let kind = theme::classify_diff_line(row.line);
+    let kind = if row.seen { DiffKind::Context } else { theme::classify_diff_line(row.line) };
     let bg = theme::diff_row_style(kind, row.current);
     let text_style = if row.selected { bg.patch(theme::picked()) } else { bg };
     let spans = if row.local_del {
         vec![(theme::local_del(), row.line.replace('\t', "    "))]
+    } else if row.seen {
+        vec![(theme::dim(), row.line.replace('\t', "    "))]
     } else {
         code_spans(row.line, row.hl, row.current)
     };
@@ -539,6 +543,10 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
     if let Some(pr) = &st.active_pr {
         let n = st.files.iter().filter(|f| f.viewed).count();
         title = format!("[3] Files #{}  {}/{} viewed", pr.number, n, st.files.len());
+        let partial = st.files.iter().filter(|f| !f.viewed && st.partial_paths.contains(&f.path)).count();
+        if partial > 0 {
+            title.push_str(&format!(" · {partial} partly"));
+        }
     }
     let busy = st.busy.contains("active") || st.busy.contains("viewed");
     let b = block(&title, st.focus == Focus::Files, busy);
@@ -561,6 +569,7 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
             TreeRow::File { depth, name, index } => {
                 let path = &st.files[*index].path;
                 let viewed = st.files[*index].viewed;
+                let partly = !viewed && st.partial_paths.contains(path);
                 let edit = st.edit_kind_by_path.get(path).copied();
                 // Locally-edited files are colored (like [4]) to stand out from
                 // already-pushed changes; the change kind is shown as a sigil.
@@ -571,7 +580,7 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
                 };
                 let sigil = edit.map(|k| format!(" {}", k.sigil())).unwrap_or_default();
                 (
-                    format!("{}[{}] {}{sigil}", "  ".repeat(*depth), if viewed { "✔" } else { " " }, name),
+                    format!("{}[{}] {}{sigil}", "  ".repeat(*depth), if viewed { "✔" } else if partly { "◐" } else { " " }, name),
                     base,
                 )
             }
@@ -898,7 +907,8 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
                 .as_ref()
                 .zip(new_side(i))
                 .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
-        let kind = theme::classify_diff_line(ln);
+        let seen = !is_local_diff(st, path) && line_seen(st, path, i);
+        let kind = if seen { DiffKind::Context } else { theme::classify_diff_line(ln) };
         let bg = theme::diff_row_style(kind, current);
         if local_del {
             return SbsCell::plain(
@@ -913,7 +923,10 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
-            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
+            rows: match seen {
+                true => wrap_styled_hard(&[(theme::dim(), ln.replace('\t', "    "))], tw.max(1)),
+                false => wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
+            },
             row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
@@ -1208,6 +1221,11 @@ fn top_threads<'a>(st: &'a State, path: &str) -> Vec<(usize, &'a ReviewThread)> 
         .collect()
 }
 
+fn line_seen(st: &State, path: &str, i: usize) -> bool {
+    let key = st.line_keys.get(path).and_then(|ks| ks.get(i)).copied().flatten();
+    key.zip(st.seen_lines.get(path)).is_some_and(|(k, seen)| seen.contains(&k))
+}
+
 fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     let path = diff_path(st);
     let local = path.as_ref().map_or(false, |p| is_local_diff(st, p));
@@ -1301,6 +1319,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     };
     let now = now_epoch();
     let info_here = path.as_ref().and_then(|p| source_maps(st, p).1.get(p));
+    let seen = |i: usize| !local && path.as_ref().is_some_and(|p| line_seen(st, p, i));
 
     // Local (uncommitted) worktree edits to overlay in orange on the PR diff. The
     // local diff already *is* the edits, so no overlay there.
@@ -1399,6 +1418,7 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
                 current,
                 selected,
                 local_del,
+                seen: seen(i),
             };
             push_diff_rows(&mut out, vh, &row, nw, tw, true);
             // Local additions inserted after this head line (orange).
@@ -1890,6 +1910,7 @@ mod tests {
             current: true,
             selected: false,
             local_del: false,
+            seen: false,
         };
         push_diff_rows(&mut out, 10, &row, 4, 24, true);
         assert_eq!(out.len(), 1);

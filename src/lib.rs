@@ -3,7 +3,7 @@
 //! The crate is split so that almost all logic is pure and unit-tested,
 //! separate from the I/O layers:
 //!
-//! - [`diff`], [`markdown`], [`tree`], [`navigation`] — pure review logic
+//! - [`diff`], [`markdown`], [`tree`], [`navigation`], [`seen`] — pure review logic
 //! - [`models`] — data types + the central [`models::State`]
 //! - [`theme`], [`syntax`], [`omarchy`] — colors, diff styling and the active theme
 //! - [`gh`], [`api`] — `gh` CLI / GraphQL and the GitHub domain calls
@@ -24,6 +24,7 @@ pub mod markdown;
 pub mod models;
 pub mod navigation;
 pub mod omarchy;
+pub mod seen;
 pub mod syntax;
 pub mod term;
 pub mod textbuffer;

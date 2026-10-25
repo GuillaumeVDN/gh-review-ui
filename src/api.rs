@@ -1392,6 +1392,34 @@ pub fn save_local_comments(owner: &str, name: &str, number: i64, comments: &[Pen
     std::fs::write(&path, Value::Array(arr).to_string()).ok();
 }
 
+// ---- seen lines ----
+
+fn seen_path(owner: &str, name: &str, number: i64) -> PathBuf {
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| format!("{}/.cache", std::env::var("HOME").unwrap_or_default()));
+    PathBuf::from(cache)
+        .join("gh-review-ui")
+        .join("seen")
+        .join(format!("{owner}__{name}__pr-{number}.json"))
+}
+
+pub fn load_seen(owner: &str, name: &str, number: i64) -> HashMap<String, HashSet<u64>> {
+    std::fs::read_to_string(seen_path(owner, name, number))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_seen(owner: &str, name: &str, number: i64, seen: &HashMap<String, HashSet<u64>>) {
+    let path = seen_path(owner, name, number);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Ok(s) = serde_json::to_string(seen) {
+        std::fs::write(&path, s).ok();
+    }
+}
+
 // ---- session persistence ----
 
 fn session_file() -> PathBuf {

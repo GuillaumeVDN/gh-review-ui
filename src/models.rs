@@ -323,6 +323,11 @@ pub struct State {
     /// these marks back on every reload, and only this set tells them apart
     /// from the marks made against the PR's own version.
     pub marked_here: HashSet<String>,
+    /// The keys of the changed lines seen per file, from [`crate::seen`].
+    pub seen_lines: HashMap<String, HashSet<u64>>,
+    /// The key of each line of `diff_by_file`.
+    pub line_keys: HashMap<String, Vec<Option<u64>>>,
+    pub partial_paths: HashSet<String>,
     /// In-flight optimistic viewed changes, oldest first: (paths, target value),
     /// so a failed mark can be reverted. The single worker answers them in order.
     pub viewed_inflight: std::collections::VecDeque<(Vec<String>, bool)>,

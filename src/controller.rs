@@ -28,6 +28,8 @@ fn set_diff(
     info: std::collections::HashMap<String, Vec<crate::models::LineInfo>>,
 ) {
     st.hunks_by_file = diff.iter().map(|(p, l)| (p.clone(), compute_hunks(l))).collect();
+    st.line_keys = diff.iter().map(|(p, l)| (p.clone(), crate::seen::line_keys(l))).collect();
+    st.partial_paths = crate::seen::partial(&st.line_keys, &st.seen_lines);
     st.diff_by_file = diff;
     st.info_by_file = info;
     st.diff_scroll = 0;
@@ -192,6 +194,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.pr_paths.clear();
                     st.viewed_by_path.clear();
                     st.marked_here.clear();
+                    st.seen_lines.clear();
                     st.commits.clear();
                     st.commit_selected.clear();
                     st.commit_idx = 0;
@@ -205,6 +208,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                         st.collapsed_dirs.clear();
                         st.viewed_by_path.clear();
                         st.marked_here.clear();
+                        st.seen_lines = api::load_seen(&st.repo_owner, &st.repo_name, n);
                     }
                     let matched = st.prs.iter().find(|p| p.number == n).cloned();
                     let mut pr = matched.unwrap_or(Pr {
@@ -235,6 +239,20 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.commit_idx = 0;
                     st.commit_offset = 0;
                     set_diff(st, diff, info);
+                    // A file marked viewed elsewhere, or before this store
+                    // existed, has no lines on record yet.
+                    let unrecorded: Vec<String> = st
+                        .files
+                        .iter()
+                        .filter(|f| f.viewed && !st.seen_lines.contains_key(&f.path))
+                        .map(|f| f.path.clone())
+                        .collect();
+                    for p in &unrecorded {
+                        record_seen(st, p, true);
+                    }
+                    if !unrecorded.is_empty() {
+                        save_seen(st);
+                    }
                     request_blobs(st, tx);
                     st.status = format!(
                         "#{n} · {} file{} · {} commit{}{}",
@@ -1267,6 +1285,8 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
             st.files[index].viewed = new_v;
             st.viewed_by_path.insert(path.clone(), new_v);
             remember_mark(st, &path, new_v);
+            record_seen(st, &path, new_v);
+            save_seen(st);
             if !pr_has_path(st, &path) {
                 st.status = format!(
                     "{} {path}{}",
@@ -1304,7 +1324,9 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
             for p in &paths {
                 st.viewed_by_path.insert(p.clone(), new_v);
                 remember_mark(st, p, new_v);
+                record_seen(st, p, new_v);
             }
+            save_seen(st);
             // One rejected path fails the batch it is in, so the folder's local
             // files never reach GitHub at all.
             let (on_pr, local_only): (Vec<String>, Vec<String>) =
@@ -1337,6 +1359,28 @@ fn revert_viewed(st: &mut State, paths: &[String], target: bool) {
     for p in failed {
         remember_mark(st, &p, !target);
         st.viewed_by_path.insert(p, !target);
+    }
+}
+
+/// A mark adds the lines on screen to the ones seen before, because a diff of
+/// some commits only shows part of the file. An unmark asks for the whole
+/// file again.
+fn record_seen(st: &mut State, path: &str, viewed: bool) {
+    if !viewed {
+        st.seen_lines.remove(path);
+    } else if let Some(keys) = st.line_keys.get(path) {
+        st.seen_lines.entry(path.to_string()).or_default().extend(keys.iter().flatten());
+    }
+    st.partial_paths = crate::seen::partial(&st.line_keys, &st.seen_lines);
+}
+
+fn save_seen(st: &State) {
+    // Without a repo the file name collides across repos, and only tests run that way.
+    if st.repo_owner.is_empty() {
+        return;
+    }
+    if let Some(pr) = &st.active_pr {
+        api::save_seen(&st.repo_owner, &st.repo_name, pr.number, &st.seen_lines);
     }
 }
 
@@ -2166,6 +2210,26 @@ mod tests {
 
         assert_eq!(clear_stale_marks(&mut files, &stale, &marked_here, &known), 0);
         assert!(files[0].viewed);
+    }
+
+    /// A commit that adds a line to a file seen before leaves the old lines
+    /// seen, and the file reads as partly viewed.
+    #[test]
+    fn a_new_commit_leaves_a_viewed_file_partly_seen() {
+        let mut st = State::default();
+        let diff = |lines: &[&str]| -> std::collections::HashMap<String, Vec<String>> {
+            [("a.rs".to_string(), lines.iter().map(|l| l.to_string()).collect())].into_iter().collect()
+        };
+        set_diff(&mut st, diff(&["@@ -1,3 +1,3 @@", " a", "-b", "+c", " d"]), Default::default());
+        record_seen(&mut st, "a.rs", true);
+        assert!(st.partial_paths.is_empty(), "everything on screen is seen");
+
+        set_diff(&mut st, diff(&["@@ -1,3 +1,4 @@", " a", "-b", "+c", " d", "+e"]), Default::default());
+        assert!(st.partial_paths.contains("a.rs"));
+
+        record_seen(&mut st, "a.rs", false);
+        assert!(st.seen_lines.is_empty(), "an unmark asks for the whole file again");
+        assert!(st.partial_paths.is_empty());
     }
 
     /// GitHub keeps a stale mark, so each reload clears it again. The panes
