@@ -319,6 +319,10 @@ pub struct State {
     /// these can be marked viewed there, and that answer must not move.
     pub pr_paths: HashSet<String>,
     pub viewed_by_path: HashMap<String, bool>,
+    /// The paths marked viewed in this session, on the active PR. GitHub hands
+    /// these marks back on every reload, and only this set tells them apart
+    /// from the marks made against the PR's own version.
+    pub marked_here: HashSet<String>,
     /// In-flight optimistic viewed changes, oldest first: (paths, target value),
     /// so a failed mark can be reverted. The single worker answers them in order.
     pub viewed_inflight: std::collections::VecDeque<(Vec<String>, bool)>,

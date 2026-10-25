@@ -191,6 +191,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     st.pr_files.clear();
                     st.pr_paths.clear();
                     st.viewed_by_path.clear();
+                    st.marked_here.clear();
                     st.commits.clear();
                     st.commit_selected.clear();
                     st.commit_idx = 0;
@@ -202,6 +203,8 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     // file shows — even ones already viewed/folded last session.
                     if st.active_pr.as_ref().map_or(true, |p| p.number != n) {
                         st.collapsed_dirs.clear();
+                        st.viewed_by_path.clear();
+                        st.marked_here.clear();
                     }
                     let matched = st.prs.iter().find(|p| p.number == n).cloned();
                     let mut pr = matched.unwrap_or(Pr {
@@ -223,7 +226,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
                     // The old map, so a mark on a file only the checkout has
                     // survives a refresh — GitHub cannot hold that one for us.
                     let mut files = files_the_diff_shows(files, &diff, &st.viewed_by_path);
-                    let unviewed = clear_stale_marks(&mut files, &stale_viewed);
+                    let unviewed = clear_stale_marks(&mut files, &stale_viewed, &st.marked_here, &st.viewed_by_path);
                     st.viewed_by_path = files.iter().map(|f| (f.path.clone(), f.viewed)).collect();
                     st.pr_files = files.clone();
                     st.files = files;
@@ -1263,6 +1266,7 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
             // Optimistic: reflect it now so a following `z`/navigation sees it.
             st.files[index].viewed = new_v;
             st.viewed_by_path.insert(path.clone(), new_v);
+            remember_mark(st, &path, new_v);
             if !pr_has_path(st, &path) {
                 st.status = format!(
                     "{} {path}{}",
@@ -1299,6 +1303,7 @@ fn apply_mark(st: &mut State, tx: &Sender<Job>) -> Option<bool> {
             }
             for p in &paths {
                 st.viewed_by_path.insert(p.clone(), new_v);
+                remember_mark(st, p, new_v);
             }
             // One rejected path fails the batch it is in, so the folder's local
             // files never reach GitHub at all.
@@ -1330,7 +1335,16 @@ fn revert_viewed(st: &mut State, paths: &[String], target: bool) {
         }
     }
     for p in failed {
+        remember_mark(st, &p, !target);
         st.viewed_by_path.insert(p, !target);
+    }
+}
+
+fn remember_mark(st: &mut State, path: &str, viewed: bool) {
+    if viewed {
+        st.marked_here.insert(path.to_string());
+    } else {
+        st.marked_here.remove(path);
     }
 }
 
@@ -1877,7 +1891,7 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
 /// — which is the whole point of the mark, and exactly why a stale one is
 /// worse than none.
 ///
-/// Returns how many were cleared, so the load can say so.
+/// Returns how many marks the panes lose, so the load can say so.
 ///
 /// Only the marks GitHub gave us are touched. One made in this session was
 /// made *looking at* the local state, so it stands: clearing those would undo
@@ -1885,11 +1899,20 @@ pub fn try_open_pending_commit(st: &mut State, tx: &Sender<Job>) {
 fn clear_stale_marks(
     files: &mut [FileEntry],
     stale: &std::collections::HashSet<String>,
+    marked_here: &std::collections::HashSet<String>,
+    known: &std::collections::HashMap<String, bool>,
 ) -> usize {
     let mut cleared = 0;
-    for f in files.iter_mut().filter(|f| f.viewed && stale.contains(&f.path)) {
+    for f in files
+        .iter_mut()
+        .filter(|f| f.viewed && stale.contains(&f.path) && !marked_here.contains(&f.path))
+    {
         f.viewed = false;
-        cleared += 1;
+        // GitHub keeps the mark, so every reload clears it again. Only a file
+        // the panes still showed as viewed is news.
+        if known.get(&f.path) != Some(&false) {
+            cleared += 1;
+        }
     }
     cleared
 }
@@ -2123,10 +2146,38 @@ mod tests {
         let stale: std::collections::HashSet<String> =
             ["touched.rs".to_string(), "never_viewed.rs".to_string()].into_iter().collect();
 
-        assert_eq!(clear_stale_marks(&mut files, &stale), 1, "only a mark it had counts");
+        let none = std::collections::HashSet::new();
+        let fresh = std::collections::HashMap::new();
+        assert_eq!(clear_stale_marks(&mut files, &stale, &none, &fresh), 1, "only a mark it had counts");
         assert!(!files[0].viewed);
         assert!(files[1].viewed, "nothing local touched it");
         assert!(!files[2].viewed);
+    }
+
+    /// A mark made in the session reaches GitHub, which hands it back on the
+    /// reload that every local commit runs. It was made against the local
+    /// version, so it stands.
+    #[test]
+    fn a_mark_made_in_the_session_survives_the_reload_after_a_local_commit() {
+        let mut files = vec![FileEntry { path: "edited.rs".into(), viewed: true }];
+        let stale: std::collections::HashSet<String> = ["edited.rs".to_string()].into_iter().collect();
+        let marked_here: std::collections::HashSet<String> = stale.clone();
+        let known = std::collections::HashMap::new();
+
+        assert_eq!(clear_stale_marks(&mut files, &stale, &marked_here, &known), 0);
+        assert!(files[0].viewed);
+    }
+
+    /// GitHub keeps a stale mark, so each reload clears it again. The panes
+    /// already showed it unviewed, and the status has nothing new to report.
+    #[test]
+    fn a_stale_mark_cleared_before_is_not_counted_again() {
+        let mut files = vec![FileEntry { path: "touched.rs".into(), viewed: true }];
+        let stale: std::collections::HashSet<String> = ["touched.rs".to_string()].into_iter().collect();
+        let known: std::collections::HashMap<String, bool> = [("touched.rs".to_string(), false)].into_iter().collect();
+
+        assert_eq!(clear_stale_marks(&mut files, &stale, &std::collections::HashSet::new(), &known), 0);
+        assert!(!files[0].viewed, "the mark still goes");
     }
 
     /// GitHub rejects a mark on a path the PR does not have, so those never go
