@@ -54,6 +54,7 @@ fn rgb(c: Rgb) -> Color {
 /// How far a diff tint carries its hue, and the contrast the code on it keeps.
 const ADD_DEL_TINT: f32 = 0.18;
 const CURRENT_TINT: f32 = 0.32;
+const SEEN_TINT: f32 = 0.07;
 const TINT_FLOOR: f32 = 5.5;
 const CURRENT_FLOOR: f32 = 4.5;
 /// How far a review thread's band carries the selection color.
@@ -107,6 +108,8 @@ pub struct Palette {
     del_bg: Color,
     add_bg_current: Color,
     del_bg_current: Color,
+    add_bg_seen: Color,
+    del_bg_seen: Color,
     thread_bg: Color,
 }
 
@@ -117,6 +120,11 @@ impl Palette {
             Appearance::Dark => (22, 52, 28, 88),
             Appearance::Light => (194, 224, 151, 217),
         };
+        // The 256 colors have no green fainter than 22, so these two are rgb.
+        let (add_seen, del_seen) = match appearance {
+            Appearance::Dark => (Color::Rgb(0x10, 0x22, 0x10), Color::Rgb(0x26, 0x10, 0x10)),
+            Appearance::Light => (Color::Rgb(0xec, 0xf8, 0xec), Color::Rgb(0xfb, 0xec, 0xec)),
+        };
         Palette {
             appearance,
             theme: None,
@@ -124,6 +132,8 @@ impl Palette {
             del_bg: Color::Indexed(del),
             add_bg_current: Color::Indexed(add_cur),
             del_bg_current: Color::Indexed(del_cur),
+            add_bg_seen: add_seen,
+            del_bg_seen: del_seen,
             thread_bg: Color::Indexed(match appearance {
                 Appearance::Dark => 236,
                 Appearance::Light => 254,
@@ -145,6 +155,8 @@ impl Palette {
             del_bg: band(c.red, ADD_DEL_TINT, TINT_FLOOR),
             add_bg_current: band(c.green, CURRENT_TINT, CURRENT_FLOOR),
             del_bg_current: band(c.red, CURRENT_TINT, CURRENT_FLOOR),
+            add_bg_seen: band(c.green, SEEN_TINT, TINT_FLOOR),
+            del_bg_seen: band(c.red, SEEN_TINT, TINT_FLOOR),
             thread_bg: band(c.selection, THREAD_TINT, TINT_FLOOR),
             theme: Some(c),
         }
@@ -179,6 +191,16 @@ impl Palette {
             (DiffKind::Del, false) => Style::default().bg(self.del_bg),
             (DiffKind::Del, true) => Style::default().bg(self.del_bg_current),
             _ => Style::default(),
+        }
+    }
+
+    /// A changed line looked at before a later commit: a fainter band. Inside
+    /// the focused block it takes the plain band, so the block still stands out.
+    pub fn seen_row(&self, kind: DiffKind, current: bool) -> Style {
+        match (kind, current) {
+            (DiffKind::Add, false) => Style::default().bg(self.add_bg_seen),
+            (DiffKind::Del, false) => Style::default().bg(self.del_bg_seen),
+            _ => self.row(kind, false),
         }
     }
 
@@ -434,6 +456,10 @@ pub fn classify_diff_line(line: &str) -> DiffKind {
 
 pub fn diff_row_style(kind: DiffKind, current: bool) -> Style {
     palette().row(kind, current)
+}
+
+pub fn diff_seen_row_style(kind: DiffKind, current: bool) -> Style {
+    palette().seen_row(kind, current)
 }
 
 pub fn diff_marker_style(kind: DiffKind, current: bool) -> Style {
@@ -720,6 +746,8 @@ mod tests {
             }
             assert_ne!(p.add_bg, p.add_bg_current);
             assert_ne!(p.del_bg, p.del_bg_current);
+            assert_ne!(p.add_bg, p.add_bg_seen, "a seen line reads apart from a new one");
+            assert_ne!(p.del_bg, p.del_bg_seen);
         }
     }
 

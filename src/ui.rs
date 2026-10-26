@@ -221,7 +221,7 @@ struct DiffRow<'a> {
     current: bool,
     selected: bool,
     local_del: bool,
-    /// A changed line looked at before: it reads like context.
+    /// A changed line looked at before: it sits on a fainter band.
     seen: bool,
 }
 
@@ -229,13 +229,14 @@ struct DiffRow<'a> {
 /// gutter, then the code wrapped to `tw`. The background carries the `+`/`-`
 /// meaning, so the code keeps its syntax colors.
 fn push_diff_rows(out: &mut Vec<Line<'static>>, vh: usize, row: &DiffRow, nw: usize, tw: usize, with_marker: bool) {
-    let kind = if row.seen { DiffKind::Context } else { theme::classify_diff_line(row.line) };
-    let bg = theme::diff_row_style(kind, row.current);
+    let kind = theme::classify_diff_line(row.line);
+    let bg = match row.seen {
+        true => theme::diff_seen_row_style(kind, row.current),
+        false => theme::diff_row_style(kind, row.current),
+    };
     let text_style = if row.selected { bg.patch(theme::picked()) } else { bg };
     let spans = if row.local_del {
         vec![(theme::local_del(), row.line.replace('\t', "    "))]
-    } else if row.seen {
-        vec![(theme::dim(), row.line.replace('\t', "    "))]
     } else {
         code_spans(row.line, row.hl, row.current)
     };
@@ -908,8 +909,11 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
                 .zip(new_side(i))
                 .map_or(false, |(ov, l)| ov.deleted_heads.contains(&l));
         let seen = !is_local_diff(st, path) && line_seen(st, path, i);
-        let kind = if seen { DiffKind::Context } else { theme::classify_diff_line(ln) };
-        let bg = theme::diff_row_style(kind, current);
+        let kind = theme::classify_diff_line(ln);
+        let bg = match seen {
+            true => theme::diff_seen_row_style(kind, current),
+            false => theme::diff_row_style(kind, current),
+        };
         if local_del {
             return SbsCell::plain(
                 gutter(&[if is_new { new } else { old }], nw),
@@ -923,10 +927,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
-            rows: match seen {
-                true => wrap_styled_hard(&[(theme::dim(), ln.replace('\t', "    "))], tw.max(1)),
-                false => wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
-            },
+            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
             row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
