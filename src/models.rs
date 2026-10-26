@@ -289,6 +289,26 @@ pub struct DiffView {
     pub end_line: usize,
 }
 
+/// Where the last render drew a modal's text, so a mouse cell maps back to a
+/// buffer position.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ModalText {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// First wrapped row on screen.
+    pub first: usize,
+}
+
+/// A mouse selection in a modal's text, as (line, char column) buffer
+/// positions. Both ends are inclusive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextSelect {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
 #[derive(Default)]
 pub struct State {
     pub repo_owner: String,
@@ -430,6 +450,8 @@ pub struct State {
     pub status: String,
     pub busy: HashSet<String>,
     pub overlay: Overlay,
+    pub modal_text: Option<ModalText>,
+    pub text_select: Option<TextSelect>,
     pub should_quit: bool,
 }
 

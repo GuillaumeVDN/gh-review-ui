@@ -74,6 +74,43 @@ pub fn open_url(url: &str) {
         .spawn();
 }
 
+/// Put text on the system clipboard. Without `wl-copy`, the terminal gets an
+/// OSC 52 request, which also reaches the local clipboard over SSH.
+pub fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    if let Ok(mut child) = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let _ = out.flush();
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 const REVIEW_TITLE: &str = "ghr-review-claude";
 
 fn has_cmd(cmd: &str) -> bool {
@@ -517,6 +554,13 @@ mod tests {
     #[test]
     fn we_can_walk_up_from_ourselves() {
         assert!(parent_pid(std::process::id()).is_some_and(|p| p > 0));
+    }
+
+    #[test]
+    fn base64_pads_the_last_group() {
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"M"), "TQ==");
     }
 
     #[test]

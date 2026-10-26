@@ -213,6 +213,40 @@ pub fn wrap(ta: &TextArea, width: usize) -> (Vec<(usize, usize, String)>, usize,
     (visual, before + ta.col / width, ta.col % width)
 }
 
+/// The buffer position under a cell of the wrapped text. A cell past the end
+/// of a row or below the text lands on the nearest end.
+pub fn position_at(ta: &TextArea, width: usize, vrow: usize, vcol: usize) -> (usize, usize) {
+    let (visual, _, _) = wrap(ta, width);
+    match visual.get(vrow) {
+        Some((lrow, start, text)) => (*lrow, start + vcol.min(text.chars().count())),
+        None => {
+            let last = ta.lines.len() - 1;
+            (last, ta.lines[last].chars().count())
+        }
+    }
+}
+
+/// The ordered `[start, end)` range between two inclusive selection ends.
+pub fn select_range(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    (start, (end.0, end.1 + 1))
+}
+
+pub fn selected_text(ta: &TextArea, a: (usize, usize), b: (usize, usize)) -> String {
+    let (start, end) = select_range(a, b);
+    let mut out = String::new();
+    for lrow in start.0..=end.0.min(ta.lines.len() - 1) {
+        let chars: Vec<char> = ta.lines[lrow].chars().collect();
+        let from = if lrow == start.0 { start.1.min(chars.len()) } else { 0 };
+        let to = if lrow == end.0 { end.1.min(chars.len()) } else { chars.len() };
+        if lrow > start.0 {
+            out.push('\n');
+        }
+        out.extend(&chars[from..to.max(from)]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +335,21 @@ mod tests {
         let (vis, vr, vc) = wrap(&ta, 4);
         assert_eq!(vis.len(), 3);
         assert_eq!((vr, vc), (2, 0));
+    }
+
+    #[test]
+    fn a_selection_spans_lines_in_either_direction() {
+        let ta = TextArea::new("hello world\nsecond line\nthird");
+        assert_eq!(selected_text(&ta, (0, 6), (1, 5)), "world\nsecond");
+        assert_eq!(selected_text(&ta, (1, 5), (0, 6)), "world\nsecond");
+        assert_eq!(selected_text(&ta, (2, 0), (2, 99)), "third");
+    }
+
+    #[test]
+    fn a_cell_maps_back_through_the_wrap() {
+        let ta = TextArea::new("abcdefgh\nxy");
+        assert_eq!(position_at(&ta, 5, 1, 1), (0, 6));
+        assert_eq!(position_at(&ta, 5, 2, 9), (1, 2));
+        assert_eq!(position_at(&ta, 5, 7, 0), (1, 2));
     }
 }

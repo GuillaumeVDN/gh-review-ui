@@ -14,9 +14,9 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::models::{Category, CommitKind, Focus, Overlay, State, TreeRow, SUBMIT_CHOICES};
+use crate::models::{Category, CommitKind, Focus, Overlay, State, TextSelect, TreeRow, SUBMIT_CHOICES};
 use crate::navigation as nav;
-use crate::textbuffer::TextArea;
+use crate::textbuffer::{self, TextArea};
 use crate::worker::{Job, Msg};
 use crate::{api, controller, editor, theme, ui, worker};
 
@@ -459,6 +459,17 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     let ctrl = m.contains(KeyModifiers::CONTROL);
     let alt = m.contains(KeyModifiers::ALT);
 
+    let copy = match k.code {
+        KeyCode::Insert => ctrl,
+        KeyCode::Char('c' | 'C') => ctrl || m.contains(KeyModifiers::SUPER),
+        _ => false,
+    };
+    if copy && st.text_select.is_some() {
+        copy_selection(st);
+        return;
+    }
+    st.text_select = None;
+
     // Hook output: nothing to type into. While they run, Esc puts the window
     // away without cancelling them — a hook that hangs must not take the
     // keyboard with it — and everything else is ignored.
@@ -805,6 +816,10 @@ fn checkout_local(st: &mut State, tx: &mpsc::Sender<Job>) {
 
 
 fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
+    if overlay_ta(st).is_some() {
+        handle_modal_mouse(st, m);
+        return;
+    }
     let (rects, _, _) = ui::compute_layout(area, st);
     let (col, row) = (m.column, m.row);
     let hit = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
@@ -837,6 +852,41 @@ fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
         None if hit(rects.right) => scroll_right(st, delta),
         None => {}
     }
+}
+
+/// Drag over a modal's text to select it, like a terminal does. The release
+/// copies the selection; the highlight stays until the next key or click.
+fn handle_modal_mouse(st: &mut State, m: MouseEvent) {
+    let Some(text) = st.modal_text else { return };
+    let inside = m.column >= text.x
+        && m.column < text.x + text.width
+        && m.row >= text.y
+        && m.row < text.y + text.height;
+    let vrow = text.first + m.row.saturating_sub(text.y).min(text.height.saturating_sub(1)) as usize;
+    let vcol = m.column.saturating_sub(text.x).min(text.width.saturating_sub(1)) as usize;
+    let width = text.width.max(1) as usize;
+    let Some(ta) = overlay_ta(st) else { return };
+    let pos = textbuffer::position_at(ta, width, vrow, vcol);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            st.text_select = inside.then_some(TextSelect { anchor: pos, head: pos });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(sel) = &mut st.text_select {
+                sel.head = pos;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => copy_selection(st),
+        _ => {}
+    }
+}
+
+fn copy_selection(st: &mut State) {
+    let Some(sel) = st.text_select.filter(|s| s.anchor != s.head) else { return };
+    let Some(ta) = overlay_ta(st) else { return };
+    let text = textbuffer::selected_text(ta, sel.anchor, sel.head);
+    editor::copy_to_clipboard(&text);
+    st.status = format!("Copied {} characters.", text.chars().count());
 }
 
 fn scroll_pane(st: &mut State, pane: Focus, delta: i64) {

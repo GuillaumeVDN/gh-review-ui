@@ -10,8 +10,8 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    ArchiveBatch, CommitKind, DiffView, Focus, LineInfo, Overlay, PendingComment, ReviewThread, StageState, State,
-    TreeRow, SUBMIT_CHOICES,
+    ArchiveBatch, CommitKind, DiffView, Focus, LineInfo, ModalText, Overlay, PendingComment, ReviewThread, StageState, State,
+    TextSelect, TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
     current_hunk_range, diff_path, focused_stop, hunk_for_comment, is_local_diff,
@@ -436,7 +436,7 @@ pub fn render(f: &mut Frame, st: &mut State) {
     f.render_widget(Paragraph::new(status.to_string()).style(theme::status()), status_area);
     f.render_widget(Paragraph::new(shortcuts_for(st)).style(theme::keys()), help_area);
 
-    render_overlay(f, st);
+    st.modal_text = render_overlay(f, st);
 }
 
 fn shortcuts_for(st: &State) -> String {
@@ -1547,39 +1547,74 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
 }
 
-fn draw_editor(f: &mut Frame, ta: &textbuffer::TextArea, inner: Rect, help: &str) {
-    let editor_h = inner.height.saturating_sub(1) as usize;
-    let editor_w = inner.width as usize;
-    let (visual, cur_vrow, cur_vcol) = textbuffer::wrap(ta, editor_w.max(1));
-    let first = cur_vrow.saturating_sub(editor_h.saturating_sub(1));
-    let mut out = Vec::new();
-    for (_, _, text) in visual.iter().skip(first).take(editor_h) {
-        out.push(Line::from(text.clone()));
+/// The wrapped text of a modal, scrolled to keep the cursor in view, with the
+/// mouse selection highlighted.
+fn draw_text(f: &mut Frame, ta: &textbuffer::TextArea, rect: Rect, sel: Option<TextSelect>, cursor: bool) -> ModalText {
+    let height = rect.height as usize;
+    let (visual, cur_vrow, cur_vcol) = textbuffer::wrap(ta, rect.width.max(1) as usize);
+    let first = cur_vrow.saturating_sub(height.saturating_sub(1));
+    let range = sel.filter(|s| s.anchor != s.head).map(|s| textbuffer::select_range(s.anchor, s.head));
+    let out: Vec<Line> = visual
+        .iter()
+        .skip(first)
+        .take(height)
+        .map(|(lrow, start, text)| selectable_row(*lrow, *start, text, range))
+        .collect();
+    f.render_widget(Paragraph::new(out), rect);
+    if cursor && cur_vrow - first < height {
+        let cx = rect.x + (cur_vcol as u16).min(rect.width.saturating_sub(1));
+        f.set_cursor_position((cx, rect.y + (cur_vrow - first) as u16));
     }
-    f.render_widget(Paragraph::new(out), Rect { height: inner.height.saturating_sub(1), ..inner });
-    // help line at the bottom of the modal
+    ModalText { x: rect.x, y: rect.y, width: rect.width, height: rect.height, first }
+}
+
+fn selectable_row(
+    lrow: usize,
+    start: usize,
+    text: &str,
+    range: Option<((usize, usize), (usize, usize))>,
+) -> Line<'static> {
+    let Some((from, to)) = range else {
+        return Line::from(text.to_string());
+    };
+    let spans: Vec<Span> = text
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let at = (lrow, start + i);
+            let style = if from <= at && at < to { theme::selection() } else { Style::default() };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect();
+    Line::from(spans)
+}
+
+fn draw_editor(f: &mut Frame, ta: &textbuffer::TextArea, sel: Option<TextSelect>, inner: Rect, help: &str) -> ModalText {
+    let text = draw_text(f, ta, Rect { height: inner.height.saturating_sub(1), ..inner }, sel, true);
     let help_y = inner.y + inner.height.saturating_sub(1);
     f.render_widget(
         Paragraph::new(help.to_string()).style(theme::keys()),
         Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
     );
-    // cursor
-    let cx = inner.x + (cur_vcol as u16).min(inner.width.saturating_sub(1));
-    let cy = inner.y + (cur_vrow.saturating_sub(first)) as u16;
-    if cy < help_y {
-        f.set_cursor_position((cx, cy));
-    }
+    text
 }
 
 /// The shared comment-editor modal (used by both new-comment and edit-comment):
 /// a centered box with a title, the wrapped text editor and a shortcuts line.
-fn draw_modal_editor(f: &mut Frame, area: Rect, ta: &textbuffer::TextArea, title: &str, help: &str) {
+fn draw_modal_editor(
+    f: &mut Frame,
+    area: Rect,
+    ta: &textbuffer::TextArea,
+    sel: Option<TextSelect>,
+    title: &str,
+    help: &str,
+) -> ModalText {
     let rect = centered(area, 120.min(area.width.saturating_sub(4)), 18.min(area.height.saturating_sub(4)));
     let b = block(title, true, false);
     let inner = b.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(b, rect);
-    draw_editor(f, ta, inner, help);
+    draw_editor(f, ta, sel, inner, help)
 }
 
 /// A commit's hooks while they run, and what they said if they refused.
@@ -1682,21 +1717,22 @@ fn archive_kind_style(kind: &str) -> Style {
     }
 }
 
-fn render_overlay(f: &mut Frame, st: &State) {
+fn render_overlay(f: &mut Frame, st: &State) -> Option<ModalText> {
     let area = f.area();
+    let sel = st.text_select;
     match &st.overlay {
-        Overlay::None => {}
+        Overlay::None => None,
         Overlay::Comment { ta, path, line, side, start_line, .. } => {
             let where_ = match start_line {
                 Some(s) => format!("{path}:{s}-{line}"),
                 None => format!("{path}:{line} ({side})"),
             };
-            draw_modal_editor(f, area, ta, &format!("Comment on {where_}"),
-                "Enter: add · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: back");
+            Some(draw_modal_editor(f, area, ta, sel, &format!("Comment on {where_}"),
+                "Enter: add · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+Bksp: del word · Esc: back"))
         }
         Overlay::Edit { ta, path, line, .. } => {
-            draw_modal_editor(f, area, ta, &format!("Edit comment on {path}:{line}"),
-                "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+D: delete · Esc: cancel");
+            Some(draw_modal_editor(f, area, ta, sel, &format!("Edit comment on {path}:{line}"),
+                "Enter: save · Alt+Enter: newline · Ctrl+S: suggestion · Ctrl+D: delete · Esc: cancel"))
         }
         Overlay::CommitMsg { ta, kind } => {
             let n = st.edit_files.len();
@@ -1705,15 +1741,16 @@ fn render_overlay(f: &mut Frame, st: &State) {
                 CommitKind::NoVerify => format!("Commit {n} file(s) locally · no hooks"),
                 CommitKind::New => format!("Commit {n} file(s) locally"),
             };
-            draw_modal_editor(f, area, ta, &what,
-                "Enter: commit · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+            Some(draw_modal_editor(f, area, ta, sel, &what,
+                "Enter: commit · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel"))
         }
         Overlay::Hooks { title, lines, failed, scroll } => {
             render_hooks(f, area, title, lines, *failed, *scroll);
+            None
         }
         Overlay::Ask { ta } => {
-            draw_modal_editor(f, area, ta, "Ask Claude about this hunk",
-                "Enter: launch Claude · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel");
+            Some(draw_modal_editor(f, area, ta, sel, "Ask Claude about this hunk",
+                "Enter: launch Claude · Alt+Enter: newline · Ctrl+Bksp: del word · Esc: cancel"))
         }
         Overlay::Confirm { prompt, .. } => {
             let w = (prompt.chars().count() as u16 + 6).clamp(30, area.width.saturating_sub(4));
@@ -1728,8 +1765,12 @@ fn render_overlay(f: &mut Frame, st: &State) {
                 Paragraph::new("y: confirm · any other key: cancel").style(theme::keys()),
                 Rect { x: inner.x, y: help_y, width: inner.width, height: 1 },
             );
+            None
         }
-        Overlay::Archive { batches, idx, scroll } => render_archive(f, area, batches, *idx, *scroll),
+        Overlay::Archive { batches, idx, scroll } => {
+            render_archive(f, area, batches, *idx, *scroll);
+            None
+        }
         Overlay::Review { ta, editing, choice } => {
             let rect = centered(area, 90.min(area.width.saturating_sub(4)), 22.min(area.height.saturating_sub(4)));
             let title = format!("Finish review · {} pending comment{}", st.pending.len(), if st.pending.len() == 1 { "" } else { "s" });
@@ -1739,12 +1780,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
             f.render_widget(b, rect);
             let choices_h = SUBMIT_CHOICES.len() as u16;
             let editor_h = inner.height.saturating_sub(choices_h + 2);
-            // editor
-            let mut ed = Vec::new();
-            for l in ta.lines.iter() {
-                ed.push(Line::from(l.clone()));
-            }
-            f.render_widget(Paragraph::new(ed), Rect { height: editor_h, ..inner });
+            let text = draw_text(f, ta, Rect { height: editor_h, ..inner }, sel, *editing);
             // divider
             let div_y = inner.y + editor_h;
             f.render_widget(Paragraph::new(Line::styled("─".repeat(inner.width as usize), theme::dim())),
@@ -1767,12 +1803,7 @@ fn render_overlay(f: &mut Frame, st: &State) {
             let help_y = inner.y + inner.height.saturating_sub(1);
             f.render_widget(Paragraph::new(help.to_string()).style(theme::keys()),
                 Rect { x: inner.x, y: help_y, width: inner.width, height: 1 });
-            if *editing {
-                let (_, cur_vrow, cur_vcol) = textbuffer::wrap(ta, inner.width.max(1) as usize);
-                let cy = inner.y + cur_vrow.min(editor_h.saturating_sub(1) as usize) as u16;
-                let cx = inner.x + (cur_vcol as u16).min(inner.width.saturating_sub(1));
-                f.set_cursor_position((cx, cy));
-            }
+            Some(text)
         }
     }
 }
