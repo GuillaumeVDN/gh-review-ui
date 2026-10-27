@@ -102,7 +102,8 @@ pub fn files_under_dir(st: &State, dir_path: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Collapse every folder whose files are all viewed. Returns the count folded.
+/// Collapse every folder whose files are all viewed, and expand every folder
+/// that hides an unviewed file. Returns the count folded.
 pub fn fold_viewed_dirs(st: &mut State) -> usize {
     let mut dirs: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, f) in st.files.iter().enumerate() {
@@ -114,8 +115,9 @@ pub fn fold_viewed_dirs(st: &mut State) -> usize {
     let mut folded = 0;
     for (path, idxs) in dirs {
         let all_viewed = !idxs.is_empty() && idxs.iter().all(|&i| st.files[i].viewed);
-        if all_viewed && !st.collapsed_dirs.contains(&path) {
-            st.collapsed_dirs.insert(path);
+        if !all_viewed {
+            st.collapsed_dirs.remove(&path);
+        } else if st.collapsed_dirs.insert(path) {
             folded += 1;
         }
     }
@@ -123,7 +125,8 @@ pub fn fold_viewed_dirs(st: &mut State) -> usize {
     folded
 }
 
-/// Collapse every folder of the Pending-edits tree whose files are all staged.
+/// Collapse every folder of the Pending-edits tree whose files are all staged,
+/// and expand every folder that hides a file left to stage.
 ///
 /// The `[4]` pane's fold, with "fully staged" standing in for "viewed" — it is
 /// the same statement about a file: there is nothing left to do here.
@@ -137,20 +140,22 @@ pub fn fold_staged_dirs(st: &mut State) -> usize {
     }
     // Decided before collapsing: `stage_state` borrows the state we are about
     // to write to.
-    let to_fold: Vec<String> = dirs
+    let all_staged: Vec<(String, bool)> = dirs
         .into_iter()
-        .filter(|(path, paths)| {
-            !paths.is_empty()
-                && !st.edit_collapsed.contains(path)
-                && paths
-                    .iter()
-                    .all(|p| crate::navigation::stage_state(st, p) == StageState::Staged)
+        .map(|(path, paths)| {
+            let done = paths
+                .iter()
+                .all(|p| crate::navigation::stage_state(st, p) == StageState::Staged);
+            (path, done)
         })
-        .map(|(path, _)| path)
         .collect();
-    let folded = to_fold.len();
-    for path in to_fold {
-        st.edit_collapsed.insert(path);
+    let mut folded = 0;
+    for (path, done) in all_staged {
+        if !done {
+            st.edit_collapsed.remove(&path);
+        } else if st.edit_collapsed.insert(path) {
+            folded += 1;
+        }
     }
     rebuild_edits(st);
     folded
@@ -203,24 +208,25 @@ pub fn first_unviewed_in_dir(st: &State, dir_path: &str) -> Option<usize> {
 
 /// Tree index of the "next" unviewed file relative to `anchor` (a file index into
 /// `st.files`, typically the file the cursor sat on). Prefers the closest unviewed
-/// file whose display order is *after* the anchor; if none remain after it, falls
-/// back to the closest one *before* it. With no anchor, returns the first unviewed
-/// file. The anchor itself is never returned.
-pub fn next_unviewed_index(st: &State, anchor: Option<usize>) -> Option<usize> {
+/// file on the `direction` side of the anchor (after it for `1`, before it for
+/// `-1`); if none remain there, falls back to the closest one on the other side.
+/// With no anchor, returns the first unviewed file (the last one for `-1`). The
+/// anchor itself is never returned.
+pub fn next_unviewed_index(st: &State, anchor: Option<usize>, direction: i64) -> Option<usize> {
     let paths: Vec<String> = st.files.iter().map(|f| f.path.clone()).collect();
     let done: Vec<bool> = st.files.iter().map(|f| f.viewed).collect();
-    next_pending_index(&st.tree, &paths, &done, anchor)
+    next_pending_index(&st.tree, &paths, &done, anchor, direction)
 }
 
 /// The same walk over the Pending-edits tree, where "done" is a fully staged
 /// file rather than a viewed one.
-pub fn next_unstaged_index(st: &State, anchor: Option<usize>) -> Option<usize> {
+pub fn next_unstaged_index(st: &State, anchor: Option<usize>, direction: i64) -> Option<usize> {
     let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
     let done: Vec<bool> = paths
         .iter()
         .map(|p| crate::navigation::stage_state(st, p) == StageState::Staged)
         .collect();
-    next_pending_index(&st.edit_tree, &paths, &done, anchor)
+    next_pending_index(&st.edit_tree, &paths, &done, anchor, direction)
 }
 
 /// Shared by both panes: the next row still to do, given which are done.
@@ -233,6 +239,7 @@ fn next_pending_index(
     paths: &[String],
     done: &[bool],
     anchor: Option<usize>,
+    direction: i64,
 ) -> Option<usize> {
     // Stable display order over file indices, independent of the current collapse
     // state, so a folded-away anchor still has a well-defined position.
@@ -268,10 +275,14 @@ fn next_pending_index(
                 if after.is_none_or(|(ar, _)| r < ar) {
                     after = Some((r, ti));
                 }
+                if before.is_none_or(|(br, _)| r > br) {
+                    before = Some((r, ti));
+                }
             }
         }
     }
-    after.or(before).map(|(_, ti)| ti)
+    let found = if direction < 0 { before.or(after) } else { after.or(before) };
+    found.map(|(_, ti)| ti)
 }
 
 #[cfg(test)]
@@ -325,7 +336,7 @@ mod tests {
         rebuild_edits(&mut st);
 
         assert_eq!(fold_staged_dirs(&mut st), 0);
-        assert!(next_unstaged_index(&st, None).is_some(), "it is still to do");
+        assert!(next_unstaged_index(&st, None, 1).is_some(), "it is still to do");
     }
 
     #[test]
@@ -342,10 +353,10 @@ mod tests {
         rebuild_edits(&mut st);
 
         // From a.rs: b.rs is done, so c.rs is next.
-        let ti = next_unstaged_index(&st, Some(0)).expect("something left");
+        let ti = next_unstaged_index(&st, Some(0), 1).expect("something left");
         assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 2, .. }));
         // From c.rs there is nothing after, so it falls back to a.rs before it.
-        let ti = next_unstaged_index(&st, Some(2)).expect("something left");
+        let ti = next_unstaged_index(&st, Some(2), 1).expect("something left");
         assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 0, .. }));
     }
 
@@ -358,7 +369,7 @@ mod tests {
         }];
         st.staged_paths.insert("a.rs".to_string());
         rebuild_edits(&mut st);
-        assert!(next_unstaged_index(&st, None).is_none());
+        assert!(next_unstaged_index(&st, None, 1).is_none());
     }
 
     #[test]
@@ -439,7 +450,7 @@ mod tests {
             ("e.py", false),
         ]);
         rebuild(&mut st);
-        let ti = next_unviewed_index(&st, Some(idx_of(&st, "d.py"))).unwrap();
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "d.py")), 1).unwrap();
         assert_eq!(file_at(&st, ti), "e.py");
     }
 
@@ -455,7 +466,7 @@ mod tests {
             ("e.py", true),
         ]);
         rebuild(&mut st);
-        let ti = next_unviewed_index(&st, Some(idx_of(&st, "e.py"))).unwrap();
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "e.py")), 1).unwrap();
         assert_eq!(file_at(&st, ti), "c.py");
     }
 
@@ -464,7 +475,7 @@ mod tests {
         let mut st = State::default();
         st.files = files(&[("a.py", true), ("b.py", false), ("c.py", false)]);
         rebuild(&mut st);
-        let ti = next_unviewed_index(&st, None).unwrap();
+        let ti = next_unviewed_index(&st, None, 1).unwrap();
         assert_eq!(file_at(&st, ti), "b.py");
     }
 
@@ -506,7 +517,20 @@ mod tests {
         let anchor = idx_of(&st, "seen/a.py");
         fold_viewed_dirs(&mut st);
         assert!(st.collapsed_dirs.contains("seen"));
-        let ti = next_unviewed_index(&st, Some(anchor)).unwrap();
+        let ti = next_unviewed_index(&st, Some(anchor), 1).unwrap();
         assert_eq!(file_at(&st, ti), "zzz/y.py");
+        let ti = next_unviewed_index(&st, Some(anchor), -1).unwrap();
+        assert_eq!(file_at(&st, ti), "aaa/x.py");
+    }
+
+    #[test]
+    fn fold_opens_a_folder_that_hides_an_unviewed_file() {
+        let mut st = State::default();
+        st.files = files(&[("todo/a.py", false), ("todo/b.py", true)]);
+        st.collapsed_dirs.insert("todo".to_string());
+        rebuild(&mut st);
+        assert_eq!(fold_viewed_dirs(&mut st), 0);
+        assert!(!st.collapsed_dirs.contains("todo"));
+        assert!(first_unviewed_index(&st).is_some());
     }
 }

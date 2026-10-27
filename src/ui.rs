@@ -449,9 +449,9 @@ fn shortcuts_for(st: &State) -> String {
         Focus::Files => match focused_stop(st) {
             Some(Stop::Pending(_)) => format!("j/k: stop · J/K: row · Enter/e: edit comment · d: discard · c: comment · Space: viewed+next · s/w · {common}"),
             Some(Stop::Thread(_)) => format!("j/k: stop · J/K: row · Enter: answer · o: open in browser · c: comment · Space: viewed+next · s/w · {common}"),
-            _ => format!("j/k: block · J/K: row · Space: viewed+next · c: comment · a: ask Claude · e: editor · s: side by side · w: whitespace · z/Z: fold/unfold · {common}"),
+            _ => format!("j/k: block · J/K: row · Space: viewed+next · c: comment · a: ask Claude · e: editor · s: side by side · w: whitespace · z/Z: fold+next/prev · U: unfold all · Alt+j/k: file · {common}"),
         },
-        Focus::Edits => format!("j/k: block · J/K: row · Space: stage+next · d: revert block · X: revert file · c: commit+push · A: amend · w: no hooks · P: push · e: editor · s: side by side · z/Z · {common}"),
+        Focus::Edits => format!("j/k: block · J/K: row · Space: stage+next · d: revert block · X: revert file · c: commit+push · A: amend · w: no hooks · P: push · e: editor · s: side by side · z/Z: fold+next/prev · U: unfold all · Alt+j/k: file · {common}"),
     }
 }
 

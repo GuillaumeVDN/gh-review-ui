@@ -405,7 +405,7 @@ pub fn apply_msg(st: &mut State, msg: Msg, tx: &Sender<Job>) {
             // The staging this reload carries came from `space` in [4], which
             // moves on like `z` once git confirms the file is staged.
             if std::mem::take(&mut st.stage_advance) {
-                fold_staged(st);
+                fold_staged(st, 1);
             }
         }
         Msg::HookLine(line) => {
@@ -1266,7 +1266,7 @@ fn local_mark_note(local_only: usize) -> String {
 
 pub fn mark_viewed(st: &mut State, tx: &Sender<Job>) {
     if apply_mark(st, tx) == Some(true) {
-        fold_viewed(st);
+        fold_viewed(st, 1);
     }
 }
 
@@ -1398,7 +1398,8 @@ fn settle_viewed(st: &mut State) {
     }
 }
 
-pub fn fold_viewed(st: &mut State) {
+/// `direction` picks which way the jump goes: `1` for `z`, `-1` for `Z`.
+pub fn fold_viewed(st: &mut State, direction: i64) {
     // Capture the cursor context before folding collapses rows away (so we keep
     // the underlying file index / dir path, not the volatile row position).
     let (dir, file_anchor) = match st.tree.get(st.file_idx) {
@@ -1407,15 +1408,18 @@ pub fn fold_viewed(st: &mut State) {
         None => (None, None),
     };
     let folded = tree::fold_viewed_dirs(st);
-    let jumped = if let Some(path) = dir {
+    let jumped = match dir {
         // On a folder: dive to the first unviewed file inside it; only if it has
         // none (fully viewed → just folded) fall back to jumping onward from it.
-        tree::first_unviewed_in_dir(st, &path).or_else(|| {
+        Some(path) if direction > 0 => tree::first_unviewed_in_dir(st, &path).or_else(|| {
             let anchor = tree::files_under_dir(st, &path).into_iter().next();
-            tree::next_unviewed_index(st, anchor)
-        })
-    } else {
-        tree::next_unviewed_index(st, file_anchor)
+            tree::next_unviewed_index(st, anchor, direction)
+        }),
+        Some(path) => {
+            let anchor = tree::files_under_dir(st, &path).into_iter().next();
+            tree::next_unviewed_index(st, anchor, direction)
+        }
+        None => tree::next_unviewed_index(st, file_anchor, direction),
     };
     if let Some(ti) = jumped {
         st.file_idx = ti;
@@ -1426,7 +1430,11 @@ pub fn fold_viewed(st: &mut State) {
     st.status = format!(
         "Folded {folded} viewed folder{}{}",
         if folded == 1 { "" } else { "s" },
-        if jumped.is_some() { " · jumped to next unviewed file" } else { " · no unviewed files" }
+        match (jumped, direction > 0) {
+            (None, _) => " · no unviewed files",
+            (Some(_), true) => " · jumped to next unviewed file",
+            (Some(_), false) => " · jumped to previous unviewed file",
+        }
     );
 }
 
@@ -1434,7 +1442,7 @@ pub fn fold_viewed(st: &mut State) {
 ///
 /// The same gesture as `z` in the Files pane, reading "fully staged" as that
 /// pane reads "viewed" — both say there is nothing left to do in that file.
-pub fn fold_staged(st: &mut State) {
+pub fn fold_staged(st: &mut State, direction: i64) {
     // Captured before folding collapses rows away, so the anchor is the file,
     // not the row it happened to sit on.
     let (dir, file_anchor) = match st.edit_tree.get(st.edit_idx) {
@@ -1443,15 +1451,18 @@ pub fn fold_staged(st: &mut State) {
         None => (None, None),
     };
     let folded = tree::fold_staged_dirs(st);
-    let jumped = if let Some(path) = dir {
+    let jumped = match dir {
         // On a folder: dive to the first unstaged file inside it, and only if
         // it has none (fully staged → just folded) carry on past it.
-        tree::first_unstaged_in_dir(st, &path).or_else(|| {
+        Some(path) if direction > 0 => tree::first_unstaged_in_dir(st, &path).or_else(|| {
             let anchor = tree::edit_files_under_dir(st, &path).into_iter().next();
-            tree::next_unstaged_index(st, anchor)
-        })
-    } else {
-        tree::next_unstaged_index(st, file_anchor)
+            tree::next_unstaged_index(st, anchor, direction)
+        }),
+        Some(path) => {
+            let anchor = tree::edit_files_under_dir(st, &path).into_iter().next();
+            tree::next_unstaged_index(st, anchor, direction)
+        }
+        None => tree::next_unstaged_index(st, file_anchor, direction),
     };
     if let Some(ti) = jumped {
         st.edit_idx = ti;
@@ -1459,7 +1470,11 @@ pub fn fold_staged(st: &mut State) {
     st.status = format!(
         "Folded {folded} staged folder{}{}",
         if folded == 1 { "" } else { "s" },
-        if jumped.is_some() { " · jumped to next unstaged file" } else { " · nothing left unstaged" }
+        match (jumped, direction > 0) {
+            (None, _) => " · nothing left unstaged",
+            (Some(_), true) => " · jumped to next unstaged file",
+            (Some(_), false) => " · jumped to previous unstaged file",
+        }
     );
 }
 

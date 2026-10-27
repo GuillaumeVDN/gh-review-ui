@@ -111,15 +111,19 @@ next / previous file:
   tall block shows its bottom. The move stops at the first and the last stop of
   the file.
 - `Shift+J` / `Shift+K` — move to the next / previous row of the tree, file or folder
+- `Alt+J` / `Alt+K` — move to the next / previous file of the tree, past the folders
 - `Home` / `G` — first / last file
 - `PgDn` / `PgUp` — page down / up in the diff
 - `s` — switch the diff between inline and side by side
-- `z` / `Z` — fold the done folders and jump to the first file left / unfold all
+- `z` / `Z` — fold the done folders, open the folders that hide a file left,
+  and jump to the next / previous file left
+- `U` — unfold all folders
 
 Files pane:
 - `Space` — toggle viewed on the file. A mark does what `z` does next: it folds
   every fully-viewed folder and jumps to the first unviewed file.
-- `z` — fold every fully-viewed folder, then jump to the first unviewed file
+- `z` — fold every fully-viewed folder, open every folder that hides an unviewed
+  file, then jump to the next unviewed file. `Z` jumps to the previous one.
 - `Enter` — on a folder row, collapse / expand it
 - `c` — start the comment line picker on the selected block (see below)
 - `a` — ask Claude about the selected stop

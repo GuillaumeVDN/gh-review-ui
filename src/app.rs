@@ -365,6 +365,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Files => match k.code {
+            KeyCode::Char('j') if alt => jump_file(st, 1),
+            KeyCode::Char('k') if alt => jump_file(st, -1),
             KeyCode::Down | KeyCode::Char('j') => step_file_stop(st, 1),
             KeyCode::Up | KeyCode::Char('k') => step_file_stop(st, -1),
             KeyCode::Home => {
@@ -382,8 +384,9 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 _ => controller::enter_focused_stop(st),
             },
             KeyCode::Char(' ') => controller::mark_viewed(st, tx),
-            KeyCode::Char('z') => controller::fold_viewed(st),
-            KeyCode::Char('Z') => {
+            KeyCode::Char('z') => controller::fold_viewed(st, 1),
+            KeyCode::Char('Z') => controller::fold_viewed(st, -1),
+            KeyCode::Char('U') => {
                 st.collapsed_dirs.clear();
                 crate::tree::rebuild(st);
                 st.status = "Unfolded all folders.".into();
@@ -401,6 +404,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             _ => {}
         },
         Focus::Edits => match k.code {
+            KeyCode::Char('j') if alt => jump_edit_file(st, 1),
+            KeyCode::Char('k') if alt => jump_edit_file(st, -1),
             KeyCode::Down | KeyCode::Char('j') => step_edit_stop(st, 1),
             KeyCode::Up | KeyCode::Char('k') => step_edit_stop(st, -1),
             KeyCode::Home => {
@@ -411,7 +416,8 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
                 set_edit_idx(st, st.edit_tree.len().saturating_sub(1));
                 land_on_edit_file(st, -1);
             }
-            KeyCode::Char('z') => controller::fold_staged(st),
+            KeyCode::Char('z') => controller::fold_staged(st, 1),
+            KeyCode::Char('Z') => controller::fold_staged(st, -1),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Enter => controller::fold_edit_dir(st),
@@ -422,7 +428,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char('P') => controller::push_edits(st, tx),
             KeyCode::Char('d') => controller::begin_discard_hunk(st),
             KeyCode::Char('X') => controller::begin_discard_edit(st),
-            KeyCode::Char('Z') => {
+            KeyCode::Char('U') => {
                 st.edit_collapsed.clear();
                 crate::tree::rebuild_edits(st);
                 st.status = "Unfolded all folders.".into();
