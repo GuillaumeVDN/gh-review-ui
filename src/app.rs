@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::models::{Category, CommitKind, Focus, Overlay, State, TextSelect, TreeRow, SUBMIT_CHOICES};
+use crate::models::{Category, CodePane, CodeSelect, CommitKind, Focus, Overlay, State, TextSelect, TreeRow, SUBMIT_CHOICES};
 use crate::navigation as nav;
 use crate::textbuffer::{self, TextArea};
 use crate::worker::{Job, Msg};
@@ -253,6 +253,13 @@ fn handle_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Rect) {
         handle_overlay_key(st, tx, k);
         return;
     }
+    if st.code_select.is_some() {
+        if is_copy_key(&k) {
+            copy_code_selection(st);
+            return;
+        }
+        st.code_select = None;
+    }
     if st.comment_mode {
         handle_comment_mode(st, tx, k);
         return;
@@ -465,12 +472,7 @@ fn handle_overlay_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent) {
     let ctrl = m.contains(KeyModifiers::CONTROL);
     let alt = m.contains(KeyModifiers::ALT);
 
-    let copy = match k.code {
-        KeyCode::Insert => ctrl,
-        KeyCode::Char('c' | 'C') => ctrl || m.contains(KeyModifiers::SUPER),
-        _ => false,
-    };
-    if copy && st.text_select.is_some() {
+    if is_copy_key(&k) && st.text_select.is_some() {
         copy_selection(st);
         return;
     }
@@ -826,6 +828,9 @@ fn handle_mouse(st: &mut State, m: MouseEvent, area: Rect) {
         handle_modal_mouse(st, m);
         return;
     }
+    if handle_code_mouse(st, m) {
+        return;
+    }
     let (rects, _, _) = ui::compute_layout(area, st);
     let (col, row) = (m.column, m.row);
     let hit = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
@@ -884,6 +889,60 @@ fn handle_modal_mouse(st: &mut State, m: MouseEvent) {
         }
         MouseEventKind::Up(MouseButton::Left) => copy_selection(st),
         _ => {}
+    }
+}
+
+/// Drag over a diff code column to select what it shows. The selection stays
+/// in the column where the drag starts, so a side-by-side drag copies one side.
+/// Returns whether the event belongs to such a drag.
+fn handle_code_mouse(st: &mut State, m: MouseEvent) -> bool {
+    let at = |pane: &CodePane| {
+        let r = pane.rect;
+        let row = m.row.clamp(r.y, r.bottom().saturating_sub(1)) - r.y;
+        let col = m.column.clamp(r.x, r.right().saturating_sub(1)) - r.x;
+        (row, col)
+    };
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = st.code_panes.iter().position(|p| p.rect.contains((m.column, m.row).into()));
+            st.code_select = hit.map(|i| {
+                let pos = at(&st.code_panes[i]);
+                CodeSelect { pane: i, anchor: pos, head: pos }
+            });
+            hit.is_some()
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(sel) = st.code_select else { return false };
+            let Some(pane) = st.code_panes.get(sel.pane) else { return false };
+            let head = at(pane);
+            st.code_select = Some(CodeSelect { head, ..sel });
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            copy_code_selection(st);
+            st.code_select.is_some()
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            st.code_select = None;
+            false
+        }
+        _ => false,
+    }
+}
+
+fn copy_code_selection(st: &mut State) {
+    let Some(sel) = st.code_select.filter(|s| s.anchor != s.head) else { return };
+    let Some(pane) = st.code_panes.get(sel.pane) else { return };
+    let text = ui::selected_cells(&pane.rows, sel.anchor, sel.head);
+    editor::copy_to_clipboard(&text);
+    st.status = format!("Copied {} characters.", text.chars().count());
+}
+
+fn is_copy_key(k: &KeyEvent) -> bool {
+    match k.code {
+        KeyCode::Insert => k.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Char('c' | 'C') => k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER),
+        _ => false,
     }
 }
 

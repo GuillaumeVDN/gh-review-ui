@@ -309,6 +309,23 @@ pub struct TextSelect {
     pub head: (usize, usize),
 }
 
+/// A code column of the diff as the last render drew it, cell by cell, so a
+/// mouse drag copies what the screen shows.
+#[derive(Clone, Default, Debug)]
+pub struct CodePane {
+    pub rect: ratatui::layout::Rect,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// A mouse selection in one code pane, as (row, column) cells relative to
+/// the pane. Both ends are inclusive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CodeSelect {
+    pub pane: usize,
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
 #[derive(Default)]
 pub struct State {
     pub repo_owner: String,
@@ -452,6 +469,8 @@ pub struct State {
     pub overlay: Overlay,
     pub modal_text: Option<ModalText>,
     pub text_select: Option<TextSelect>,
+    pub code_panes: Vec<CodePane>,
+    pub code_select: Option<CodeSelect>,
     pub should_quit: bool,
 }
 

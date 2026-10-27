@@ -10,7 +10,7 @@ use ratatui::Frame;
 
 use crate::markdown::{format_pr_details, wrap_styled};
 use crate::models::{
-    ArchiveBatch, CommitKind, DiffView, Focus, LineInfo, ModalText, Overlay, PendingComment, ReviewThread, StageState, State,
+    ArchiveBatch, CodePane, CommitKind, DiffView, Focus, LineInfo, ModalText, Overlay, PendingComment, ReviewThread, StageState, State,
     TextSelect, TreeRow, SUBMIT_CHOICES,
 };
 use crate::navigation::{
@@ -190,6 +190,25 @@ fn wrap_styled_hard(spans: &[(Style, String)], width: usize) -> Vec<Vec<(Style, 
     rows
 }
 
+/// Hard-wrap a code row so the continuation rows hang under the code, past the
+/// `+`/`-`/` ` marker column. A drag over the code column then copies no marker.
+fn wrap_code(spans: &[(Style, String)], width: usize) -> Vec<Vec<(Style, String)>> {
+    let Some((style, first)) = spans.first() else { return wrap_styled_hard(spans, width) };
+    let mut chars = first.chars();
+    let marker = match chars.next() {
+        Some(c @ ('+' | '-' | ' ')) if width > 1 => c,
+        _ => return wrap_styled_hard(spans, width),
+    };
+    let mut rest = vec![(*style, chars.as_str().to_string())];
+    rest.extend(spans[1..].iter().cloned());
+    let mut rows = wrap_styled_hard(&rest, width - 1);
+    for (k, row) in rows.iter_mut().enumerate() {
+        let lead = if k == 0 { (*style, marker.to_string()) } else { (Style::default(), " ".to_string()) };
+        row.insert(0, lead);
+    }
+    rows
+}
+
 /// The pieces of one diff row's text column: the `+`/`-`/` ` marker, then the
 /// code with its syntax colors (plain when the language is unknown).
 fn code_spans(line: &str, hl: Option<&StyledLine>, current: bool) -> Vec<(Style, String)> {
@@ -252,7 +271,7 @@ fn push_diff_rows(out: &mut Vec<Line<'static>>, vh: usize, row: &DiffRow, nw: us
     let num_style = if row.local_del { theme::local_marker() } else { theme::diff_number_style(kind, row.current) };
     let g = gutter(row.nos, nw);
     let gw = g.chars().count();
-    for (k, chunk) in wrap_styled_hard(&spans, tw.max(1)).into_iter().enumerate() {
+    for (k, chunk) in wrap_code(&spans, tw.max(1)).into_iter().enumerate() {
         if out.len() >= vh {
             return;
         }
@@ -421,6 +440,7 @@ pub fn pr_rows(st: &State) -> Vec<(bool, String, usize)> {
 
 pub fn render(f: &mut Frame, st: &mut State) {
     let (rects, status_area, help_area) = compute_layout(f.area(), st);
+    st.code_panes.clear();
     render_prs(f, st, rects.prs);
     render_commits(f, st, rects.commits);
     render_files(f, st, rects.files);
@@ -432,6 +452,7 @@ pub fn render(f: &mut Frame, st: &mut State) {
         Focus::Pending => render_pending_detail(f, st, rects.right),
         _ => render_diff(f, st, rects.right),
     }
+    snapshot_code_panes(f, st);
 
     let status = if st.status.is_empty() { "Ready." } else { &st.status };
     f.render_widget(Paragraph::new(status.to_string()).style(theme::status()), status_area);
@@ -749,7 +770,7 @@ impl SbsCell {
         SbsCell {
             gutter,
             num_style: m_style,
-            rows: wrap_styled_hard(&[(style, text.to_string())], width.max(1)),
+            rows: wrap_code(&[(style, text.to_string())], width.max(1)),
             row_style: Style::default(),
             marker,
             m_style,
@@ -927,7 +948,7 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
         SbsCell {
             gutter: gutter(&[if is_new { new } else { old }], nw),
             num_style: theme::diff_number_style(kind, current).patch(bg),
-            rows: wrap_styled_hard(&code_spans(ln, hl.row(i), current), tw.max(1)),
+            rows: wrap_code(&code_spans(ln, hl.row(i), current), tw.max(1)),
             row_style: if selected { bg.patch(theme::picked()) } else { bg },
             marker: if selected {
                 "▶"
@@ -1042,6 +1063,59 @@ fn render_sbs_diff(f: &mut Frame, st: &mut State, inner: Rect, path: &str) {
     st.diff_reveal_pending = false;
     st.diff_reveal_tail = false;
     f.render_widget(Paragraph::new(out), inner);
+    add_code_pane(st, inner, 2 + gw, ltw);
+    add_code_pane(st, inner, 1 + gw + ltw + 1 + 2 + gw, rtw);
+}
+
+/// Mark the code column `text_w` wide, `x` cells into `inner`, as one the
+/// mouse can select. The column starts past the diff marker.
+fn add_code_pane(st: &mut State, inner: Rect, x: usize, text_w: usize) {
+    let rect = Rect {
+        x: inner.x + x as u16,
+        width: text_w.saturating_sub(1) as u16,
+        ..inner
+    };
+    if rect.width > 0 && rect.right() <= inner.right() {
+        st.code_panes.push(CodePane { rect, rows: Vec::new() });
+    }
+}
+
+/// Keep what the code panes show, for a drag to copy, and paint the selection.
+fn snapshot_code_panes(f: &mut Frame, st: &mut State) {
+    let buf = f.buffer_mut();
+    for pane in &mut st.code_panes {
+        let r = pane.rect;
+        pane.rows = (r.y..r.bottom())
+            .map(|y| (r.x..r.right()).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+    }
+    let Some(sel) = st.code_select.filter(|s| s.anchor != s.head) else { return };
+    let Some(pane) = st.code_panes.get(sel.pane) else { return };
+    let (from, to) = if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) };
+    let r = pane.rect;
+    for y in from.0..=to.0.min(r.height.saturating_sub(1)) {
+        let lo = if y == from.0 { from.1 } else { 0 };
+        let hi = if y == to.0 { to.1 } else { r.width.saturating_sub(1) };
+        for x in lo..=hi.min(r.width.saturating_sub(1)) {
+            let cell = &mut buf[(r.x + x, r.y + y)];
+            cell.set_style(theme::selection());
+        }
+    }
+}
+
+/// The text between two inclusive (row, column) cells of a pane, in reading
+/// order. Each row drops the padding after its code.
+pub fn selected_cells(rows: &[Vec<String>], a: (u16, u16), b: (u16, u16)) -> String {
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    let mut lines = Vec::new();
+    for y in from.0..=to.0 {
+        let Some(row) = rows.get(y as usize) else { break };
+        let lo = if y == from.0 { from.1 as usize } else { 0 };
+        let hi = if y == to.0 { to.1 as usize + 1 } else { row.len() };
+        let text: String = row[lo.min(row.len())..hi.min(row.len())].concat();
+        lines.push(text.trim_end().to_string());
+    }
+    lines.join("\n")
 }
 
 /// Body rows an unfocused review thread keeps, before it folds.
@@ -1365,10 +1439,11 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
         for add in adds {
             let prefix = if pr_deleted.contains(add.as_str()) { ' ' } else { '+' };
             let shown = format!("{prefix}{}", add.replace('\t', "    "));
-            for (k, chunk) in wrap_hard(&shown, tw).into_iter().enumerate() {
+            for (k, row) in wrap_code(&[(Style::default(), shown)], tw).into_iter().enumerate() {
                 if out.len() >= vh {
                     return;
                 }
+                let chunk: String = row.into_iter().map(|(_, t)| t).collect();
                 let marker = if k > 0 { " " } else { "▎" };
                 out.push(Line::from(vec![
                     Span::styled(marker, theme::local_marker()),
@@ -1459,6 +1534,9 @@ fn render_diff(f: &mut Frame, st: &mut State, area: Rect) {
     st.diff_reveal_pending = false;
     st.diff_reveal_tail = false;
     f.render_widget(Paragraph::new(out), inner);
+    if path.is_some() {
+        add_code_pane(st, inner, 2 + gw, tw);
+    }
 }
 
 fn render_pr_details(f: &mut Frame, st: &mut State, area: Rect) {
@@ -1920,6 +1998,23 @@ mod tests {
                 rows.iter().map(|r| r.iter().map(|(_, t)| t.as_str()).collect()).collect();
             assert_eq!(joined, wrap_hard(text, width), "{text:?} at {width}");
         }
+    }
+
+    #[test]
+    fn a_wrapped_code_row_hangs_past_the_marker() {
+        let rows = wrap_code(&[(Style::default(), "+abcdef".into())], 4);
+        let shown: Vec<String> = rows.iter().map(|r| r.iter().map(|(_, t)| t.as_str()).collect()).collect();
+        assert_eq!(shown, ["+abc", " def"]);
+        assert_eq!(wrap_code(&[(Style::default(), "@@ -1 +1 @@".into())], 6).len(), 2);
+    }
+
+    #[test]
+    fn a_cell_selection_reads_rows_in_order_without_padding() {
+        let rows: Vec<Vec<String>> =
+            ["let a  ", "  b;   "].iter().map(|r| r.chars().map(String::from).collect()).collect();
+        assert_eq!(selected_cells(&rows, (0, 4), (1, 2)), "a\n  b");
+        assert_eq!(selected_cells(&rows, (1, 2), (0, 4)), "a\n  b");
+        assert_eq!(selected_cells(&rows, (0, 0), (0, 2)), "let");
     }
 
     #[test]
