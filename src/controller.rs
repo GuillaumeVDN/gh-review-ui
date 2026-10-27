@@ -1421,17 +1421,23 @@ pub fn fold_viewed(st: &mut State, direction: i64) {
         }
         None => tree::next_unviewed_index(st, file_anchor, direction),
     };
+    let stayed = jumped.is_some_and(|ti| {
+        file_anchor.is_some() && matches!(st.tree.get(ti), Some(TreeRow::File { index, .. }) if Some(*index) == file_anchor)
+    });
     if let Some(ti) = jumped {
         st.file_idx = ti;
-        st.diff_scroll = 0;
-        st.diff_hunk_idx = 0;
-        st.diff_stop_idx = 0;
+        if !stayed {
+            st.diff_scroll = 0;
+            st.diff_hunk_idx = 0;
+            st.diff_stop_idx = 0;
+        }
     }
     st.status = format!(
         "Folded {folded} viewed folder{}{}",
         if folded == 1 { "" } else { "s" },
         match (jumped, direction > 0) {
             (None, _) => " · no unviewed files",
+            _ if stayed => " · no other unviewed file that way",
             (Some(_), true) => " · jumped to next unviewed file",
             (Some(_), false) => " · jumped to previous unviewed file",
         }
@@ -1464,6 +1470,10 @@ pub fn fold_staged(st: &mut State, direction: i64) {
         }
         None => tree::next_unstaged_index(st, file_anchor, direction),
     };
+    let stayed = jumped.is_some_and(|ti| {
+        file_anchor.is_some()
+            && matches!(st.edit_tree.get(ti), Some(TreeRow::File { index, .. }) if Some(*index) == file_anchor)
+    });
     if let Some(ti) = jumped {
         st.edit_idx = ti;
     }
@@ -1472,6 +1482,7 @@ pub fn fold_staged(st: &mut State, direction: i64) {
         if folded == 1 { "" } else { "s" },
         match (jumped, direction > 0) {
             (None, _) => " · nothing left unstaged",
+            _ if stayed => " · no other unstaged file that way",
             (Some(_), true) => " · jumped to next unstaged file",
             (Some(_), false) => " · jumped to previous unstaged file",
         }

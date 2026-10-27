@@ -209,9 +209,9 @@ pub fn first_unviewed_in_dir(st: &State, dir_path: &str) -> Option<usize> {
 /// Tree index of the "next" unviewed file relative to `anchor` (a file index into
 /// `st.files`, typically the file the cursor sat on). Prefers the closest unviewed
 /// file on the `direction` side of the anchor (after it for `1`, before it for
-/// `-1`); if none remain there, falls back to the closest one on the other side.
-/// With no anchor, returns the first unviewed file (the last one for `-1`). The
-/// anchor itself is never returned.
+/// `-1`). If none remain there, an unviewed anchor stays where it is, and a
+/// viewed one falls back to the closest unviewed file on the other side.
+/// With no anchor, returns the first unviewed file (the last one for `-1`).
 pub fn next_unviewed_index(st: &State, anchor: Option<usize>, direction: i64) -> Option<usize> {
     let paths: Vec<String> = st.files.iter().map(|f| f.path.clone()).collect();
     let done: Vec<bool> = st.files.iter().map(|f| f.viewed).collect();
@@ -281,8 +281,16 @@ fn next_pending_index(
             }
         }
     }
-    let found = if direction < 0 { before.or(after) } else { after.or(before) };
-    found.map(|(_, ti)| ti)
+    let (ahead, behind) = if direction < 0 { (before, after) } else { (after, before) };
+    if let Some((_, ti)) = ahead {
+        return Some(ti);
+    }
+    if let Some(a) = anchor.filter(|&a| !done[a]) {
+        return tree
+            .iter()
+            .position(|row| matches!(row, TreeRow::File { index, .. } if *index == a));
+    }
+    behind.map(|(_, ti)| ti)
 }
 
 #[cfg(test)]
@@ -355,7 +363,11 @@ mod tests {
         // From a.rs: b.rs is done, so c.rs is next.
         let ti = next_unstaged_index(&st, Some(0), 1).expect("something left");
         assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 2, .. }));
-        // From c.rs there is nothing after, so it falls back to a.rs before it.
+        // From c.rs there is nothing after, and c.rs is still to do, so it stays.
+        let ti = next_unstaged_index(&st, Some(2), 1).expect("something left");
+        assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 2, .. }));
+        // Once c.rs is staged, it falls back to a.rs before it.
+        st.staged_paths.insert("c.rs".to_string());
         let ti = next_unstaged_index(&st, Some(2), 1).expect("something left");
         assert!(matches!(st.edit_tree[ti], TreeRow::File { index: 0, .. }));
     }
@@ -521,6 +533,17 @@ mod tests {
         assert_eq!(file_at(&st, ti), "zzz/y.py");
         let ti = next_unviewed_index(&st, Some(anchor), -1).unwrap();
         assert_eq!(file_at(&st, ti), "aaa/x.py");
+    }
+
+    #[test]
+    fn the_last_unviewed_file_keeps_the_cursor() {
+        let mut st = State::default();
+        st.files = files(&[("a.py", false), ("b.py", true), ("c.py", false)]);
+        rebuild(&mut st);
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "c.py")), 1).unwrap();
+        assert_eq!(file_at(&st, ti), "c.py");
+        let ti = next_unviewed_index(&st, Some(idx_of(&st, "a.py")), -1).unwrap();
+        assert_eq!(file_at(&st, ti), "a.py");
     }
 
     #[test]

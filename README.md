@@ -116,7 +116,8 @@ next / previous file:
 - `PgDn` / `PgUp` — page down / up in the diff
 - `s` — switch the diff between inline and side by side
 - `z` / `Z` — fold the done folders, open the folders that hide a file left,
-  and jump to the next / previous file left
+  and jump to the next / previous file left. On the last file left in that
+  direction, the cursor stays.
 - `U` — unfold all folders
 
 Files pane:
