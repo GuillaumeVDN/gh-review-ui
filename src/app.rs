@@ -374,8 +374,9 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
         Focus::Files => match k.code {
             KeyCode::Char('j') if alt => jump_file(st, 1),
             KeyCode::Char('k') if alt => jump_file(st, -1),
-            KeyCode::Down | KeyCode::Char('j') => step_file_stop(st, 1),
-            KeyCode::Up | KeyCode::Char('k') => step_file_stop(st, -1),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => file_tree_arrow(st, k.code),
+            KeyCode::Char('j') => step_file_stop(st, 1),
+            KeyCode::Char('k') => step_file_stop(st, -1),
             KeyCode::Home => {
                 set_file_idx(st, 0);
                 land_on_file(st, 1);
@@ -413,8 +414,9 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
         Focus::Edits => match k.code {
             KeyCode::Char('j') if alt => jump_edit_file(st, 1),
             KeyCode::Char('k') if alt => jump_edit_file(st, -1),
-            KeyCode::Down | KeyCode::Char('j') => step_edit_stop(st, 1),
-            KeyCode::Up | KeyCode::Char('k') => step_edit_stop(st, -1),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => edit_tree_arrow(st, k.code),
+            KeyCode::Char('j') => step_edit_stop(st, 1),
+            KeyCode::Char('k') => step_edit_stop(st, -1),
             KeyCode::Home => {
                 set_edit_idx(st, 0);
                 land_on_edit_file(st, 1);
@@ -721,6 +723,45 @@ fn land_on_file(st: &mut State, direction: i64) {
 fn land_on_edit_file(st: &mut State, direction: i64) {
     if !matches!(st.edit_tree.get(st.edit_idx), Some(TreeRow::File { .. })) {
         jump_edit_file(st, direction);
+    }
+}
+
+enum TreeArrow {
+    Select(usize),
+    Toggle(String),
+}
+
+/// Arrow keys walk a tree row by row: Left folds an open folder or goes to the
+/// parent, Right unfolds a folded one or enters an open one.
+fn tree_arrow(tree: &[TreeRow], idx: usize, key: KeyCode) -> Option<TreeArrow> {
+    let row = tree.get(idx)?;
+    match (key, row) {
+        (KeyCode::Up, _) => idx.checked_sub(1).map(TreeArrow::Select),
+        (KeyCode::Down, _) => (idx + 1 < tree.len()).then(|| TreeArrow::Select(idx + 1)),
+        (KeyCode::Left, TreeRow::Dir { path, collapsed: false, .. }) => Some(TreeArrow::Toggle(path.clone())),
+        (KeyCode::Left, TreeRow::Dir { depth, .. } | TreeRow::File { depth, .. }) => (0..idx)
+            .rev()
+            .find(|&i| matches!(&tree[i], TreeRow::Dir { depth: d, .. } if d < depth))
+            .map(TreeArrow::Select),
+        (KeyCode::Right, TreeRow::Dir { path, collapsed: true, .. }) => Some(TreeArrow::Toggle(path.clone())),
+        (KeyCode::Right, TreeRow::Dir { .. }) => (idx + 1 < tree.len()).then(|| TreeArrow::Select(idx + 1)),
+        _ => None,
+    }
+}
+
+fn file_tree_arrow(st: &mut State, key: KeyCode) {
+    match tree_arrow(&st.tree, st.file_idx, key) {
+        Some(TreeArrow::Select(i)) => set_file_idx(st, i),
+        Some(TreeArrow::Toggle(path)) => controller::toggle_collapse(st, &path),
+        None => {}
+    }
+}
+
+fn edit_tree_arrow(st: &mut State, key: KeyCode) {
+    match tree_arrow(&st.edit_tree, st.edit_idx, key) {
+        Some(TreeArrow::Select(i)) => set_edit_idx(st, i),
+        Some(TreeArrow::Toggle(path)) => controller::toggle_collapse_edit(st, &path),
+        None => {}
     }
 }
 
