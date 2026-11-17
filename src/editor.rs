@@ -170,7 +170,7 @@ pub fn send_review_to_claude(st: &mut State, prompt: &str) -> Result<&'static st
         std::fs::write(&file, prompt).map_err(|e| e.to_string())?;
         let fp = file.display().to_string();
         let instruction =
-            format!("Read {fp} and address all the review comments described in it.");
+            format!("Lis {fp} et traite tous les commentaires de revue qu'il décrit.");
         let script = format!(
             "{focus}; sleep 0.2; wtype {q}; wtype -k Return",
             focus = hypr_focus_sh(&format!("title:^{REVIEW_TITLE}$")),

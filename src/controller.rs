@@ -530,12 +530,12 @@ pub fn confirm_ask(st: &mut State) {
         .unwrap_or((0, String::new()));
     let file = path.as_deref().unwrap_or("?");
     let prompt = format!(
-        "I'm reviewing GitHub PR #{num} ({title}) and have a question about a change.\n\n\
-         File: {file}\n\
-         You're running in the PR's checked-out worktree, so you can open that file for full context.\n\n\
-         The relevant diff hunk:\n\
+        "Je relis la PR GitHub #{num} ({title}) et j'ai une question sur une modification.\n\n\
+         Fichier : {file}\n\
+         Tu tournes dans le worktree de la PR, tu peux donc ouvrir ce fichier pour tout le contexte.\n\n\
+         Le hunk de diff concerné :\n\
          ```diff\n{snippet}```\n\n\
-         My question:\n{question}\n"
+         Ma question :\n{question}\n"
     );
     match editor::send_to_manager(st, &prompt, "ask-latest.txt") {
         Ok(true) => {
@@ -556,36 +556,38 @@ pub fn confirm_ask(st: &mut State) {
 }
 
 const DEEP_REVIEW: &str = "\
-I'm reviewing GitHub PR #{num} ({title}). You run in the PR's checked-out worktree. \
-Change nothing: report only.
+Je relis la PR GitHub #{num} ({title}). Tu tournes dans le worktree de la PR. \
+Ne modifie rien : fais seulement un rapport.
 
-# 1. The context
+# 1. Le contexte
 
-Read the PR with `gh pr view {num} --comments`: the description, the base branch and the \
-linked issues. Fetch the base, then read the whole diff with `git diff origin/<base>...HEAD`. \
-Open the touched files for the full picture.
+Lis la PR avec `gh pr view {num} --comments` : la description, la branche de base et les \
+tickets liés. Fais un fetch de la base, puis lis tout le diff avec `git diff origin/<base>...HEAD`. \
+Ouvre les fichiers touchés pour avoir la vue complète.
 
-Explain what problem the PR solves and why. Then explain how the change is organised: the main \
-pieces, how they fit together, and the order in which to read the files.
+Explique quel problème la PR résout, et pourquoi. Puis explique comment la modification est \
+organisée : les pièces principales, comment elles s'assemblent, et dans quel ordre lire les fichiers.
 
-# 2. The deep review
+# 2. La revue approfondie
 
-Audit the changes for implementation quality. Flag first the correctness bugs you are \
-confident about, with the failing scenario.
+Audite la qualité d'implémentation des modifications. Signale d'abord les bugs de correction dont \
+tu es sûr, avec le scénario qui échoue.
 
-Look for restructurings that keep the behaviour and make the code dramatically simpler: whole \
-branches, helpers, modes or layers disappearing. Prefer deleting complexity to rearranging it.
+Cherche des restructurations qui gardent le comportement et simplifient fortement le code : des \
+branches, helpers, modes ou couches entiers qui disparaissent. Préfère supprimer la complexité \
+plutôt que la réarranger.
 
-Be demanding about new ad-hoc conditionals and one-off special cases bolted onto unrelated \
-flows: that is a design problem, not a nit. Be demanding about a file crossing 1k lines without \
-a compelling reason. Be demanding about unnecessary optionality, `any`, cast-heavy code, and \
-silent fallbacks papering over unclear invariants. Be demanding about feature logic leaking into \
-shared paths, and bespoke code duplicating an existing helper.
+Sois exigeant sur les nouvelles conditions ad hoc et les cas particuliers isolés greffés sur des \
+flux sans rapport : c'est un problème de conception, pas un détail. Sois exigeant sur un fichier \
+qui dépasse 1k lignes sans raison solide. Sois exigeant sur l'optionalité inutile, `any`, le code \
+plein de casts, et les fallbacks silencieux qui masquent des invariants flous. Sois exigeant sur la \
+logique métier qui fuit dans des chemins partagés, et sur du code sur mesure qui duplique un helper \
+existant.
 
-Order findings by severity: bugs, then structural regressions, then missed simplifications, \
-then spaghetti growth, then boundaries and types, then file size, then legibility. A few \
-high-conviction findings beat a long list of nits. Give each one a file and line, and a \
-concrete remedy.
+Classe les constats par gravité : bugs, puis régressions structurelles, puis simplifications \
+manquées, puis code spaghetti, puis frontières et types, puis taille des fichiers, puis lisibilité. \
+Quelques constats très sûrs valent mieux qu'une longue liste de détails. Donne pour chacun un \
+fichier et une ligne, et un remède concret.
 ";
 
 /// Launch Claude on the whole open PR: explain its context, then review it.
@@ -1174,12 +1176,12 @@ fn build_review_prompt(st: &State, body: &str) -> String {
         .map(|p| (p.number, p.title.clone()))
         .unwrap_or((0, String::new()));
     let mut s = format!(
-        "I'm reviewing GitHub PR #{num} ({title}). You're in the checkout for it. \
-         Please address these review comments by editing the code, or answer a comment when it is \
-         a question rather than a clear request for a change:\n\n"
+        "Je relis la PR GitHub #{num} ({title}). Tu es dans son checkout. \
+         Traite ces commentaires de revue en modifiant le code, ou réponds à un commentaire quand \
+         c'est une question plutôt qu'une demande claire de modification :\n\n"
     );
     if !body.trim().is_empty() {
-        s.push_str(&format!("Overall note: {}\n\n", body.trim()));
+        s.push_str(&format!("Note générale : {}\n\n", body.trim()));
     }
     for c in &st.pending {
         let loc = match c.start_line {
@@ -1196,7 +1198,7 @@ fn build_review_prompt(st: &State, body: &str) -> String {
             }
             s.push_str("```\n");
         }
-        s.push_str(&format!("Comment: {}\n\n", c.body));
+        s.push_str(&format!("Commentaire : {}\n\n", c.body));
     }
     s
 }
