@@ -369,6 +369,8 @@ pub struct State {
     /// so a failed mark can be reverted. The single worker answers them in order.
     pub viewed_inflight: std::collections::VecDeque<(Vec<String>, bool)>,
     pub collapsed_dirs: HashSet<String>,
+    /// Hides the test files from the [3] and [4] trees.
+    pub hide_tests: bool,
     pub tree: Vec<TreeRow>,
     pub file_idx: usize,
     pub file_offset: usize,

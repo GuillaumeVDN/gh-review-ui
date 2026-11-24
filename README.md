@@ -119,6 +119,9 @@ next / previous file:
   and jump to the next / previous file left. On the last file left in that
   direction, the cursor stays.
 - `U` — unfold all folders
+- `T` — hide / show the test files in both trees: `tests_*.py`, `test_*.py`,
+  `conftest.py`, `*.test.*`, `*.spec.*`, and the files under `__tests__/` or
+  `__snapshots__/`
 
 Files pane:
 - `Space` — toggle viewed on the file. A mark does what `z` does next: it folds

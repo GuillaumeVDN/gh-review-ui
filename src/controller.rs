@@ -1236,6 +1236,39 @@ pub fn toggle_collapse(st: &mut State, path: &str) {
     tree::rebuild(st);
 }
 
+/// `T` in the [3] and [4] panes: one switch hides the test files from both trees.
+pub fn toggle_hide_tests(st: &mut State) {
+    let file_at = |tree: &[TreeRow], idx: usize| match tree.get(idx) {
+        Some(TreeRow::File { index, .. }) => Some(*index),
+        _ => None,
+    };
+    let file = file_at(&st.tree, st.file_idx);
+    let edit = file_at(&st.edit_tree, st.edit_idx);
+    st.hide_tests = !st.hide_tests;
+    tree::rebuild(st);
+    tree::rebuild_edits(st);
+    let row_of = |tree: &[TreeRow], target: Option<usize>| {
+        tree.iter()
+            .position(|row| matches!(row, TreeRow::File { index, .. } if Some(*index) == target))
+    };
+    let mut file_lost = false;
+    match row_of(&st.tree, file) {
+        Some(ti) => st.file_idx = ti,
+        None => file_lost = file.is_some(),
+    }
+    match row_of(&st.edit_tree, edit) {
+        Some(ti) => st.edit_idx = ti,
+        None => file_lost |= edit.is_some(),
+    }
+    if file_lost {
+        st.diff_scroll = 0;
+        st.diff_hunk_idx = 0;
+        st.diff_stop_idx = 0;
+        st.diff_reveal_pending = true;
+    }
+    st.status = if st.hide_tests { "Test files hidden." } else { "Test files shown." }.into();
+}
+
 /// The same, on the Pending-edits tree, which keeps its own folded set.
 pub fn toggle_collapse_edit(st: &mut State, path: &str) {
     if st.edit_collapsed.contains(path) {

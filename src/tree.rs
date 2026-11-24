@@ -18,8 +18,31 @@ pub fn build_tree(files: &[FileEntry], collapsed: &HashSet<String>) -> Vec<TreeR
 /// Build the display rows for a bare list of paths; `TreeRow::File.index` refers
 /// to the position in `paths`. Shared by the Files and Pending-edits panes.
 pub fn build_tree_from_paths(paths: &[String], collapsed: &HashSet<String>) -> Vec<TreeRow> {
+    build_visible_tree(paths, collapsed, false)
+}
+
+/// Python tests are `tests_*.py` or `test_*.py`, front-end tests are `*.test.*`,
+/// `*.spec.*` or live under `__tests__/` and `__snapshots__/`.
+pub fn is_test_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let python_test = name.ends_with(".py")
+        && (name.starts_with("tests_") || name.starts_with("test_") || name == "conftest.py");
+    python_test
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || path.split('/').any(|part| part == "__tests__" || part == "__snapshots__")
+}
+
+pub fn is_hidden(st: &State, path: &str) -> bool {
+    st.hide_tests && is_test_path(path)
+}
+
+fn build_visible_tree(paths: &[String], collapsed: &HashSet<String>, hide_tests: bool) -> Vec<TreeRow> {
     let mut root = Node::Dir(HashMap::new());
     for (i, path) in paths.iter().enumerate() {
+        if hide_tests && is_test_path(path) {
+            continue;
+        }
         let parts: Vec<&str> = path.split('/').collect();
         let mut node = &mut root;
         for p in &parts[..parts.len() - 1] {
@@ -76,7 +99,8 @@ fn walk(node: &Node, prefix: &str, depth: usize, collapsed: &HashSet<String>, ou
 }
 
 pub fn rebuild(st: &mut State) {
-    st.tree = build_tree(&st.files, &st.collapsed_dirs);
+    let paths: Vec<String> = st.files.iter().map(|f| f.path.clone()).collect();
+    st.tree = build_visible_tree(&paths, &st.collapsed_dirs, st.hide_tests);
     if st.file_idx >= st.tree.len() {
         st.file_idx = st.tree.len().saturating_sub(1);
     }
@@ -85,7 +109,7 @@ pub fn rebuild(st: &mut State) {
 /// Rebuild the Pending-edits tree from the current `edit_files`.
 pub fn rebuild_edits(st: &mut State) {
     let paths: Vec<String> = st.edit_files.iter().map(|e| e.path.clone()).collect();
-    st.edit_tree = build_tree_from_paths(&paths, &st.edit_collapsed);
+    st.edit_tree = build_visible_tree(&paths, &st.edit_collapsed, st.hide_tests);
     if st.edit_idx >= st.edit_tree.len() {
         st.edit_idx = st.edit_tree.len().saturating_sub(1);
     }
@@ -97,7 +121,7 @@ pub fn files_under_dir(st: &State, dir_path: &str) -> Vec<usize> {
     st.files
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.path.starts_with(&prefix))
+        .filter(|(_, f)| f.path.starts_with(&prefix) && !is_hidden(st, &f.path))
         .map(|(i, _)| i)
         .collect()
 }
@@ -107,6 +131,9 @@ pub fn files_under_dir(st: &State, dir_path: &str) -> Vec<usize> {
 pub fn fold_viewed_dirs(st: &mut State) -> usize {
     let mut dirs: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, f) in st.files.iter().enumerate() {
+        if is_hidden(st, &f.path) {
+            continue;
+        }
         let parts: Vec<&str> = f.path.split('/').collect();
         for d in 1..parts.len() {
             dirs.entry(parts[..d].join("/")).or_default().push(i);
@@ -132,7 +159,7 @@ pub fn fold_viewed_dirs(st: &mut State) -> usize {
 /// the same statement about a file: there is nothing left to do here.
 pub fn fold_staged_dirs(st: &mut State) -> usize {
     let mut dirs: HashMap<String, Vec<String>> = HashMap::new();
-    for e in &st.edit_files {
+    for e in st.edit_files.iter().filter(|e| !is_hidden(st, &e.path)) {
         let parts: Vec<&str> = e.path.split('/').collect();
         for d in 1..parts.len() {
             dirs.entry(parts[..d].join("/")).or_default().push(e.path.clone());
@@ -182,7 +209,7 @@ pub fn edit_files_under_dir(st: &State, dir_path: &str) -> Vec<usize> {
     st.edit_files
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.path.starts_with(&prefix))
+        .filter(|(_, e)| e.path.starts_with(&prefix) && !is_hidden(st, &e.path))
         .map(|(i, _)| i)
         .collect()
 }
@@ -382,6 +409,44 @@ mod tests {
         st.staged_paths.insert("a.rs".to_string());
         rebuild_edits(&mut st);
         assert!(next_unstaged_index(&st, None, 1).is_none());
+    }
+
+    #[test]
+    fn test_files_follow_the_dashdoc_conventions() {
+        for path in [
+            "backend/dashdoc/tms/tests/tests_orders.py",
+            "backend/.github/scripts/test_impact.py",
+            "backend/conftest.py",
+            "frontend/src/Map.test.tsx",
+            "frontend/src/map.spec.ts",
+            "frontend/src/__tests__/helpers.ts",
+            "frontend/src/__snapshots__/Map.test.tsx.snap",
+        ] {
+            assert!(is_test_path(path), "{path}");
+        }
+        for path in ["backend/dashdoc/tests/factories.py", "backend/latest_tests.py", "frontend/src/testing.ts"] {
+            assert!(!is_test_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn hidden_tests_leave_the_tree_and_the_fold() {
+        let mut st = State::default();
+        st.files = files(&[("app/models.py", false), ("app/tests_models.py", false), ("tests/tests_x.py", false)]);
+        st.hide_tests = true;
+        rebuild(&mut st);
+        let names: Vec<String> = st
+            .tree
+            .iter()
+            .map(|row| match row {
+                TreeRow::Dir { path, .. } => format!("{path}/"),
+                TreeRow::File { index, .. } => st.files[*index].path.clone(),
+            })
+            .collect();
+        assert_eq!(names, ["app/", "app/models.py"]);
+        st.files[0].viewed = true;
+        fold_viewed_dirs(&mut st);
+        assert!(st.collapsed_dirs.contains("app"), "the hidden test does not keep app open");
     }
 
     #[test]

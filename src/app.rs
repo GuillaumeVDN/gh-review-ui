@@ -394,6 +394,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             KeyCode::Char(' ') => controller::mark_viewed(st, tx),
             KeyCode::Char('z') => controller::fold_viewed(st, 1),
             KeyCode::Char('Z') => controller::fold_viewed(st, -1),
+            KeyCode::Char('T') => controller::toggle_hide_tests(st),
             KeyCode::Char('U') => {
                 st.collapsed_dirs.clear();
                 crate::tree::rebuild(st);
@@ -427,6 +428,7 @@ fn handle_pane_key(st: &mut State, tx: &mpsc::Sender<Job>, k: KeyEvent, area: Re
             }
             KeyCode::Char('z') => controller::fold_staged(st, 1),
             KeyCode::Char('Z') => controller::fold_staged(st, -1),
+            KeyCode::Char('T') => controller::toggle_hide_tests(st),
             KeyCode::PageDown => nav::scroll_diff(st, page as i64),
             KeyCode::PageUp => nav::scroll_diff(st, -(page as i64)),
             KeyCode::Enter => controller::fold_edit_dir(st),
