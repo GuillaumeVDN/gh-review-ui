@@ -120,7 +120,7 @@ next / previous file:
   direction, the cursor stays.
 - `U` — unfold all folders
 - `T` — hide / show the test files in both trees: `tests_*.py`, `test_*.py`,
-  `conftest.py`, `*.test.*`, `*.spec.*`, and the files under `__tests__/` or
+  `conftest.py`, `*.perf.yml`, `*.test.*`, `*.spec.*`, and the files under `__tests__/` or
   `__snapshots__/`
 
 Files pane:

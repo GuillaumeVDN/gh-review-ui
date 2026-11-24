@@ -22,7 +22,8 @@ pub fn build_tree_from_paths(paths: &[String], collapsed: &HashSet<String>) -> V
 }
 
 /// Python tests are `tests_*.py` or `test_*.py`, front-end tests are `*.test.*`,
-/// `*.spec.*` or live under `__tests__/` and `__snapshots__/`.
+/// `*.spec.*` or live under `__tests__/` and `__snapshots__/`. The `*.perf.yml`
+/// files are the query-count snapshots of the backend tests.
 pub fn is_test_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let python_test = name.ends_with(".py")
@@ -30,6 +31,7 @@ pub fn is_test_path(path: &str) -> bool {
     python_test
         || name.contains(".test.")
         || name.contains(".spec.")
+        || name.ends_with(".perf.yml")
         || path.split('/').any(|part| part == "__tests__" || part == "__snapshots__")
 }
 
@@ -421,6 +423,7 @@ mod tests {
             "frontend/src/map.spec.ts",
             "frontend/src/__tests__/helpers.ts",
             "frontend/src/__snapshots__/Map.test.tsx.snap",
+            "backend/dashdoc/tms/tests/tests_orders.perf.yml",
         ] {
             assert!(is_test_path(path), "{path}");
         }
