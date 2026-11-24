@@ -560,15 +560,21 @@ fn render_commits(f: &mut Frame, st: &mut State, area: Rect) {
     render_line_list(f, inner, &rows, sel_line, &mut st.commit_offset);
 }
 
+fn tests_hidden_note(st: &State) -> &'static str {
+    if st.hide_tests { "  · tests hidden" } else { "" }
+}
+
 fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
     let mut title = "[3] Files".to_string();
     if let Some(pr) = &st.active_pr {
-        let n = st.files.iter().filter(|f| f.viewed).count();
-        title = format!("[3] Files #{}  {}/{} viewed", pr.number, n, st.files.len());
-        let partial = st.files.iter().filter(|f| !f.viewed && st.partial_paths.contains(&f.path)).count();
+        let shown: Vec<_> = st.files.iter().filter(|f| !crate::tree::is_hidden(st, &f.path)).collect();
+        let n = shown.iter().filter(|f| f.viewed).count();
+        title = format!("[3] Files #{}  {}/{} viewed", pr.number, n, shown.len());
+        let partial = shown.iter().filter(|f| !f.viewed && st.partial_paths.contains(&f.path)).count();
         if partial > 0 {
             title.push_str(&format!(" · {partial} partly"));
         }
+        title.push_str(tests_hidden_note(st));
     }
     let busy = st.busy.contains("active") || st.busy.contains("viewed");
     let b = block(&title, st.focus == Focus::Files, busy);
@@ -612,17 +618,17 @@ fn render_files(f: &mut Frame, st: &mut State, area: Rect) {
 }
 
 fn render_edits(f: &mut Frame, st: &mut State, area: Rect) {
-    let staged = st
-        .edit_files
+    let shown: Vec<_> = st.edit_files.iter().filter(|e| !crate::tree::is_hidden(st, &e.path)).collect();
+    let staged = shown
         .iter()
         .filter(|e| stage_state(st, &e.path) != StageState::Unstaged)
         .count();
     let title = if st.edit_files.is_empty() {
         "[4] Pending edits".to_string()
     } else if staged > 0 {
-        format!("[4] Pending edits ({}·{staged}✔)", st.edit_files.len())
+        format!("[4] Pending edits ({}·{staged}✔){}", shown.len(), tests_hidden_note(st))
     } else {
-        format!("[4] Pending edits ({})", st.edit_files.len())
+        format!("[4] Pending edits ({}){}", shown.len(), tests_hidden_note(st))
     };
     let busy = st.busy.contains("edits") || st.busy.contains("editcommit");
     let b = block(&title, st.focus == Focus::Edits, busy);
