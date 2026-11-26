@@ -21,13 +21,15 @@ pub fn build_tree_from_paths(paths: &[String], collapsed: &HashSet<String>) -> V
     build_visible_tree(paths, collapsed, false)
 }
 
-/// Python tests are `tests_*.py` or `test_*.py`, front-end tests are `*.test.*`,
+/// Python tests are `tests_*.py`, `ecosystem_tests_*.py` or `test_*.py`, front-end tests are `*.test.*`,
 /// `*.spec.*` or live under `__tests__/` and `__snapshots__/`. The `*.perf.yml`
 /// files are the query-count snapshots of the backend tests.
 pub fn is_test_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let python_test = name.ends_with(".py")
-        && (name.starts_with("tests_") || name.starts_with("test_") || name == "conftest.py");
+        && (name.starts_with("tests_")
+            || name.starts_with("ecosystem_tests_")
+            || name.starts_with("test_") || name == "conftest.py");
     python_test
         || name.contains(".test.")
         || name.contains(".spec.")
@@ -424,10 +426,11 @@ mod tests {
             "frontend/src/__tests__/helpers.ts",
             "frontend/src/__snapshots__/Map.test.tsx.snap",
             "backend/dashdoc/tms/tests/tests_orders.perf.yml",
+            "backend/dashdoc/tms/tests/third_parties/ecosystem_tests_billit_integration.py",
         ] {
             assert!(is_test_path(path), "{path}");
         }
-        for path in ["backend/dashdoc/tests/factories.py", "backend/latest_tests.py", "frontend/src/testing.ts"] {
+        for path in ["backend/dashdoc/tests/factories.py", "backend/latest_tests.py", "backend/e2e/e2e_tests_views.py", "frontend/src/testing.ts"] {
             assert!(!is_test_path(path), "{path}");
         }
     }

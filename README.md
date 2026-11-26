@@ -119,7 +119,7 @@ next / previous file:
   and jump to the next / previous file left. On the last file left in that
   direction, the cursor stays.
 - `U` — unfold all folders
-- `T` — hide / show the test files in both trees: `tests_*.py`, `test_*.py`,
+- `T` — hide / show the test files in both trees: `tests_*.py`, `ecosystem_tests_*.py`, `test_*.py`,
   `conftest.py`, `*.perf.yml`, `*.test.*`, `*.spec.*`, and the files under `__tests__/` or
   `__snapshots__/`
 
